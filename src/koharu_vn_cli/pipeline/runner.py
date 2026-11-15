@@ -661,12 +661,17 @@ def run_compose_pipeline(
         # Fast 1-sheet batch composition when there are multiple CG pages (up to 36 per sheet)
         sheet_results: dict[int, tuple[list[TextRegionItem], str]] = {}
         if total > 1:
+            msg = (
+                f"Đang gộp {total} ảnh thành các sheet 12 ảnh nét cao để sáng tác nối tiếp..."
+                if total > 18
+                else f"Đang gộp {total} ảnh thành 1 sheet tổng hợp để sáng tác nhanh trong 1 lượt..."
+            )
             hooks.emit_step(
                 0,
                 total,
                 base_name,
                 "llm_sheet",
-                f"Đang gộp {total} ảnh thành 1 sheet tổng hợp để sáng tác nhanh trong 1 lượt...",
+                msg,
             )
             all_sizes: list[tuple[int, int]] = []
             for p in images:

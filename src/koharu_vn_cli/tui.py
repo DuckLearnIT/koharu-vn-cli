@@ -944,7 +944,12 @@ class KoharuTUI(App[None]):
         stream.write(Text.assemble(("❯ ", "bold cyan"), (message, "bold white")))
 
     def _log_ai(self, message: str, style: str = "white") -> None:
-        stream = self.query_one("#stream", RichLog)
+        if not self.is_mounted:
+            return
+        try:
+            stream = self.query_one("#stream", RichLog)
+        except Exception:
+            return
         stream.write(Text.from_markup(f"[cyan]●[/cyan] [{style}]{message}[/{style}]"))
 
     def _log_page_table(self, idx: int, total: int, img_name: str, doc: PageDocument, out_path: Path) -> None:
@@ -1675,13 +1680,19 @@ class KoharuTUI(App[None]):
             self._spinner_idx = 0
         elif not running:
             self._job_started_at = 0.0
+        if not self.is_mounted:
+            return
+        try:
+            sb_status = self.query_one("#sb-job-status", Static)
+            pb = self.query_one("#job-progress", ProgressBar)
+        except Exception:
+            return
         if running:
             spin = self._SPINNER_FRAMES[self._spinner_idx % len(self._SPINNER_FRAMES)]
             elapsed = self._format_elapsed()
-            self.query_one("#sb-job-status", Static).update(f"[yellow]{spin} {elapsed}[/yellow]\n{status_text}")
+            sb_status.update(f"[yellow]{spin} {elapsed}[/yellow]\n{status_text}")
         else:
-            self.query_one("#sb-job-status", Static).update(status_text)
-        pb = self.query_one("#job-progress", ProgressBar)
+            sb_status.update(status_text)
         pb.update(progress=pct)
         self._refresh_chrome()
 

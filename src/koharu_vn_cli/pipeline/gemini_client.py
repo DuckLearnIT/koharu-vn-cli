@@ -281,16 +281,22 @@ def _build_annotated_page_and_collage(
 def _build_story_contact_sheets(
     image_paths: list[Path],
     max_pages: int = 36,
+    *,
+    pages_per_sheet: int | None = None,
+    include_keyframes: bool = False,
+    page_numbers: list[int] | None = None,
+    total_pages: int | None = None,
 ) -> list[tuple[str, str]]:
     """
-    Pack chapter/CG pages into compact numbered contact sheets (or full-res single image)
-    so Gemini sees the entire artwork/story before generating dialogue or translations.
+    Pack chapter/CG pages into crisp numbered contact sheets (plus optional high-res character
+    keyframes for 50-100+ page chapters) so Gemini sees clear character traits & plot arc.
     """
-    total = len(image_paths)
-    if total == 0:
+    total = total_pages or len(image_paths)
+    count = len(image_paths)
+    if count == 0:
         return []
 
-    if total == 1:
+    if count == 1 and page_numbers is None:
         try:
             with Image.open(image_paths[0]) as im:
                 return [
@@ -302,27 +308,47 @@ def _build_story_contact_sheets(
         except Exception:
             return []
 
-    if total > max_pages:
-        indices = sorted({int(round(i * (total - 1) / (max_pages - 1))) for i in range(max_pages)})
+    sheets: list[tuple[str, str]] = []
+    if include_keyframes and count > 4:
+        kf_indices = sorted({0, max(1, count // 3), min(count - 1, (2 * count) // 3)})
+        for ki in kf_indices:
+            try:
+                p_label = page_numbers[ki] if page_numbers else (ki + 1)
+                with Image.open(image_paths[ki]) as im:
+                    sheets.append(
+                        (
+                            f"Ảnh cận/rõ nét Trang {p_label}/{total} (dùng để nhìn rõ mặt, tóc, phụ kiện & nhận diện chính xác Game/Nhân vật):",
+                            _pil_to_jpeg_b64(im.convert("RGB"), max_side=1150, quality=86),
+                        )
+                    )
+            except Exception:
+                continue
+
+    if count > max_pages:
+        indices = sorted({int(round(i * (count - 1) / (max_pages - 1))) for i in range(max_pages)})
     else:
-        indices = list(range(total))
+        indices = list(range(count))
 
     selected: list[tuple[int, Image.Image]] = []
     for idx in indices:
         try:
+            p_no = page_numbers[idx] if page_numbers else (idx + 1)
             with Image.open(image_paths[idx]) as im:
-                selected.append((idx + 1, im.convert("RGB")))
+                selected.append((p_no, im.convert("RGB")))
         except Exception:
             continue
     if not selected:
-        return []
+        return sheets
 
     total_sel = len(selected)
-    if total_sel <= 9:
+    per_sheet = max(1, pages_per_sheet) if pages_per_sheet else max(1, total_sel)
+    if per_sheet <= 9:
         tile_w, tile_h = 340, 440
-    elif total_sel <= 16:
+    elif per_sheet <= 12:
+        tile_w, tile_h = 300, 380
+    elif per_sheet <= 16:
         tile_w, tile_h = 280, 360
-    elif total_sel <= 25:
+    elif per_sheet <= 25:
         tile_w, tile_h = 230, 300
     else:
         tile_w, tile_h = 190, 250
@@ -333,13 +359,10 @@ def _build_story_contact_sheets(
         copy.thumbnail((tile_w, tile_h), Image.Resampling.LANCZOS)
         resized.append((page_no, copy))
 
-    # Pack all selected pages onto 1 single full contact sheet for speed & lower token cost
-    sheets: list[tuple[str, str]] = []
-    lbl_font = ImageFont.truetype(str(resolve_font_path("mali-bold")), size=16 if total_sel > 16 else 18)
-    per_sheet = max(1, total_sel)
+    lbl_font = ImageFont.truetype(str(resolve_font_path("mali-bold")), size=16 if per_sheet > 16 else 18)
     for start in range(0, len(resized), per_sheet):
         chunk = resized[start : start + per_sheet]
-        cols = min(6, max(1, math.ceil(math.sqrt(len(chunk)))))
+        cols = min(6 if per_sheet > 12 else 4, max(1, math.ceil(math.sqrt(len(chunk)))))
         rows = (len(chunk) + cols - 1) // cols
         cell_w, cell_h, hdr_h, pad = tile_w + 10, tile_h + 32, 24, 10
         canvas = Image.new("RGB", (cols * cell_w + pad, rows * cell_h + pad), (24, 26, 34))
@@ -357,8 +380,8 @@ def _build_story_contact_sheets(
         last_no = chunk[-1][0]
         sheets.append(
             (
-                f"Sheet tổng hợp full {len(chunk)} trang (từ Trang {first_no} đến Trang {last_no} / tổng {total}):",
-                _pil_to_jpeg_b64(canvas, max_side=1800 if total_sel > 9 else 1500, quality=84),
+                f"Sheet tổng hợp {len(chunk)} trang (từ Trang {first_no} đến Trang {last_no} / tổng {total}):",
+                _pil_to_jpeg_b64(canvas, max_side=1800 if per_sheet > 9 else 1500, quality=86),
             )
         )
     return sheets
@@ -724,7 +747,12 @@ class VisionLLMClient:
         Pass 1 global analysis: scan the whole chapter / CG set before translating Page 1
         to lock characters, visual appearance, Vietnamese pronoun rules, and full plot arc.
         """
-        sheets = _build_story_contact_sheets(image_paths)
+        sheets = _build_story_contact_sheets(
+            image_paths,
+            max_pages=60,
+            pages_per_sheet=12,
+            include_keyframes=True,
+        )
         if not sheets and not user_story:
             return StoryBible()
 
@@ -1022,10 +1050,74 @@ class VisionLLMClient:
         tags: str | None = None,
     ) -> dict[int, tuple[list[TextRegionItem], str]]:
         """
-        Fast 1-sheet batch CG composition: pack all images onto 1 numbered contact sheet
-        and compose Vietnamese dialogue + per-panel normalized coordinates in a single API call.
+        Batch CG composition on numbered contact sheets:
+        - Up to 18 pages -> 1 single full sheet call.
+        - > 18 pages (e.g. 50-100+ CGs) -> automatically splits into crisp 12-page sheets
+          preserving plot continuity across batches so characters & details stay sharp.
         """
-        sheets = _build_story_contact_sheets(image_paths, max_pages=36)
+        total = len(image_paths)
+        if total == 0:
+            return {}
+        if total > 18:
+            results: dict[int, tuple[list[TextRegionItem], str]] = {}
+            running_summaries: list[str] = []
+            batch_size = 12
+            for start in range(0, total, batch_size):
+                end = min(total, start + batch_size)
+                page_nums = list(range(start + 1, end + 1))
+                self._emit_status(
+                    f"Sáng tác batch Trang {page_nums[0]}–{page_nums[-1]}/{total} trên sheet nét cao..."
+                )
+                batch_res = self._compose_cg_sheet_batch(
+                    image_paths=image_paths[start:end],
+                    image_sizes=image_sizes[start:end],
+                    page_numbers=page_nums,
+                    total_pages=total,
+                    preset=preset,
+                    density=density,
+                    story_prompt=story_prompt,
+                    story_bible=story_bible,
+                    previous_summaries=running_summaries,
+                    tags=tags,
+                )
+                for p_no, val in sorted(batch_res.items()):
+                    results[p_no] = val
+                    if val[1]:
+                        running_summaries.append(val[1])
+            return results
+
+        return self._compose_cg_sheet_batch(
+            image_paths=image_paths,
+            image_sizes=image_sizes,
+            page_numbers=list(range(1, total + 1)),
+            total_pages=total,
+            preset=preset,
+            density=density,
+            story_prompt=story_prompt,
+            story_bible=story_bible,
+            previous_summaries=None,
+            tags=tags,
+        )
+
+    def _compose_cg_sheet_batch(
+        self,
+        image_paths: list[Path],
+        image_sizes: list[tuple[int, int]],
+        page_numbers: list[int],
+        total_pages: int,
+        preset: ComposePreset = ComposePreset.CG_OVAL,
+        density: str = "medium",
+        story_prompt: str | None = None,
+        story_bible: StoryBible | None = None,
+        previous_summaries: list[str] | None = None,
+        tags: str | None = None,
+    ) -> dict[int, tuple[list[TextRegionItem], str]]:
+        sheets = _build_story_contact_sheets(
+            image_paths,
+            max_pages=len(image_paths),
+            page_numbers=page_numbers,
+            total_pages=total_pages,
+        )
         if not sheets:
             return {}
 
@@ -1040,13 +1132,17 @@ class VisionLLMClient:
             bible_txt = story_bible.to_prompt_block()
             if bible_txt:
                 bible_block = f"\n=== HỒ SƠ CỐT TRUYỆN & NHÂN VẬT TOÀN BỘ CG ===\n{bible_txt}\n==========================================\n"
+        prev_block = ""
+        if previous_summaries:
+            joined = "\n".join(f"- Cảnh trước: {s}" for s in previous_summaries[-6:])
+            prev_block = f"\nDiễn biến liền trước cụm ảnh này (giữ mạch nối tiếp):\n{joined}\n"
         tags_block = _format_tags_block(tags)
         prompt_block = f"\nChỉ dẫn kịch bản / phong cách từ người dùng: {story_prompt}\n" if story_prompt else ""
 
         system_prompt = (
             "Bạn là biên kịch & đạo diễn dàn trang truyện tranh/CG chuyên nghiệp.\n"
-            "Nhiệm vụ: Quan sát toàn bộ các ô ảnh được đánh số 'Trang 1..N' trên sheet tổng hợp, "
-            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, mạch lạc từ Trang 1 đến Trang cuối, "
+            "Nhiệm vụ: Quan sát toàn bộ các ô ảnh được đánh số 'Trang X/Y' trên sheet tổng hợp, "
+            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, mạch lạc theo đúng số trang, "
             "và trả về tọa độ đặt chữ riêng cho TỪNG TRANG.\n"
             "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
             "- Với mỗi trang, `box_2d: [ymin, xmin, ymax, xmax]` tính từ 0 đến 1000 TRONG PHẠM VI Ô ẢNH CỦA TRANG ĐÓ (không phải tọa độ cả sheet).\n"
@@ -1054,15 +1150,17 @@ class VisionLLMClient:
             "- TUYỆT ĐỐI KHÔNG che khuôn mặt, mắt, miệng hoặc hành động chính; các hộp không được chồng chéo.\n"
             "Bắt buộc trả về đúng JSON hợp lệ."
         )
+        page_range_label = f"Trang {page_numbers[0]} đến {page_numbers[-1]}"
         user_prompt = (
-            f"Tổng số ảnh cần sáng tác trên sheet: {len(image_paths)}.{bible_block}{tags_block}{prompt_block}\n"
+            f"Các trang cần sáng tác trên sheet này ({len(image_paths)} ảnh: {page_range_label} / tổng {total_pages}):"
+            f"{bible_block}{prev_block}{tags_block}{prompt_block}\n"
             f"Mật độ thoại mỗi ảnh: {density_guide}\n"
             f"Quy tắc loại thoại:\n{style_rule}\n\n"
-            f"Hãy trả về JSON cho ĐỦ TẤT CẢ {len(image_paths)} trang theo đúng cấu trúc:\n"
+            f"Hãy trả về JSON cho ĐỦ TẤT CẢ {len(image_paths)} trang ({page_range_label}) theo đúng số `page` ghi trên đầu mỗi ô ảnh:\n"
             "{\n"
             '  "pages": [\n'
             "    {\n"
-            '      "page": 1,\n'
+            f'      "page": {page_numbers[0]},\n'
             '      "page_summary": "Tóm tắt 1 câu diễn biến trang này",\n'
             '      "items": [\n'
             "        {\n"
@@ -1082,14 +1180,15 @@ class VisionLLMClient:
             "}"
         )
         data = self._call_json(system_prompt, user_prompt, images=sheets, temperature=0.65)
+        page_map = {p_no: sz for p_no, sz in zip(page_numbers, image_sizes)}
         results: dict[int, tuple[list[TextRegionItem], str]] = {}
         for p_obj in data.get("pages", []):
             try:
                 p_no = int(p_obj.get("page", 0))
             except (TypeError, ValueError):
                 continue
-            if 1 <= p_no <= len(image_sizes):
-                w, h = image_sizes[p_no - 1]
+            if p_no in page_map:
+                w, h = page_map[p_no]
                 items = _parse_composed_items(p_obj.get("items", []), w=w, h=h, preset=preset)
                 results[p_no] = (items, str(p_obj.get("page_summary", "")).strip())
         return results

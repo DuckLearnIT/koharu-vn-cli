@@ -974,3 +974,66 @@ def test_extract_json_block_handles_think_tags_trailing_commas_and_truncation():
     with pytest.raises(ContentBlockedError) as exc_info:
         _extract_json_block("Tôi không thể đáp ứng yêu cầu này do quy tắc an toàn.")
     assert "/tags clear" in str(exc_info.value)
+
+
+def test_long_chapter_keyframes_multisheets_and_batched_compose(tmp_path: Path):
+    from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient, _build_story_contact_sheets
+
+    img_paths: list[Path] = []
+    sizes: list[tuple[int, int]] = []
+    for i in range(25):
+        p = tmp_path / f"p_{i + 1:03d}.jpg"
+        Image.new("RGB", (600, 800), (80 + (i * 5) % 150, 120, 180)).save(p)
+        img_paths.append(p)
+        sizes.append((600, 800))
+
+    # Pass 1 with 25 pages -> 3 high-res keyframes + ceil(25/12)=3 crisp sheets = 6 images total
+    sheets = _build_story_contact_sheets(
+        img_paths,
+        max_pages=60,
+        pages_per_sheet=12,
+        include_keyframes=True,
+    )
+    assert len(sheets) == 6
+    assert "Ảnh cận/rõ nét" in sheets[0][0]
+    assert "Trang 1/25" in sheets[0][0]
+    assert "Sheet tổng hợp 12 trang" in sheets[3][0]
+    assert "Sheet tổng hợp 1 trang" in sheets[5][0]
+
+    # Compose > 18 pages chunks into batches of 12 with running summaries
+    client = VisionLLMClient(api_key="dummy")
+    seen_prompts: list[str] = []
+
+    def fake_call_json(system_prompt, user_prompt, images, temperature=0.65):
+        seen_prompts.append(user_prompt)
+        assert len(images) == 1
+        pages_out = []
+        # Detect batch range from sheet label
+        label = images[0][0]
+        import re as _re
+        m = _re.search(r"Trang (\d+) đến Trang (\d+)", label)
+        assert m is not None
+        s_p, e_p = int(m.group(1)), int(m.group(2))
+        for p_no in range(s_p, e_p + 1):
+            pages_out.append(
+                {
+                    "page": p_no,
+                    "page_summary": f"Tóm tắt trang {p_no}",
+                    "items": [
+                        {
+                            "id": 1,
+                            "kind": "bubble",
+                            "bubble_style": "white_oval",
+                            "box_2d": [50, 50, 260, 320],
+                            "text": f"Thoại {p_no}",
+                        }
+                    ],
+                }
+            )
+        return {"pages": pages_out}
+
+    client._call_json = fake_call_json  # type: ignore[method-assign]
+    res = client.compose_cg_sheet(img_paths, sizes)
+    assert len(seen_prompts) == 3  # 12 + 12 + 1
+    assert "Tóm tắt trang 12" in seen_prompts[1]
+    assert set(res.keys()) == set(range(1, 26))
