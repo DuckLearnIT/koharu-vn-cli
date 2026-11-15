@@ -604,7 +604,7 @@ def run_translate_pipeline(
                         total,
                         img_path.name,
                         "ocr",
-                        f"Đang OCR cục bộ {len(region_items)} vùng chữ (No-Vision CPU)...",
+                        f"Đang OCR cục bộ {len(region_items)} vùng chữ (No-Vision)...",
                     )
                     ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
                     pending_ocr_pages.append(
@@ -636,17 +636,48 @@ def run_translate_pipeline(
                         tags=tags,
                     )
                 except ContentBlockedError as exc:
-                    if not skip_blocked:
-                        raise
-                    save_image(Image.fromarray(rgb), out_img_path)
-                    hooks.emit_step(
-                        idx,
-                        total,
-                        img_path.name,
-                        "blocked",
-                        f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
-                    )
-                    continue
+                    fallback_done = False
+                    if hasattr(cache, "get_ocr"):
+                        try:
+                            if ocr_engine is None:
+                                ocr_engine = (
+                                    cache.get_ocr(use_gpu=use_gpu)
+                                    if isinstance(cache, ModelCache)
+                                    else cache.get_ocr()
+                                )
+                            hooks.emit_step(
+                                idx,
+                                total,
+                                img_path.name,
+                                "ocr_fallback",
+                                f"⚠ Trang {idx}/{total} bị lọc ảnh -> tự động fallback OCR cục bộ + dịch text-only (0 ảnh)...",
+                            )
+                            ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
+                            translated_items, summary = llm.translate_page_from_ocr(
+                                regions=region_items,
+                                ocr_texts=ocr_texts,
+                                source_lang=lang,
+                                previous_summaries=scene_summaries,
+                                extra_instructions=prompt,
+                                story_bible=story_bible,
+                                page_index=idx,
+                                tags=tags,
+                            )
+                            fallback_done = True
+                        except ContentBlockedError as ocr_exc:
+                            exc = ocr_exc
+                    if not fallback_done:
+                        if not skip_blocked:
+                            raise
+                        save_image(Image.fromarray(rgb), out_img_path)
+                        hooks.emit_step(
+                            idx,
+                            total,
+                            img_path.name,
+                            "blocked",
+                            f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
+                        )
+                        continue
                 if summary:
                     scene_summaries.append(summary)
                 translated_items = adapt_regions_for_readability(translated_items, w, h)

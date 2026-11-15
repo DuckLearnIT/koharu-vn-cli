@@ -1383,3 +1383,64 @@ def test_compose_cli_and_tui_do_not_pass_translate_only_kwargs(tmp_path: Path, m
     for call_kw in seen_calls:
         assert "vision_translate" not in call_kw
         assert "use_gpu" not in call_kw
+
+
+def test_vision_blocked_image_falls_back_to_local_ocr_translation(tmp_path: Path, monkeypatch):
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    Image.new("RGB", (240, 320), (240, 240, 240)).save(in_dir / "p1.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            return [DetectedRegion((30, 30, 180, 120), (20, 20, 190, 130), None, True, False, 0.9)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeOcr:
+        def recognize_regions(self, rgb, regions):
+            return {r.id: "やめて…" for r in regions}
+
+    class FakeCache:
+        def get_detector(self, accurate=True):
+            return FakeDet()
+
+        def get_inpainter(self):
+            return FakeInp()
+
+        def get_ocr(self):
+            return FakeOcr()
+
+    def blocked_vision(self, *args, **kwargs):
+        raise ContentBlockedError("PROHIBITED_CONTENT")
+
+    ocr_text_calls: list[tuple[dict[int, str], int]] = []
+
+    def fake_ocr_translate(self, regions, ocr_texts, **kwargs):
+        ocr_text_calls.append((ocr_texts, kwargs["page_index"]))
+        out = [r.model_copy(update={"source_text": ocr_texts[r.id], "translated_text": "Dừng lại đi…"}) for r in regions]
+        return out, "Đã fallback OCR thành công"
+
+    monkeypatch.setattr(VisionLLMClient, "translate_page", blocked_vision)
+    monkeypatch.setattr(VisionLLMClient, "translate_page_from_ocr", fake_ocr_translate)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out",
+        api_key="dummy",
+        story_pass=False,
+        vision_translate=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(ocr_text_calls) == 1
+    assert ocr_text_calls[0][0] == {1: "やめて…"}
+    assert len(docs) == 1
+    assert docs[0].regions[0].translated_text == "Dừng lại đi…"
+    assert (out_dir / "p1.png").is_file()
+    assert (out_dir / ".koharu_cache" / "p1.koharu.json").is_file()
