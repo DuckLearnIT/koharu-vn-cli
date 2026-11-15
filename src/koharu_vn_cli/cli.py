@@ -245,8 +245,6 @@ def compose(
                 save_cbz=save_cbz,
                 output_format=eff_format,
                 sequential_names=eff_seq,
-                vision_translate=eff_vision,
-                use_gpu=eff_gpu,
                 resume=resume,
                 hooks=PipelineHooks(
                     on_step=on_step,

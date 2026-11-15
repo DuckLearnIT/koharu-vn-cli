@@ -1349,3 +1349,37 @@ def test_ort_session_gpu_selection_and_runtime_cpu_fallback(monkeypatch, tmp_pat
     assert app_tui.cfg.use_gpu is False
     app_tui._handle_submission("/gpu on")
     assert app_tui.cfg.use_gpu is True
+
+
+def test_compose_cli_and_tui_do_not_pass_translate_only_kwargs(tmp_path: Path, monkeypatch):
+    from koharu_vn_cli.config import AppConfig
+    from koharu_vn_cli.tui import KoharuTUI
+
+    img_dir = tmp_path / "cg"
+    img_dir.mkdir()
+    Image.new("RGB", (200, 200), (220, 220, 220)).save(img_dir / "01.png")
+
+    seen_calls: list[dict[str, object]] = []
+
+    def fake_compose_pipeline(input_path, **kwargs):
+        seen_calls.append(kwargs)
+        return tmp_path / "out", []
+
+    monkeypatch.setattr("koharu_vn_cli.cli.run_compose_pipeline", fake_compose_pipeline)
+    monkeypatch.setattr("koharu_vn_cli.tui.run_compose_pipeline", fake_compose_pipeline)
+    monkeypatch.setattr("koharu_vn_cli.cli.load_config", lambda: AppConfig(api_key="dummy"))
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: AppConfig(api_key="dummy"))
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda cfg: None)
+
+    runner = CliRunner()
+    res = runner.invoke(app, ["compose", str(img_dir)])
+    assert res.exit_code == 0, res.output
+
+    app_tui = KoharuTUI()
+    app_tui.call_from_thread = lambda fn, *a, **kw: None  # type: ignore[method-assign]
+    app_tui._start_compose.__wrapped__(app_tui, img_dir)
+
+    assert len(seen_calls) == 2
+    for call_kw in seen_calls:
+        assert "vision_translate" not in call_kw
+        assert "use_gpu" not in call_kw

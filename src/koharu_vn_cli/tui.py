@@ -1914,8 +1914,6 @@ class KoharuTUI(App[None]):
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
-                vision_translate=self.cfg.vision_translate,
-                use_gpu=self.cfg.use_gpu,
                 resume=resume,
                 hooks=self._build_hooks(),
             )
