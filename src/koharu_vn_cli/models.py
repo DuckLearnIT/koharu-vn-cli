@@ -59,6 +59,17 @@ class CharacterProfile(BaseModel):
     pronoun_rules: str = ""
 
 
+class SceneArc(BaseModel):
+    """Per-scene / mini-oneshot plot & pronoun scope detected in Pass 1."""
+
+    scene_id: int
+    start_page: int
+    end_page: int
+    title: str = ""
+    plot: str = ""
+    pronoun_notes: str = ""
+
+
 class StoryBible(BaseModel):
     """Global story context built automatically from full image(s) before page-by-page generation."""
 
@@ -70,6 +81,15 @@ class StoryBible(BaseModel):
     full_plot_summary: str = ""
     characters: list[CharacterProfile] = Field(default_factory=list)
     page_beats: dict[str, str] = Field(default_factory=dict)
+    scene_arcs: list[SceneArc] = Field(default_factory=list)
+
+    def scene_for_page(self, page_index: int | None) -> SceneArc | None:
+        if page_index is None or not self.scene_arcs:
+            return None
+        for arc in self.scene_arcs:
+            if arc.start_page <= page_index <= arc.end_page:
+                return arc
+        return None
 
     def to_prompt_block(self, page_index: int | None = None) -> str:
         lines: list[str] = []
@@ -77,12 +97,23 @@ class StoryBible(BaseModel):
             lines.append(f"Tác phẩm / Thể loại: {self.title} ({self.genre_and_tone})".strip())
         if self.source_game:
             lines.append(f"Game / Series gốc: {self.source_game}")
-        if self.pre_event_backstory:
-            lines.append(f"Cốt truyện TRƯỚC sự kiện ảnh: {self.pre_event_backstory}")
-        if self.during_event_plot:
-            lines.append(f"Diễn biến TRONG sự kiện ảnh: {self.during_event_plot}")
+        active_arc = self.scene_for_page(page_index)
+        if active_arc is not None:
+            arc_hdr = f"Tuyến / Cảnh HIỆN TẠI (Tuyến {active_arc.scene_id}, trang {active_arc.start_page}-{active_arc.end_page})"
+            if active_arc.title:
+                arc_hdr += f": {active_arc.title}"
+            lines.append(arc_hdr)
+            if active_arc.plot:
+                lines.append(f"  * Diễn biến riêng của tuyến này (KHÔNG trộn với tuyến khác): {active_arc.plot}")
+            if active_arc.pronoun_notes:
+                lines.append(f"  * Xưng hô & giọng riêng tuyến này: {active_arc.pronoun_notes}")
+        else:
+            if self.pre_event_backstory:
+                lines.append(f"Cốt truyện TRƯỚC sự kiện ảnh: {self.pre_event_backstory}")
+            if self.during_event_plot:
+                lines.append(f"Diễn biến TRONG sự kiện ảnh: {self.during_event_plot}")
         if self.full_plot_summary:
-            lines.append(f"Mạch truyện tổng thể: {self.full_plot_summary}")
+            lines.append(f"Mạch tổng quan: {self.full_plot_summary}")
         if self.characters:
             lines.append("Nhân vật & Quy tắc xưng hô BẮT BUỘC giữ nhất quán:")
             for c in self.characters:

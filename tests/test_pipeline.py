@@ -561,7 +561,7 @@ def test_dual_model_story_master_and_worker_compose(tmp_path: Path, monkeypatch)
 
     calls: list[tuple[str, str]] = []
 
-    def fake_build_bible(self, image_paths, mode="translate", user_story=None, extra_instructions=None, tags=None):
+    def fake_build_bible(self, image_paths, mode="translate", user_story=None, extra_instructions=None, tags=None, scenes=None):
         calls.append(("pass1_story", self.model))
         return StoryBible(title="Dual Test", genre_and_tone="vanilla", full_plot_summary="Cốt truyện chuẩn")
 
@@ -1105,3 +1105,168 @@ def test_translate_skips_blocked_page_and_resumes_cleanly(tmp_path: Path, monkey
     assert calls == [2]
     assert len(docs2) == 3
     assert (out_dir / ".koharu_cache" / "p2.koharu.json").is_file()
+
+
+def test_cluster_story_scenes_groups_similar_runs_and_isolates_story_bible(tmp_path: Path):
+    from koharu_vn_cli.models import SceneArc, StoryBible
+    from koharu_vn_cli.pipeline.scene_cluster import cluster_story_scenes
+
+    # Oneshot 1 (160..162): bright left half, dark right half
+    paths: list[Path] = []
+    for num in (160, 161, 162):
+        arr = np.zeros((96, 96, 3), dtype=np.uint8)
+        arr[:, :48] = (230, 210, 200)
+        arr[:, 48:] = (40, 30, 50)
+        arr[20 + (num - 160) * 2 : 30 + (num - 160) * 2, 10:30] = (120, 80, 90)  # tiny expression change
+        p = tmp_path / f"{num}.jpg"
+        Image.fromarray(arr).save(p)
+        paths.append(p)
+
+    # Oneshot 2 (250..252): completely different pattern (top dark navy, bottom warm gold)
+    for num in (250, 251, 252):
+        arr = np.zeros((96, 96, 3), dtype=np.uint8)
+        arr[:48, :] = (20, 35, 95)
+        arr[48:, :] = (240, 200, 110)
+        p = tmp_path / f"{num}.jpg"
+        Image.fromarray(arr).save(p)
+        paths.append(p)
+
+    scenes = cluster_story_scenes(paths)
+    assert len(scenes) == 2
+    assert scenes[0].page_indices == [0, 1, 2]
+    assert scenes[0].start_page == 1 and scenes[0].end_page == 3
+    assert scenes[1].page_indices == [3, 4, 5]
+    assert scenes[1].start_page == 4 and scenes[1].end_page == 6
+
+    bible = StoryBible(
+        title="Ayaya Anthology",
+        scene_arcs=[
+            SceneArc(scene_id=1, start_page=1, end_page=3, title="Cảnh 1", plot="Ngại ngùng phòng ngủ", pronoun_notes="anh - em"),
+            SceneArc(scene_id=2, start_page=4, end_page=6, title="Cảnh 2", plot="Trêu chọc ngoài hành lang", pronoun_notes="cậu - tớ"),
+        ],
+    )
+    blk_p2 = bible.to_prompt_block(page_index=2)
+    assert "Tuyến 1" in blk_p2 and "Ngại ngùng phòng ngủ" in blk_p2
+    assert "Trêu chọc ngoài hành lang" not in blk_p2
+
+    blk_p5 = bible.to_prompt_block(page_index=5)
+    assert "Tuyến 2" in blk_p5 and "Trêu chọc ngoài hành lang" in blk_p5
+    assert "Ngại ngùng phòng ngủ" not in blk_p5
+
+
+def test_no_vision_translate_uses_local_ocr_and_batches_by_scene(tmp_path: Path, monkeypatch):
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "oneshots"
+    in_dir.mkdir()
+    for i, name in enumerate(("160.png", "161.png", "250.png")):
+        arr = np.zeros((160, 160, 3), dtype=np.uint8)
+        if i < 2:
+            arr[:, :80] = (235, 225, 220)
+            arr[:, 80:] = (45, 40, 55)
+        else:
+            arr[:80, :] = (25, 45, 110)
+            arr[80:, :] = (245, 210, 120)
+        Image.fromarray(arr).save(in_dir / name)
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            return [DetectedRegion((30, 30, 120, 90), (20, 20, 130, 100), None, True, False, 0.9)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeOcr:
+        def recognize_regions(self, rgb, regions):
+            return {r.id: "助けて…" for r in regions}
+
+    class FakeCache:
+        def get_detector(self, accurate=True):
+            return FakeDet()
+
+        def get_inpainter(self):
+            return FakeInp()
+
+        def get_ocr(self):
+            return FakeOcr()
+
+    recorded_calls: list[tuple[str, int, str]] = []
+
+    def fake_call_json(self, system_prompt, user_prompt, images, temperature=0.3):
+        img_count = len(images)
+        recorded_calls.append((self.model, img_count, user_prompt))
+        if img_count > 0:
+            # Pass 1 Story Bible only!
+            return {
+                "title": "Collection",
+                "source_game": "Genshin Impact",
+                "full_plot_summary": "Hai tuyến riêng.",
+                "characters": [],
+                "scene_arcs": [
+                    {"scene_id": 1, "start_page": 1, "end_page": 2, "title": "Oneshot 1", "plot": "Cảnh A", "pronoun_notes": "anh - em"},
+                    {"scene_id": 2, "start_page": 3, "end_page": 3, "title": "Oneshot 2", "plot": "Cảnh B", "pronoun_notes": "cậu - tớ"},
+                ],
+                "page_beats": {},
+            }
+        # Pass 2 text-only (0 images!)
+        if "[Trang 1]" in user_prompt and "[Trang 2]" in user_prompt:
+            return {
+                "pages": [
+                    {"page": 1, "page_summary": "Tuyến 1 trang 1", "items": [{"id": 1, "source_text": "助けて…", "vietnamese": "Cứu em với…"}]},
+                    {"page": 2, "page_summary": "Tuyến 1 trang 2", "items": [{"id": 1, "source_text": "助けて…", "vietnamese": "Đừng mà anh…"}]},
+                ]
+            }
+        return {
+            "detected_language": "ja",
+            "page_summary": "Tuyến 2 trang 3",
+            "items": [{"id": 1, "source_text": "助けて…", "vietnamese": "Tha cho tớ…"}],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_call_json)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out",
+        api_key="dummy",
+        model="fast-text-worker",
+        story_model="strong-vision-master",
+        vision_translate=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+
+    assert len(docs) == 3
+    assert docs[0].regions[0].source_text == "助けて…"
+    assert docs[0].regions[0].translated_text == "Cứu em với…"
+    assert docs[1].regions[0].translated_text == "Đừng mà anh…"
+    assert docs[2].regions[0].translated_text == "Tha cho tớ…"
+    assert (out_dir / "160.png").is_file() and (out_dir / "250.png").is_file()
+
+    # Verify Pass 1 used story_model WITH images, while Pass 2 sent ZERO images in 2 scene calls!
+    assert len(recorded_calls) == 3
+    assert recorded_calls[0][0] == "strong-vision-master" and recorded_calls[0][1] > 0
+    assert recorded_calls[1][0] == "fast-text-worker" and recorded_calls[1][1] == 0
+    assert recorded_calls[2][0] == "fast-text-worker" and recorded_calls[2][1] == 0
+    assert "Tuyến 1 trang 1" not in recorded_calls[2][2]  # scene summaries isolated between scenes!
+
+
+def test_tui_vision_slash_toggle(tmp_path: Path, monkeypatch):
+    from koharu_vn_cli.config import AppConfig
+    from koharu_vn_cli.tui import KoharuTUI
+
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda cfg: None)
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: AppConfig(vision_translate=True))
+    app_tui = KoharuTUI()
+    logs: list[str] = []
+    app_tui._log_user = lambda _msg: None  # type: ignore[method-assign]
+    app_tui._log_ai = lambda msg, style="": logs.append(msg)  # type: ignore[method-assign]
+
+    app_tui._handle_submission("/vision off")
+    assert app_tui.cfg.vision_translate is False
+    assert any("TẮT Vision" in m for m in logs)
+
+    app_tui._handle_submission("/vision on")
+    assert app_tui.cfg.vision_translate is True
+    assert any("BẬT Vision" in m for m in logs)

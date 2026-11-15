@@ -100,6 +100,7 @@ def translate(
     output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
     seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
     review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi dịch."),
+    vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Pass 2 dùng Vision gửi ảnh (mặc định) hoặc --no-vision để OCR cục bộ + model con dịch text-only."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
 ) -> None:
     """Dịch truyện tranh (Nhật, Hàn, Trung, Anh -> Tiếng Việt) sửa triệt để lỗi cỡ chữ, viền & đè chữ."""
@@ -107,6 +108,7 @@ def translate(
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
+    eff_vision = cfg.vision_translate if vision is None else vision
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -149,6 +151,7 @@ def translate(
                 save_cbz=save_cbz,
                 output_format=eff_format,
                 sequential_names=eff_seq,
+                vision_translate=eff_vision,
                 resume=resume,
                 hooks=PipelineHooks(
                     on_step=on_step,
@@ -239,6 +242,7 @@ def compose(
                 save_cbz=save_cbz,
                 output_format=eff_format,
                 sequential_names=eff_seq,
+                vision_translate=eff_vision,
                 resume=resume,
                 hooks=PipelineHooks(
                     on_step=on_step,

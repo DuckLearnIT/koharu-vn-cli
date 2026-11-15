@@ -27,6 +27,8 @@ from koharu_vn_cli.pipeline.inpaint import (
     build_erasure_mask,
     classify_region_colors,
 )
+from koharu_vn_cli.pipeline.ocr import MangaOcrONNX
+from koharu_vn_cli.pipeline.scene_cluster import SceneGroup, cluster_story_scenes
 from koharu_vn_cli.pipeline.typesetter import (
     adapt_regions_for_readability,
     render_text_regions,
@@ -83,6 +85,7 @@ class ModelCache:
         self._detector: ComicDetector | None = None
         self._detector_accurate: bool | None = None
         self._inpainter: HybridInpainter | None = None
+        self._ocr: MangaOcrONNX | None = None
 
     def get_detector(self, accurate: bool = True) -> ComicDetector:
         if self._detector is None or self._detector_accurate != accurate:
@@ -94,6 +97,11 @@ class ModelCache:
         if self._inpainter is None:
             self._inpainter = HybridInpainter()
         return self._inpainter
+
+    def get_ocr(self) -> MangaOcrONNX:
+        if self._ocr is None:
+            self._ocr = MangaOcrONNX()
+        return self._ocr
 
     def warmup_all(self, accurate: bool = True) -> tuple[ComicDetector, HybridInpainter]:
         det = self.get_detector(accurate=accurate)
@@ -329,6 +337,7 @@ def _load_or_build_story_bible(
     tags: str | None = None,
     enable_story_pass: bool,
     resume: bool,
+    scenes: list[SceneGroup] | None = None,
     hooks: PipelineHooks,
 ) -> StoryBible | None:
     """Shared Pass-1 global story & character analysis across translate and compose pipelines."""
@@ -353,12 +362,14 @@ def _load_or_build_story_bible(
         f"Pass 1 [Model chính: {llm.model}]: Tự động xem full {len(images)} ảnh -> phân tích cốt truyện, nhân vật & xưng hô...",
     )
     try:
+        extra_kw = {"scenes": scenes} if scenes and len(scenes) >= 2 else {}
         bible = llm.build_story_bible(
             images,
             mode=mode,
             user_story=resolved_story,
             extra_instructions=prompt,
             tags=tags,
+            **extra_kw,
         )
     except ContentBlockedError as exc:
         hooks.emit_step(
@@ -392,6 +403,7 @@ def run_translate_pipeline(
     story: str | None = None,
     tags: str | None = None,
     story_pass: bool = True,
+    vision_translate: bool = True,
     font: str | None = None,
     conf: float = 0.34,
     accurate_detector: bool = True,
@@ -419,12 +431,13 @@ def run_translate_pipeline(
 
         total = len(images)
         eff_story_model = (story_model or "").strip() or model
+        mode_tag = "Vision" if vision_translate else "No-Vision OCR"
         hooks.emit_step(
             0,
             total,
             base_name,
             "init",
-            f"Kiểm tra API & ONNX (Chính: {eff_story_model} -> Phụ: {model})...",
+            f"Kiểm tra API & ONNX (Chính: {eff_story_model} -> Phụ ({mode_tag}): {model})...",
         )
         llm = VisionLLMClient(
             api_key=api_key,
@@ -446,6 +459,17 @@ def run_translate_pipeline(
         )
         detector = cache.get_detector(accurate=accurate_detector)
         inpainter = cache.get_inpainter()
+        ocr_engine = cache.get_ocr() if not vision_translate else None
+
+        scenes = cluster_story_scenes(images)
+        if len(scenes) >= 2:
+            hooks.emit_step(
+                0,
+                total,
+                base_name,
+                "scene_cluster",
+                f"Phân tuyến thông minh: gom {total} ảnh thành {len(scenes)} tuyến/oneshot riêng để không trộn ngữ cảnh.",
+            )
 
         story_bible = _load_or_build_story_bible(
             story_llm,
@@ -458,149 +482,231 @@ def run_translate_pipeline(
             tags=tags,
             enable_story_pass=story_pass,
             resume=resume,
+            scenes=scenes,
             hooks=hooks,
         )
 
-        previous_summaries: list[str] = []
         docs: list[PageDocument] = []
         seq_pad = max(3, len(str(total)))
 
-        for idx, img_path in enumerate(images, start=1):
-            hooks.check_cancelled()
-            out_img_path = out_dir / _output_image_name(
-                img_path,
-                output_format=output_format,
-                seq_index=idx if sequential_names else None,
-                seq_pad=seq_pad,
-            )
-            json_path = cache_dir / f"{img_path.stem}.koharu.json"
+        for sc in scenes:
+            scene_summaries: list[str] = []
+            # Tuple: (idx, img_path, out_img_path, json_path, clean_path, w, h, rgb, clean_rgb, region_items, ocr_texts)
+            pending_ocr_pages: list[
+                tuple[int, Path, Path, Path, Path, int, int, np.ndarray, np.ndarray, list[TextRegionItem], dict[int, str]]
+            ] = []
 
-            if resume and out_img_path.is_file() and json_path.is_file():
-                prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
-                if prev_doc.page_summary:
-                    previous_summaries.append(prev_doc.page_summary)
-                docs.append(prev_doc)
-                hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
-                hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
-                continue
-
-            rgb = load_rgb(img_path)
-            h, w = rgb.shape[:2]
-
-            hooks.emit_step(idx, total, img_path.name, "detect", f"Đọc ảnh {w}×{h}, đang dò khung thoại...")
-            detected, seg_mask = detector.detect(rgb, conf_thresh=conf)
-            if not detected:
-                save_image(Image.fromarray(rgb), out_img_path)
-                doc = PageDocument(
-                    image_path=str(img_path.resolve()),
-                    cleaned_image_path=str(out_img_path.resolve()),
-                    width=w,
-                    height=h,
-                    mode="translate",
-                    source_language=lang,
-                    regions=[],
+            for p_idx in sc.page_indices:
+                idx = p_idx + 1
+                img_path = images[p_idx]
+                hooks.check_cancelled()
+                out_img_path = out_dir / _output_image_name(
+                    img_path,
+                    output_format=output_format,
+                    seq_index=idx if sequential_names else None,
+                    seq_pad=seq_pad,
                 )
-                docs.append(doc)
-                hooks.emit_step(idx, total, img_path.name, "empty", "Không có khung thoại, giữ nguyên ảnh gốc")
-                hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
-                continue
+                json_path = cache_dir / f"{img_path.stem}.koharu.json"
 
-            hooks.check_cancelled()
-            t0 = time.perf_counter()
-            hooks.emit_step(
-                idx,
-                total,
-                img_path.name,
-                "inpaint",
-                f"Phát hiện {len(detected)} vùng chữ — đang tạo mask & tẩy chữ gốc...",
-            )
-            erasure_mask = build_erasure_mask(rgb, seg_mask, detected)
-            clean_rgb = inpainter.inpaint(rgb, erasure_mask)
+                if resume and out_img_path.is_file() and json_path.is_file():
+                    prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
+                    if prev_doc.page_summary:
+                        scene_summaries.append(prev_doc.page_summary)
+                    docs.append(prev_doc)
+                    hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
+                    hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
+                    continue
 
-            clean_path = cache_dir / f"{img_path.stem}.clean.png"
-            save_image(Image.fromarray(clean_rgb), clean_path)
+                rgb = load_rgb(img_path)
+                h, w = rgb.shape[:2]
 
-            region_items: list[TextRegionItem] = []
-            for reg_idx, reg in enumerate(detected, start=1):
-                t_col, s_col, s_factor, is_dark = classify_region_colors(
-                    rgb, clean_rgb, erasure_mask, reg
-                )
-                region_items.append(
-                    TextRegionItem(
-                        id=reg_idx,
-                        kind="bubble" if reg.is_bubble else "floating",
-                        text_bbox=reg.text_bbox,
-                        bubble_bbox=reg.bubble_bbox,
-                        bubble_contour=reg.bubble_contour,
-                        text_color=t_col,
-                        stroke_color=s_col,
-                        stroke_width=None if s_factor > 0 else 0.0,
-                        font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
-                        angle=reg.angle,
-                        is_dark_bubble=is_dark,
-                        draw_bubble=False,
-                        confidence=reg.confidence,
+                hooks.emit_step(idx, total, img_path.name, "detect", f"Đọc ảnh {w}×{h}, đang dò khung thoại...")
+                detected, seg_mask = detector.detect(rgb, conf_thresh=conf)
+                if not detected:
+                    save_image(Image.fromarray(rgb), out_img_path)
+                    doc = PageDocument(
+                        image_path=str(img_path.resolve()),
+                        cleaned_image_path=str(out_img_path.resolve()),
+                        width=w,
+                        height=h,
+                        mode="translate",
+                        source_language=lang,
+                        regions=[],
                     )
-                )
+                    docs.append(doc)
+                    hooks.emit_step(idx, total, img_path.name, "empty", "Không có khung thoại, giữ nguyên ảnh gốc")
+                    hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+                    continue
 
-            hooks.check_cancelled()
-            hooks.emit_step(
-                idx,
-                total,
-                img_path.name,
-                "llm",
-                f"Đang gửi {len(region_items)} vùng chữ lên {model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
-            )
-            prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
-            next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
-            try:
-                translated_items, summary = llm.translate_page(
-                    rgb=rgb,
-                    regions=region_items,
-                    source_lang=lang,
-                    previous_summaries=previous_summaries,
-                    extra_instructions=prompt,
-                    story_bible=story_bible,
-                    page_index=idx,
-                    prev_rgb=prev_rgb,
-                    next_rgb=next_rgb,
-                    tags=tags,
-                )
-            except ContentBlockedError as exc:
-                if not skip_blocked:
-                    raise
-                # Save unmodified page without .koharu.json so `/resume` retries this page later
-                save_image(Image.fromarray(rgb), out_img_path)
+                hooks.check_cancelled()
+                t0 = time.perf_counter()
                 hooks.emit_step(
                     idx,
                     total,
                     img_path.name,
-                    "blocked",
-                    f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
+                    "inpaint",
+                    f"Phát hiện {len(detected)} vùng chữ — đang tạo mask & tẩy chữ gốc...",
                 )
-                continue
-            if summary:
-                previous_summaries.append(summary)
-            translated_items = adapt_regions_for_readability(translated_items, w, h)
+                erasure_mask = build_erasure_mask(rgb, seg_mask, detected)
+                clean_rgb = inpainter.inpaint(rgb, erasure_mask)
 
-            hooks.check_cancelled()
-            hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
-            doc = PageDocument(
-                image_path=str(img_path.resolve()),
-                cleaned_image_path=str(clean_path.resolve()),
-                width=w,
-                height=h,
-                mode="translate",
-                source_language=lang,
-                page_summary=summary,
-                regions=translated_items,
-            )
-            json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+                clean_path = cache_dir / f"{img_path.stem}.clean.png"
+                save_image(Image.fromarray(clean_rgb), clean_path)
 
-            final_img = render_document(clean_rgb, doc)
-            save_image(final_img, out_img_path)
-            docs.append(doc)
-            hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+                region_items: list[TextRegionItem] = []
+                for reg_idx, reg in enumerate(detected, start=1):
+                    t_col, s_col, s_factor, is_dark = classify_region_colors(
+                        rgb, clean_rgb, erasure_mask, reg
+                    )
+                    region_items.append(
+                        TextRegionItem(
+                            id=reg_idx,
+                            kind="bubble" if reg.is_bubble else "floating",
+                            text_bbox=reg.text_bbox,
+                            bubble_bbox=reg.bubble_bbox,
+                            bubble_contour=reg.bubble_contour,
+                            text_color=t_col,
+                            stroke_color=s_col,
+                            stroke_width=None if s_factor > 0 else 0.0,
+                            font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
+                            angle=reg.angle,
+                            is_dark_bubble=is_dark,
+                            draw_bubble=False,
+                            confidence=reg.confidence,
+                        )
+                    )
+
+                if not vision_translate and ocr_engine is not None:
+                    hooks.check_cancelled()
+                    hooks.emit_step(
+                        idx,
+                        total,
+                        img_path.name,
+                        "ocr",
+                        f"Đang OCR cục bộ {len(region_items)} vùng chữ (No-Vision CPU)...",
+                    )
+                    ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
+                    pending_ocr_pages.append(
+                        (idx, img_path, out_img_path, json_path, clean_path, w, h, rgb, clean_rgb, region_items, ocr_texts)
+                    )
+                    continue
+
+                hooks.check_cancelled()
+                hooks.emit_step(
+                    idx,
+                    total,
+                    img_path.name,
+                    "llm",
+                    f"Đang gửi {len(region_items)} vùng chữ lên {model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
+                )
+                prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
+                next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
+                try:
+                    translated_items, summary = llm.translate_page(
+                        rgb=rgb,
+                        regions=region_items,
+                        source_lang=lang,
+                        previous_summaries=scene_summaries,
+                        extra_instructions=prompt,
+                        story_bible=story_bible,
+                        page_index=idx,
+                        prev_rgb=prev_rgb,
+                        next_rgb=next_rgb,
+                        tags=tags,
+                    )
+                except ContentBlockedError as exc:
+                    if not skip_blocked:
+                        raise
+                    save_image(Image.fromarray(rgb), out_img_path)
+                    hooks.emit_step(
+                        idx,
+                        total,
+                        img_path.name,
+                        "blocked",
+                        f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
+                    )
+                    continue
+                if summary:
+                    scene_summaries.append(summary)
+                translated_items = adapt_regions_for_readability(translated_items, w, h)
+
+                hooks.check_cancelled()
+                hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
+                doc = PageDocument(
+                    image_path=str(img_path.resolve()),
+                    cleaned_image_path=str(clean_path.resolve()),
+                    width=w,
+                    height=h,
+                    mode="translate",
+                    source_language=lang,
+                    page_summary=summary,
+                    regions=translated_items,
+                )
+                json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+
+                final_img = render_document(clean_rgb, doc)
+                save_image(final_img, out_img_path)
+                docs.append(doc)
+                hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+
+            if pending_ocr_pages:
+                for start_i in range(0, len(pending_ocr_pages), 10):
+                    chunk = pending_ocr_pages[start_i : start_i + 10]
+                    hooks.check_cancelled()
+                    batch_input = [(item[0], item[9], item[10]) for item in chunk]
+                    hooks.emit_step(
+                        chunk[0][0],
+                        total,
+                        chunk[0][1].name,
+                        "llm",
+                        f"Tuyến {sc.scene_id}: Gửi text OCR {len(chunk)} trang tới {model} (0 ảnh)...",
+                    )
+                    try:
+                        batch_res = llm.translate_scene_from_ocr(
+                            batch_input,
+                            source_lang=lang,
+                            previous_summaries=scene_summaries,
+                            extra_instructions=prompt,
+                            story_bible=story_bible,
+                            tags=tags,
+                            scene_id=sc.scene_id,
+                        )
+                    except ContentBlockedError as exc:
+                        if not skip_blocked:
+                            raise
+                        for idx, img_path, out_img_path, *_ in chunk:
+                            rgb_orig = load_rgb(img_path)
+                            save_image(Image.fromarray(rgb_orig), out_img_path)
+                            hooks.emit_step(
+                                idx,
+                                total,
+                                img_path.name,
+                                "blocked",
+                                f"⚠ Tuyến {sc.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
+                            )
+                        continue
+
+                    for idx, img_path, out_img_path, json_path, clean_path, w, h, _rgb, clean_rgb, reg_items, _ocrs in chunk:
+                        translated_items, summary = batch_res.get(idx, (reg_items, ""))
+                        if summary:
+                            scene_summaries.append(summary)
+                        translated_items = adapt_regions_for_readability(translated_items, w, h)
+                        hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
+                        doc = PageDocument(
+                            image_path=str(img_path.resolve()),
+                            cleaned_image_path=str(clean_path.resolve()),
+                            width=w,
+                            height=h,
+                            mode="translate",
+                            source_language=lang,
+                            page_summary=summary,
+                            regions=translated_items,
+                        )
+                        json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+                        final_img = render_document(clean_rgb, doc)
+                        save_image(final_img, out_img_path)
+                        docs.append(doc)
+                        hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
 
         if save_cbz:
             package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
@@ -671,6 +777,16 @@ def run_compose_pipeline(
             )
         )
 
+        scenes = cluster_story_scenes(images)
+        if len(scenes) >= 2:
+            hooks.emit_step(
+                0,
+                total,
+                base_name,
+                "scene_cluster",
+                f"Phân tuyến thông minh: gom {total} ảnh thành {len(scenes)} tuyến/oneshot riêng để không trộn ngữ cảnh.",
+            )
+
         story_bible = _load_or_build_story_bible(
             story_llm,
             images,
@@ -682,6 +798,7 @@ def run_compose_pipeline(
             tags=tags,
             enable_story_pass=story_pass,
             resume=resume,
+            scenes=scenes,
             hooks=hooks,
         )
 

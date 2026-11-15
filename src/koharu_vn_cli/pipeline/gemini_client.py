@@ -21,11 +21,13 @@ from koharu_vn_cli.models import (
     BubbleStyle,
     CharacterProfile,
     ComposePreset,
+    SceneArc,
     StoryBible,
     TextRegionItem,
 )
 from koharu_vn_cli.pipeline.bubble_renderer import resolve_box_overlaps
 from koharu_vn_cli.pipeline.fonts import resolve_font_path
+from koharu_vn_cli.pipeline.scene_cluster import SceneGroup
 
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
@@ -495,9 +497,14 @@ class VisionLLMClient:
             try:
                 if transient_attempt == 0 and keys_tried == 1:
                     key_tag = f" [key {self._key_idx + 1}/{keys_total}]" if keys_total > 1 else ""
-                    self._emit_status(
-                        f"Đang gửi {len(images)} ảnh (~{img_kb} KB) tới {self.model}{key_tag} (timeout {int(self.timeout)}s)..."
-                    )
+                    if images:
+                        self._emit_status(
+                            f"Đang gửi {len(images)} ảnh (~{img_kb} KB) tới {self.model}{key_tag} (timeout {int(self.timeout)}s)..."
+                        )
+                    else:
+                        self._emit_status(
+                            f"Đang gửi text-only (OCR + Story Bible) tới {self.model}{key_tag} (timeout {int(self.timeout)}s)..."
+                        )
                 if self.base_url:
                     raw = self._call_openai_compatible(system_prompt, user_prompt, images, temperature)
                 else:
@@ -735,6 +742,20 @@ class VisionLLMClient:
         found.sort(key=lambda x: _model_sort_key(x[0]), reverse=True)
         return found[:limit]
 
+    _VI_LOCALIZATION_RULES = (
+        "NGUYÊN TẮC VIỆT HÓA TỰ NHIÊN & GỢI CẢM ĐÚNG CONTEXT (CỰC KỲ QUAN TRỌNG):\n"
+        "- Viết như người Việt ngoài đời đang nói chuyện/thì thầm/rên rỉ thật; TUYỆT ĐỐI KHÔNG dịch word-by-word, không văn viết, không lối diễn văn sách vở hay từ y khoa khô khan.\n"
+        "- Khi cảnh mang sắc thái thân mật/18+/trêu chọc, hãy dùng ngôn từ mềm mại, ướt át, gợi cảm hoặc táo bạo đúng với biểu cảm & ngữ cảnh gốc (vd: 'nhạy cảm quá...', 'đừng chạm chỗ đó mà...', 'sâu quá... chậm chút đi...', 'cứng hết cả lên rồi kìa', 'chịu hết nổi rồi...', 'bên trong khít chặt quá...').\n"
+        "- TUYỆT ĐỐI TRÁNH từ y khoa khô khan ('âm đạo', 'dương vật', 'giao hợp') và tiếng rên kiểu Anh ('UGH', 'GUH', 'BUH', 'NNGH', 'MMN', 'FUH'): đổi sang khẩu ngữ Việt tự nhiên theo sắc thái cảnh (nhẹ/vanilla: 'bên trong', 'chỗ đó', 'nóng hổi', 'ướt nhẹp'; thô/hardcore/NTR: 'nứng', 'chịch', 'bắn vào trong', 'dính bầu'...) và tiếng thở Việt ('Ư...', 'Ưm...', 'Á...', 'Aaa...', 'Hộc...', 'Khựa...').\n"
+        "- CẤM dùng từ cứng, sáo rỗng ít ai nói ngoài đời như: 'hắn ta', 'ả', 'gã', 'cô nàng', 'thực sự là', 'vô cùng', 'cái đó', 'vậy sao', 'thèm thuồng lắm chứ', 'kẻ hầu', 'ấn ký' (trừ khi đúng bối cảnh kỳ ảo cổ trang: mới dùng 'ta - ngươi' hoặc danh xưng cổ trang).\n"
+        "- Thay bằng khẩu ngữ ngắn gọn, có nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...): vd 'Cứ tưởng cô không thích cơ đấy', 'Ủa sao tự dưng...', 'Đừng có mà...', 'Nhói quá...'.\n"
+        "- Câu ngắn gọn vừa khung thoại, giữ đúng sắc thái ngại ngùng / trêu chọc / đê mê / hoảng hốt / áp đảo của tuyến cảnh.\n"
+        "- Không giải thích dài dòng, không thêm chú thích ngoài lời thoại.\n"
+        "- Tiếng động / SFX & tiếng thở dịch tự nhiên đúng chất doujinshi (vd: 'Ư...', 'Á...', 'Hộc...', 'CHỤT', 'NHÓP NHÉP', 'PHỤT', 'HẢ?!').\n"
+        "Bắt buộc trả về đúng JSON hợp lệ."
+    )
+
+
     def build_story_bible(
         self,
         image_paths: list[Path],
@@ -742,17 +763,42 @@ class VisionLLMClient:
         user_story: str | None = None,
         extra_instructions: str | None = None,
         tags: str | None = None,
+        scenes: list[SceneGroup] | None = None,
     ) -> StoryBible:
         """
-        Pass 1 global analysis: scan the whole chapter / CG set before translating Page 1
-        to lock characters, visual appearance, Vietnamese pronoun rules, and full plot arc.
+        Pass 1 global analysis: scan the whole chapter / CG set (or 1 crisp representative per
+        clustered visual scene when many similar frames/oneshots are stacked) before Pass 2.
         """
-        sheets = _build_story_contact_sheets(
-            image_paths,
-            max_pages=60,
-            pages_per_sheet=12,
-            include_keyframes=True,
-        )
+        multi_scene = bool(scenes and len(scenes) >= 2)
+        if multi_scene and scenes:
+            rep_paths = [image_paths[sc.rep_index] for sc in scenes]
+            rep_nums = [sc.rep_index + 1 for sc in scenes]
+            sheets = _build_story_contact_sheets(
+                rep_paths,
+                max_pages=60,
+                pages_per_sheet=9,
+                include_keyframes=True,
+                page_numbers=rep_nums,
+                total_pages=len(image_paths),
+            )
+            scene_lines = "\n".join(
+                f"- Tuyến {sc.scene_id}: Trang {sc.start_page}-{sc.end_page} ({len(sc.page_indices)} ảnh na ná nhau, ảnh đại diện #{sc.rep_index + 1})"
+                for sc in scenes
+            )
+            scenes_block = (
+                "\nPHÂN TUYẾN TỰ ĐỘNG (nhiều ảnh na ná nhau đã gom thành từng tuyến/oneshot riêng):\n"
+                f"{scene_lines}\n"
+                "Hãy điền mảng `scene_arcs` tương ứng TỪNG TUYẾN để Pass 2 dịch riêng biệt, KHÔNG trộn ngữ cảnh tuyến này sang tuyến khác!\n"
+            )
+        else:
+            sheets = _build_story_contact_sheets(
+                image_paths,
+                max_pages=60,
+                pages_per_sheet=12,
+                include_keyframes=True,
+            )
+            scenes_block = ""
+
         if not sheets and not user_story:
             return StoryBible()
 
@@ -777,10 +823,11 @@ class VisionLLMClient:
             "để NHẬN DIỆN CHÍNH XÁC TÊN GAME / SERIES (vd: Honkai: Star Rail, Blue Archive, Genshin Impact, Zenless Zone Zero, Arknights, Nikke, Azur Lane, Fate, Wuthering Waves...) "
             "và TÊN NHÂN VẬT GỐC TRONG GAME đó (nếu là nhân vật game/anime hãy ghi đúng tên chuẩn của nhân vật; nếu không chắc hoặc là OC hãy ghi rõ 'Chưa rõ / OC').\n"
             "Ưu tiên cặp xưng hô tự nhiên theo đúng quan hệ đời thực & lore nhân vật (anh/em, cậu/tớ, tao/mày, thầy/em, cô/cháu, ta/ngươi chỉ dùng cho cổ trang/fantasy).\n"
+            "Nếu có nhiều Tuyến/Oneshot tách biệt, hãy tóm tắt từng tuyến vào `scene_arcs` để tránh trộn lẫn bối cảnh.\n"
             "Trả về đúng JSON hợp lệ."
         )
         user_prompt = (
-            f"Tổng số ảnh: {len(image_paths)}.{user_hint}{tags_hint}{extra_hint}\n"
+            f"Tổng số ảnh: {len(image_paths)}.{scenes_block}{user_hint}{tags_hint}{extra_hint}\n"
             "Hãy trả về JSON Story Bible đúng cấu trúc:\n"
             "{\n"
             '  "title": "Tên gợi ý hoặc chủ đề chính của cảnh/chương",\n'
@@ -792,7 +839,10 @@ class VisionLLMClient:
             '  "characters": [\n'
             '    {"name": "Tên chuẩn nhân vật trong game (hoặc danh xưng nếu OC)", "appearance": "đặc điểm nhận diện (tóc, mắt, halo/tai/trang phục...)", "role_and_tone": "vai trò, tính cách", "pronoun_rules": "cặp xưng hô Tiếng Việt bắt buộc (vd: anh - em / chị - em)"}\n'
             "  ],\n"
-            '  "page_beats": {"1": "Tình huống cụ thể ảnh 1", "2": "Tình huống ảnh 2"}\n'
+            '  "scene_arcs": [\n'
+            '    {"scene_id": 1, "start_page": 1, "end_page": 7, "title": "Tiêu đề ngắn tuyến này", "plot": "Diễn biến & hoàn cảnh riêng tuyến 1", "pronoun_notes": "Xưng hô riêng tuyến này"}\n'
+            "  ],\n"
+            '  "page_beats": {"1": "Tình huống cụ thể ảnh 1"}\n'
             "}"
         )
         data = self._call_json(
@@ -812,6 +862,31 @@ class VisionLLMClient:
                         pronoun_rules=str(raw_c.get("pronoun_rules", "")).strip(),
                     )
                 )
+        arcs: list[SceneArc] = []
+        for raw_a in data.get("scene_arcs", []):
+            if not isinstance(raw_a, dict):
+                continue
+            try:
+                sid = int(raw_a.get("scene_id", len(arcs) + 1))
+                sp = int(raw_a.get("start_page", 1))
+                ep = int(raw_a.get("end_page", sp))
+            except (TypeError, ValueError):
+                continue
+            arcs.append(
+                SceneArc(
+                    scene_id=sid,
+                    start_page=min(sp, ep),
+                    end_page=max(sp, ep),
+                    title=str(raw_a.get("title", "")).strip(),
+                    plot=str(raw_a.get("plot", "")).strip(),
+                    pronoun_notes=str(raw_a.get("pronoun_notes", "")).strip(),
+                )
+            )
+        if not arcs and multi_scene and scenes:
+            arcs = [
+                SceneArc(scene_id=sc.scene_id, start_page=sc.start_page, end_page=sc.end_page)
+                for sc in scenes
+            ]
         raw_beats = data.get("page_beats") or {}
         beats = {str(k): str(v).strip() for k, v in raw_beats.items() if str(v).strip()}
         return StoryBible(
@@ -823,6 +898,7 @@ class VisionLLMClient:
             full_plot_summary=str(data.get("full_plot_summary", "")).strip(),
             characters=chars,
             page_beats=beats,
+            scene_arcs=arcs,
         )
 
     def translate_page(
@@ -864,16 +940,7 @@ class VisionLLMClient:
             "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu (Manga Nhật, Manhwa Hàn, Manhua Trung) chuyên bản địa hóa sang Tiếng Việt.\n"
             "Nhiệm vụ: Đọc chính xác chữ gốc trong từng khung [ID] từ Bảng Crop chi tiết kết hợp Ảnh toàn trang, "
             "rồi dịch thoát ý sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, gợi cảm/gợi tình đúng mức theo đúng sắc thái cảnh truyện và xưng hô đã khóa.\n"
-            "NGUYÊN TẮC VIỆT HÓA TỰ NHIÊN & GỢI CẢM ĐÚNG CONTEXT (CỰC KỲ QUAN TRỌNG):\n"
-            "- Viết như người Việt ngoài đời đang nói chuyện/thì thầm/rên rỉ thật; TUYỆT ĐỐI KHÔNG dịch word-by-word, không văn viết, không lối diễn văn sách vở hay từ y khoa khô khan.\n"
-            "- Khi cảnh mang sắc thái thân mật/18+/trêu chọc, hãy dùng ngôn từ mềm mại, ướt át, gợi cảm hoặc táo bạo đúng với biểu cảm & ngữ cảnh gốc (vd: 'nhạy cảm quá...', 'đừng chạm chỗ đó mà...', 'sâu quá... chậm chút đi...', 'cứng hết cả lên rồi kìa', 'chịu hết nổi rồi...', 'bên trong khít chặt quá...').\n"
-            "- TUYỆT ĐỐI TRÁNH từ y khoa khô khan ('âm đạo', 'dương vật', 'giao hợp') và tiếng rên kiểu Anh ('UGH', 'GUH', 'BUH', 'NNGH', 'MMN', 'FUH'): đổi sang khẩu ngữ Việt tự nhiên theo sắc thái cảnh (nhẹ/vanilla: 'bên trong', 'chỗ đó', 'nóng hổi', 'ướt nhẹp'; thô/hardcore/NTR: 'nứng', 'chịch', 'bắn vào trong', 'dính bầu'...) và tiếng thở Việt ('Ư...', 'Ưm...', 'Á...', 'Aaa...', 'Hộc...', 'Khựa...').\n"
-            "- CẤM dùng từ cứng, sáo rỗng ít ai nói ngoài đời như: 'hắn ta', 'ả', 'gã', 'cô nàng', 'thực sự là', 'vô cùng', 'cái đó', 'vậy sao', 'thèm thuồng lắm chứ', 'kẻ hầu', 'ấn ký' (trừ khi đúng bối cảnh kỳ ảo cổ trang: mới dùng 'ta - ngươi' hoặc danh xưng cổ trang).\n"
-            "- Thay bằng khẩu ngữ ngắn gọn, có nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...): vd 'Cứ tưởng cô không thích cơ đấy', 'Ủa sao tự dưng...', 'Đừng có mà...', 'Nhói quá...'.\n"
-            "- Câu ngắn gọn vừa khung thoại, giữ đúng sắc thái ngại ngùng / trêu chọc / đê mê / hoảng hốt / áp đảo trên nét mặt nhân vật.\n"
-            "- Không giải thích dài dòng, không thêm chú thích ngoài lời thoại.\n"
-            "- Tiếng động / SFX & tiếng thở dịch tự nhiên đúng chất doujinshi (vd: 'Ư...', 'Á...', 'Hộc...', 'CHỤT', 'NHÓP NHÉP', 'PHỤT', 'HẢ?!').\n"
-            "Bắt buộc trả về đúng JSON hợp lệ."
+            + self._VI_LOCALIZATION_RULES
         )
 
         lang_hint = (
@@ -913,9 +980,18 @@ class VisionLLMClient:
             images=images_payload,
             temperature=0.25,
         )
+        return self._merge_translated_regions(regions, data.get("items", [])), str(data.get("page_summary", "")).strip()
 
+    @staticmethod
+    def _merge_translated_regions(
+        regions: list[TextRegionItem],
+        raw_items: list[Any],
+        ocr_texts: dict[int, str] | None = None,
+    ) -> list[TextRegionItem]:
         by_id: dict[int, dict[str, Any]] = {}
-        for item in data.get("items", []):
+        for item in raw_items or []:
+            if not isinstance(item, dict):
+                continue
             try:
                 by_id[int(item["id"])] = item
             except (KeyError, TypeError, ValueError):
@@ -925,12 +1001,207 @@ class VisionLLMClient:
         for reg in regions:
             copy = reg.model_copy()
             match = by_id.get(copy.id)
+            fallback_src = (ocr_texts or {}).get(copy.id, copy.source_text)
             if match:
-                copy.source_text = str(match.get("source_text", "")).strip()
+                copy.source_text = str(match.get("source_text", fallback_src)).strip() or fallback_src
                 copy.translated_text = str(match.get("vietnamese", "")).strip()
+            elif fallback_src:
+                copy.source_text = fallback_src
             updated.append(copy)
+        return updated
 
-        return updated, str(data.get("page_summary", "")).strip()
+    def _build_ocr_context_blocks(
+        self,
+        *,
+        source_lang: str,
+        previous_summaries: list[str] | None,
+        extra_instructions: str | None,
+        story_bible: StoryBible | None,
+        page_index: int | None,
+        tags: str | None,
+    ) -> tuple[str, str]:
+        bible_block = ""
+        if story_bible:
+            bible_txt = story_bible.to_prompt_block(page_index=page_index)
+            if bible_txt:
+                bible_block = f"\n=== HỒ SƠ CỐT TRUYỆN & NHÂN VẬT ===\n{bible_txt}\n===================================\n"
+        context_block = ""
+        if previous_summaries:
+            joined = "\n".join(f"- Trang trước gần {i + 1}: {s}" for i, s in enumerate(previous_summaries[-6:]))
+            context_block = f"\nDiễn biến vừa xảy ra trong cùng tuyến:\n{joined}\n"
+        tags_block = _format_tags_block(tags)
+        extra_block = f"\nYêu cầu thêm từ người dùng: {extra_instructions}\n" if extra_instructions else ""
+        lang_hint = (
+            "Tự nhận diện Nhật/Hàn/Trung/Anh" if source_lang == "auto" else f"Ngôn ngữ gốc ưu tiên: {source_lang}"
+        )
+        return lang_hint, f"{bible_block}{context_block}{tags_block}{extra_block}"
+
+    def translate_page_from_ocr(
+        self,
+        regions: list[TextRegionItem],
+        ocr_texts: dict[int, str],
+        source_lang: str = "auto",
+        previous_summaries: list[str] | None = None,
+        extra_instructions: str | None = None,
+        story_bible: StoryBible | None = None,
+        page_index: int | None = None,
+        tags: str | None = None,
+    ) -> tuple[list[TextRegionItem], str]:
+        """Text-only Pass 2 translation using local ONNX OCR output + Pass 1 StoryBible (sends zero images)."""
+        if not regions:
+            return regions, ""
+
+        lang_hint, ctx_block = self._build_ocr_context_blocks(
+            source_lang=source_lang,
+            previous_summaries=previous_summaries,
+            extra_instructions=extra_instructions,
+            story_bible=story_bible,
+            page_index=page_index,
+            tags=tags,
+        )
+        lines = []
+        for r in regions:
+            raw_txt = ocr_texts.get(r.id, "").strip() or "(trống / tiếng thở ngắn)"
+            x1, y1, x2, y2 = r.text_bbox
+            kind = "Dọc" if (y2 - y1) > (x2 - x1) * 1.25 else "Ngang"
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            lines.append(f"- ID {r.id} ({kind}, tâm=({cx},{cy})): {raw_txt}")
+        ocr_block = "\n".join(lines)
+
+        system_prompt = (
+            "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu (Manga Nhật, Manhwa Hàn, Manhua Trung) chuyên bản địa hóa sang Tiếng Việt.\n"
+            "Chế độ NO-VISION: Chữ gốc từng khung đã được OCR cục bộ trích sẵn bên dưới. "
+            "Hãy tự sửa lỗi nhận dạng OCR nhỏ nếu hiển nhiên dựa vào Story Bible & tuyến cảnh hiện tại, "
+            "rồi dịch sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, đúng xưng hô đã khóa.\n"
+            + self._VI_LOCALIZATION_RULES
+        )
+        page_label = f" (Trang {page_index})" if page_index else ""
+        user_prompt = (
+            f"{lang_hint}{page_label}.{ctx_block}\n"
+            f"Danh sách chữ OCR cục bộ theo khung thoại:\n{ocr_block}\n\n"
+            "Trả về JSON theo đúng cấu trúc:\n"
+            "{\n"
+            '  "detected_language": "ja | ko | zh | en | mixed",\n'
+            '  "page_summary": "Tóm tắt 1-2 câu diễn biến & xưng hô của trang này bằng tiếng Việt",\n'
+            '  "items": [\n'
+            '    {"id": 1, "source_text": "...", "vietnamese": "...", "is_sfx": false}\n'
+            "  ]\n"
+            "}"
+        )
+        data = self._call_json(system_prompt, user_prompt, images=[], temperature=0.25)
+        return (
+            self._merge_translated_regions(regions, data.get("items", []), ocr_texts=ocr_texts),
+            str(data.get("page_summary", "")).strip(),
+        )
+
+    def translate_scene_from_ocr(
+        self,
+        scene_pages: list[tuple[int, list[TextRegionItem], dict[int, str]]],
+        source_lang: str = "auto",
+        previous_summaries: list[str] | None = None,
+        extra_instructions: str | None = None,
+        story_bible: StoryBible | None = None,
+        tags: str | None = None,
+        *,
+        scene_id: int | None = None,
+    ) -> dict[int, tuple[list[TextRegionItem], str]]:
+        """
+        Batch text-only Pass 2 translation for all text pages in ONE clustered scene/oneshot.
+        Sends ZERO images and falls back per-page if any page is omitted in the JSON response.
+        """
+        if not scene_pages:
+            return {}
+        if len(scene_pages) == 1:
+            pno, regs, ocrs = scene_pages[0]
+            return {
+                pno: self.translate_page_from_ocr(
+                    regs,
+                    ocrs,
+                    source_lang=source_lang,
+                    previous_summaries=previous_summaries,
+                    extra_instructions=extra_instructions,
+                    story_bible=story_bible,
+                    page_index=pno,
+                    tags=tags,
+                )
+            }
+
+        rep_page_no = scene_pages[0][0]
+        lang_hint, ctx_block = self._build_ocr_context_blocks(
+            source_lang=source_lang,
+            previous_summaries=previous_summaries,
+            extra_instructions=extra_instructions,
+            story_bible=story_bible,
+            page_index=rep_page_no,
+            tags=tags,
+        )
+
+        page_blocks: list[str] = []
+        for pno, regs, ocrs in scene_pages:
+            r_lines = [
+                f"  - ID {r.id}: {ocrs.get(r.id, '').strip() or '(trống / tiếng thở ngắn)'}"
+                for r in regs
+            ]
+            page_blocks.append(f"[Trang {pno}]\n" + "\n".join(r_lines))
+        joined_pages = "\n\n".join(page_blocks)
+
+        system_prompt = (
+            "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu chuyên bản địa hóa sang Tiếng Việt.\n"
+            "Chế độ NO-VISION THEO TUYẾN (Batch OCR): Dưới đây là toàn bộ lời thoại OCR của các trang thuộc CÙNG MỘT TUYẾN/ONESHOT. "
+            "Hãy dịch liền mạch, nối nhịp cảm xúc & xưng hô nhất quán xuyên suốt các trang trong tuyến này.\n"
+            + self._VI_LOCALIZATION_RULES
+        )
+        scene_hdr = f"Tuyến {scene_id}" if scene_id is not None else "Cùng 1 tuyến"
+        user_prompt = (
+            f"{lang_hint} — {scene_hdr} ({len(scene_pages)} trang có thoại).{ctx_block}\n"
+            f"Nội dung OCR từng trang:\n{joined_pages}\n\n"
+            "Trả về đúng JSON cho TẤT CẢ các trang trên:\n"
+            "{\n"
+            '  "pages": [\n'
+            "    {\n"
+            f'      "page": {rep_page_no},\n'
+            '      "page_summary": "Tóm tắt ngắn trang này",\n'
+            '      "items": [{"id": 1, "source_text": "...", "vietnamese": "...", "is_sfx": false}]\n'
+            "    }\n"
+            "  ]\n"
+            "}"
+        )
+        data = self._call_json(system_prompt, user_prompt, images=[], temperature=0.25)
+
+        by_page: dict[int, dict[str, Any]] = {}
+        for p_entry in data.get("pages", []):
+            if not isinstance(p_entry, dict):
+                continue
+            try:
+                by_page[int(p_entry["page"])] = p_entry
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        out: dict[int, tuple[list[TextRegionItem], str]] = {}
+        rolling_summaries = list(previous_summaries or [])
+        for pno, regs, ocrs in scene_pages:
+            entry = by_page.get(pno)
+            if entry and isinstance(entry.get("items"), list):
+                merged = self._merge_translated_regions(regs, entry["items"], ocr_texts=ocrs)
+                summary = str(entry.get("page_summary", "")).strip()
+                out[pno] = (merged, summary)
+                if summary:
+                    rolling_summaries.append(summary)
+            else:
+                res = self.translate_page_from_ocr(
+                    regs,
+                    ocrs,
+                    source_lang=source_lang,
+                    previous_summaries=rolling_summaries,
+                    extra_instructions=extra_instructions,
+                    story_bible=story_bible,
+                    page_index=pno,
+                    tags=tags,
+                )
+                out[pno] = res
+                if res[1]:
+                    rolling_summaries.append(res[1])
+        return out
 
     def compose_cg_page(
         self,

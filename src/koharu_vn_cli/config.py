@@ -51,6 +51,7 @@ class AppConfig(BaseModel):
     output_format: str = "webp"
     sequential_names: bool = True
     review_characters: bool = True
+    vision_translate: bool = True
     theme: str = "tokyo-night"
     last_output_dir: Optional[str] = None
     last_input_path: Optional[str] = None

@@ -58,6 +58,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
     SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật game sau Pass 1"),
+    SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
     SlashSpec("/lang", "", "Chọn ngôn ngữ nguồn ưu tiên (auto / ja / ko / zh / en)"),
     SlashSpec("/font", "", "Chọn font Tiếng Việt mặc định"),
@@ -1448,6 +1449,23 @@ class KoharuTUI(App[None]):
                 save_config(self.cfg)
                 state = "BẬT" if self.cfg.review_characters else "TẮT"
                 self._log_ai(f"Kiểm tra & sửa tên nhân vật game sau Pass 1: [bold cyan]{state}[/bold cyan].")
+        elif cmd == "/vision":
+            val = rest.strip().lower()
+            if val in {"on", "1", "true"}:
+                self.cfg.vision_translate = True
+            elif val in {"off", "0", "false"}:
+                self.cfg.vision_translate = False
+            else:
+                self.cfg.vision_translate = not self.cfg.vision_translate
+            save_config(self.cfg)
+            if self.cfg.vision_translate:
+                self._log_ai(
+                    "Đã [bold cyan]BẬT Vision[/bold cyan] cho Pass 2 (Model con vừa xem ảnh vừa dịch)."
+                )
+            else:
+                self._log_ai(
+                    "Đã [bold yellow]TẮT Vision[/bold yellow] cho Pass 2: Model lớn xem ảnh dựng Story Bible theo tuyến -> OCR cục bộ CPU (manga-ocr-onnx) -> Model con chỉ dịch text theo tuyến (siêu nhanh, né lọc ảnh)."
+                )
         else:
             self._log_ai(f"Không rõ lệnh `[bold]{cmd}[/bold]`. Gõ `/help` hoặc `/` để xem các lệnh hỗ trợ.", style="yellow")
 
@@ -1824,6 +1842,7 @@ class KoharuTUI(App[None]):
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
+                vision_translate=self.cfg.vision_translate,
                 resume=resume,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
@@ -1877,6 +1896,7 @@ class KoharuTUI(App[None]):
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
+                vision_translate=self.cfg.vision_translate,
                 resume=resume,
                 hooks=self._build_hooks(),
             )
