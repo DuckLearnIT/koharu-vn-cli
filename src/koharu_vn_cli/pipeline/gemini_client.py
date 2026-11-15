@@ -114,10 +114,33 @@ def _repair_truncated_json(text: str) -> str:
     return repaired + "".join(reversed(stack))
 
 
+def _looks_like_soft_refusal(text: str) -> bool:
+    low = text.lower()
+    markers = (
+        "tôi không thể",
+        "tôi bị giới hạn",
+        "không được phép tạo",
+        "nguyên tắc an toàn",
+        "giới hạn an toàn",
+        "i cannot",
+        "i can't",
+        "i am unable",
+        "i'm unable",
+        "cannot assist",
+        "cannot fulfill",
+        "safety guidelines",
+        "against my",
+    )
+    return any(m in low for m in markers)
+
+
 def _extract_json_block(raw: str) -> Any:
     if not raw or not raw.strip():
         raise ValueError("Empty LLM response (no JSON content)")
     text = re.sub(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", "", raw, flags=re.IGNORECASE).strip()
+    if not text:
+        # Some reasoning models occasionally place output inside <think>; inspect raw before failing
+        text = raw.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
     if fence:
         text = fence.group(1).strip()
@@ -172,7 +195,13 @@ def _extract_json_block(raw: str) -> Any:
             except json.JSONDecodeError:
                 continue
 
-    return json.loads(text)
+    preview = text.strip().replace("\n", " ")[:220]
+    if _looks_like_soft_refusal(text):
+        raise ContentBlockedError(
+            f"Model từ chối trả lời (không xuất JSON): \"{preview}\" — "
+            "Mẹo: Thử xóa/đổi các từ nhạy cảm trong `/tags` (gõ `/tags clear`), chọn `/story-model` khác hoặc dùng `--base-url` phù hợp."
+        )
+    raise ValueError(f"Model trả về văn bản không phải JSON: {preview!r}")
 
 
 def _build_annotated_page_and_collage(
@@ -537,7 +566,10 @@ class VisionLLMClient:
                     request=resp.request,
                     response=resp,
                 )
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"API HTTP {resp.status_code} trả về non-JSON: {resp.text[:180]!r}") from exc
 
         candidates = data.get("candidates") or []
         if not candidates:
@@ -602,7 +634,10 @@ class VisionLLMClient:
                     request=resp.request,
                     response=resp,
                 )
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"API HTTP {resp.status_code} trả về non-JSON: {resp.text[:180]!r}") from exc
         msg_content = data["choices"][0]["message"].get("content", "")
         if isinstance(msg_content, list):
             return "\n".join(

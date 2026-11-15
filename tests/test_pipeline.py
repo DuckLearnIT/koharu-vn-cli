@@ -967,3 +967,10 @@ def test_extract_json_block_handles_think_tags_trailing_commas_and_truncation():
     repaired = _extract_json_block(truncated)
     assert repaired["title"] == "Trunc"
     assert repaired["characters"][0]["name"] == "Firefly"
+
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError
+    import pytest
+
+    with pytest.raises(ContentBlockedError) as exc_info:
+        _extract_json_block("Tôi không thể đáp ứng yêu cầu này do quy tắc an toàn.")
+    assert "/tags clear" in str(exc_info.value)
