@@ -1,0 +1,716 @@
+"""Shared execution pipelines for translate, compose, and rerender across CLI and TUI."""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+from PIL import Image
+
+from koharu_vn_cli.models import ComposePreset, PageDocument, StoryBible, TextRegionItem
+from koharu_vn_cli.pipeline.bubble_renderer import render_bubbles, resolve_box_overlaps
+from koharu_vn_cli.pipeline.detector import ComicDetector, _ensure_ctd_model
+from koharu_vn_cli.pipeline.gemini_client import DEFAULT_GEMINI_MODEL, VisionLLMClient
+from koharu_vn_cli.pipeline.inpaint import (
+    HybridInpainter,
+    build_erasure_mask,
+    classify_region_colors,
+)
+from koharu_vn_cli.pipeline.typesetter import (
+    adapt_regions_for_readability,
+    render_text_regions,
+    solve_layout,
+)
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+class PipelineCancelledError(RuntimeError):
+    """Raised when a user cancels an active TUI/CLI job cleanly."""
+
+
+@dataclass
+class PipelineHooks:
+    """Optional progress and inspection callbacks used by Rich CLI or Textual TUI."""
+
+    on_step: Optional[Callable[[int, int, str, str, str], None]] = None
+    on_page_done: Optional[Callable[[int, int, str, PageDocument, Path], None]] = None
+    on_story_bible: Optional[Callable[[StoryBible], None]] = None
+    is_cancelled: Optional[Callable[[], bool]] = None
+
+    def emit_step(self, idx: int, total: int, name: str, stage: str, detail: str = "") -> None:
+        if self.on_step:
+            self.on_step(idx, total, name, stage, detail)
+
+    def emit_page_done(
+        self, idx: int, total: int, name: str, doc: PageDocument, out_path: Path
+    ) -> None:
+        if self.on_page_done:
+            self.on_page_done(idx, total, name, doc, out_path)
+
+    def emit_story_bible(self, bible: StoryBible) -> None:
+        if self.on_story_bible:
+            self.on_story_bible(bible)
+
+    def check_cancelled(self) -> None:
+        if self.is_cancelled and self.is_cancelled():
+            raise PipelineCancelledError("Người dùng đã hủy tác vụ.")
+
+
+class ModelCache:
+    """Keep loaded ONNX sessions warm across pages and interactive TUI jobs."""
+
+    def __init__(self) -> None:
+        self._detector: ComicDetector | None = None
+        self._detector_accurate: bool | None = None
+        self._inpainter: HybridInpainter | None = None
+
+    def get_detector(self, accurate: bool = True) -> ComicDetector:
+        if self._detector is None or self._detector_accurate != accurate:
+            self._detector = ComicDetector(accurate=accurate)
+            self._detector_accurate = accurate
+        return self._detector
+
+    def get_inpainter(self) -> HybridInpainter:
+        if self._inpainter is None:
+            self._inpainter = HybridInpainter()
+        return self._inpainter
+
+    def warmup_all(self, accurate: bool = True) -> tuple[ComicDetector, HybridInpainter]:
+        det = self.get_detector(accurate=accurate)
+        _ensure_ctd_model()
+        inp = self.get_inpainter()
+        return det, inp
+
+
+_EMBEDDED_PAGE_RE = re.compile(
+    r"^file_\d+_(\d+)_(?:webp|png|jpe?g|bmp|gif)(?:_|$)", re.IGNORECASE
+)
+
+
+def _detect_image_ext(path: Path) -> str | None:
+    """Detect image format from suffix or magic bytes (handles extensionless scraped/cached files)."""
+    suf = path.suffix.lower()
+    if suf in IMAGE_EXTS:
+        return suf
+    if suf in {".zip", ".cbz", ".json", ".txt", ".md", ".pdf"}:
+        return None
+    try:
+        with path.open("rb") as fh:
+            hdr = fh.read(16)
+    except OSError:
+        return None
+    if hdr.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if hdr.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(hdr) >= 12 and hdr[:4] == b"RIFF" and hdr[8:12] == b"WEBP":
+        return ".webp"
+    if hdr.startswith(b"BM"):
+        return ".bmp"
+    if hdr[:6] in (b"GIF87a", b"GIF89a"):
+        return ".png"
+    return None
+
+
+def _is_supported_image(path: Path) -> bool:
+    return path.is_file() and _detect_image_ext(path) is not None
+
+
+def _output_image_name(path: Path) -> str:
+    if path.suffix.lower() in IMAGE_EXTS:
+        return path.name
+    ext = _detect_image_ext(path) or ".png"
+    return f"{path.name}{ext}"
+
+
+def natural_key(path: Path) -> tuple[int, int, list[int | str]]:
+    parts: list[int | str] = [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", path.name)]
+    m = _EMBEDDED_PAGE_RE.match(path.name)
+    if m:
+        return (0, int(m.group(1)), parts)
+    return (1, 0, parts)
+
+
+def collect_inputs(input_path: Path, extract_dir: Path | None) -> tuple[list[Path], str]:
+    """Collect naturally sorted image paths from a single image, folder, or .zip/.cbz archive."""
+    if not input_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy đường dẫn: {input_path}")
+
+    if input_path.is_file():
+        if input_path.suffix.lower() in {".zip", ".cbz"}:
+            if extract_dir is None:
+                raise ValueError("extract_dir is required for archive input")
+            root_resolved = extract_dir.resolve()
+            with zipfile.ZipFile(input_path, "r") as zf:
+                for member in zf.infolist():
+                    target = (root_resolved / member.filename).resolve()
+                    if not target.is_relative_to(root_resolved):
+                        continue
+                    zf.extract(member, extract_dir)
+            imgs = sorted(
+                (p for p in extract_dir.rglob("*") if _is_supported_image(p)),
+                key=natural_key,
+            )
+            return imgs, input_path.stem
+        if _is_supported_image(input_path):
+            return [input_path], input_path.stem
+        raise ValueError(f"Định dạng file không hỗ trợ: {input_path.suffix or '(không có đuôi file)'}")
+
+    imgs = sorted(
+        (p for p in input_path.iterdir() if _is_supported_image(p)),
+        key=natural_key,
+    )
+    if not imgs:
+        imgs = sorted(
+            (p for p in input_path.rglob("*") if _is_supported_image(p)),
+            key=natural_key,
+        )
+    return imgs, input_path.name
+
+
+def load_rgb(path: Path) -> np.ndarray:
+    """Load image safely using Pillow (supports Unicode/Vietnamese filenames on Windows)."""
+    with Image.open(path) as img:
+        return np.array(img.convert("RGB"), dtype=np.uint8)
+
+
+def save_image(pil_img: Image.Image, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ext = out_path.suffix.lower()
+    if ext in {".jpg", ".jpeg"}:
+        pil_img.convert("RGB").save(out_path, format="JPEG", quality=94)
+    elif ext == ".webp":
+        pil_img.convert("RGB").save(out_path, format="WEBP", quality=92)
+    else:
+        pil_img.convert("RGB").save(out_path, format="PNG")
+
+
+def render_document(base_rgb: np.ndarray, doc: PageDocument) -> Image.Image:
+    canvas = Image.fromarray(base_rgb).convert("RGBA")
+    canvas = render_bubbles(canvas, doc.regions)
+    canvas = render_text_regions(canvas, doc.regions)
+    return canvas
+
+
+def package_cbz(output_dir: Path, cbz_path: Path) -> None:
+    imgs = sorted(
+        (p for p in output_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+        key=natural_key,
+    )
+    with zipfile.ZipFile(cbz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for img in imgs:
+            zf.write(img, arcname=img.name)
+
+
+def expand_composed_boxes_if_tight(
+    regions: list[TextRegionItem], img_w: int, img_h: int
+) -> list[TextRegionItem]:
+    """Gently enlarge proposed compose boxes when text would otherwise shrink below readable size."""
+    adjusted: list[TextRegionItem] = []
+    for reg in regions:
+        layout = solve_layout(reg)
+        copy = reg.model_copy()
+        if layout.font_size < 14 or layout.overflowed:
+            bx1, by1, bx2, by2 = copy.bubble_bbox or copy.text_bbox
+            bw, bh = bx2 - bx1, by2 - by1
+            scale = 1.28 if layout.overflowed else 1.18
+            nbw = int(bw * scale)
+            nbh = int(bh * scale)
+            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+            nx1 = max(8, cx - nbw // 2)
+            ny1 = max(8, cy - nbh // 2)
+            nx2 = min(img_w - 8, nx1 + nbw)
+            ny2 = min(img_h - 8, ny1 + nbh)
+            box = (nx1, ny1, max(nx1 + 24, nx2), max(ny1 + 20, ny2))
+            copy.text_bbox = box
+            if copy.kind == "bubble":
+                copy.bubble_bbox = box
+        adjusted.append(copy)
+    return resolve_box_overlaps(adjusted, img_w, img_h)
+
+
+def resolve_story_text(story: str | None) -> str | None:
+    """Resolve user `--story` argument as a .txt/.md file content if valid path, else plain text."""
+    if not story:
+        return None
+    s = story.strip()
+    cand = Path(s).expanduser()
+    if cand.is_file() and cand.suffix.lower() in {".txt", ".md", ".json"}:
+        return cand.read_text(encoding="utf-8", errors="ignore").strip()
+    return s
+
+
+def _load_or_build_story_bible(
+    llm: VisionLLMClient,
+    images: list[Path],
+    cache_dir: Path,
+    base_name: str,
+    *,
+    mode: str,
+    user_story: str | None,
+    prompt: str | None,
+    tags: str | None = None,
+    enable_story_pass: bool,
+    resume: bool,
+    hooks: PipelineHooks,
+) -> StoryBible | None:
+    """Shared Pass-1 global story & character analysis across translate and compose pipelines."""
+    bible_path = cache_dir / "story_bible.json"
+    if resume and bible_path.is_file():
+        try:
+            bible = StoryBible.model_validate_json(bible_path.read_text(encoding="utf-8"))
+            hooks.emit_story_bible(bible)
+            return bible
+        except Exception:
+            pass
+
+    resolved_story = resolve_story_text(user_story)
+    if not enable_story_pass:
+        return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
+
+    hooks.emit_step(
+        0,
+        len(images),
+        base_name,
+        "story_pass",
+        f"Pass 1 [Model chính: {llm.model}]: Tự động xem full {len(images)} ảnh -> phân tích cốt truyện, nhân vật & xưng hô...",
+    )
+    bible = llm.build_story_bible(
+        images,
+        mode=mode,
+        user_story=resolved_story,
+        extra_instructions=prompt,
+        tags=tags,
+    )
+    bible_path.write_text(bible.model_dump_json(indent=2), encoding="utf-8")
+    hooks.emit_story_bible(bible)
+    return bible
+
+
+def run_translate_pipeline(
+    input_path: Path,
+    *,
+    output: Path | None = None,
+    lang: str = "auto",
+    api_key: str | None = None,
+    api_keys: list[str] | None = None,
+    base_url: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    story_model: str | None = None,
+    prompt: str | None = None,
+    story: str | None = None,
+    tags: str | None = None,
+    story_pass: bool = True,
+    font: str | None = None,
+    conf: float = 0.34,
+    accurate_detector: bool = True,
+    save_cbz: bool = False,
+    resume: bool = False,
+    model_cache: ModelCache | None = None,
+    hooks: PipelineHooks | None = None,
+) -> tuple[Path, list[PageDocument]]:
+    """Run full manga translation pipeline end-to-end and return output dir & documents."""
+    hooks = hooks or PipelineHooks()
+    cache = model_cache or ModelCache()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        if not images:
+            raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
+
+        out_dir = output or input_path.parent / f"{base_name}_vn"
+        cache_dir = out_dir / ".koharu_cache"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        total = len(images)
+        eff_story_model = (story_model or "").strip() or model
+        hooks.emit_step(
+            0,
+            total,
+            base_name,
+            "init",
+            f"Kiểm tra API & ONNX (Chính: {eff_story_model} -> Phụ: {model})...",
+        )
+        llm = VisionLLMClient(
+            api_key=api_key,
+            api_keys=api_keys,
+            model=model,
+            base_url=base_url,
+            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+        )
+        story_llm = (
+            llm
+            if eff_story_model == model
+            else VisionLLMClient(
+                api_key=api_key,
+                api_keys=api_keys,
+                model=eff_story_model,
+                base_url=base_url,
+                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            )
+        )
+        detector = cache.get_detector(accurate=accurate_detector)
+        inpainter = cache.get_inpainter()
+
+        story_bible = _load_or_build_story_bible(
+            story_llm,
+            images,
+            cache_dir,
+            base_name,
+            mode="translate",
+            user_story=story,
+            prompt=prompt,
+            tags=tags,
+            enable_story_pass=story_pass,
+            resume=resume,
+            hooks=hooks,
+        )
+
+        previous_summaries: list[str] = []
+        docs: list[PageDocument] = []
+
+        for idx, img_path in enumerate(images, start=1):
+            hooks.check_cancelled()
+            out_img_path = out_dir / _output_image_name(img_path)
+            json_path = cache_dir / f"{img_path.stem}.koharu.json"
+
+            if resume and out_img_path.is_file() and json_path.is_file():
+                prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
+                if prev_doc.page_summary:
+                    previous_summaries.append(prev_doc.page_summary)
+                docs.append(prev_doc)
+                hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
+                hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
+                continue
+
+            rgb = load_rgb(img_path)
+            h, w = rgb.shape[:2]
+
+            hooks.emit_step(idx, total, img_path.name, "detect", f"Đọc ảnh {w}×{h}, đang dò khung thoại...")
+            detected, seg_mask = detector.detect(rgb, conf_thresh=conf)
+            if not detected:
+                save_image(Image.fromarray(rgb), out_img_path)
+                doc = PageDocument(
+                    image_path=str(img_path.resolve()),
+                    cleaned_image_path=str(out_img_path.resolve()),
+                    width=w,
+                    height=h,
+                    mode="translate",
+                    source_language=lang,
+                    regions=[],
+                )
+                docs.append(doc)
+                hooks.emit_step(idx, total, img_path.name, "empty", "Không có khung thoại, giữ nguyên ảnh gốc")
+                hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+                continue
+
+            hooks.check_cancelled()
+            t0 = time.perf_counter()
+            hooks.emit_step(
+                idx,
+                total,
+                img_path.name,
+                "inpaint",
+                f"Phát hiện {len(detected)} vùng chữ — đang tạo mask & tẩy chữ gốc...",
+            )
+            erasure_mask = build_erasure_mask(rgb, seg_mask, detected)
+            clean_rgb = inpainter.inpaint(rgb, erasure_mask)
+
+            clean_path = cache_dir / f"{img_path.stem}.clean.png"
+            save_image(Image.fromarray(clean_rgb), clean_path)
+
+            region_items: list[TextRegionItem] = []
+            for reg_idx, reg in enumerate(detected, start=1):
+                t_col, s_col, s_factor, is_dark = classify_region_colors(
+                    rgb, clean_rgb, erasure_mask, reg
+                )
+                region_items.append(
+                    TextRegionItem(
+                        id=reg_idx,
+                        kind="bubble" if reg.is_bubble else "floating",
+                        text_bbox=reg.text_bbox,
+                        bubble_bbox=reg.bubble_bbox,
+                        bubble_contour=reg.bubble_contour,
+                        text_color=t_col,
+                        stroke_color=s_col,
+                        stroke_width=None if s_factor > 0 else 0.0,
+                        font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
+                        angle=reg.angle,
+                        is_dark_bubble=is_dark,
+                        draw_bubble=False,
+                        confidence=reg.confidence,
+                    )
+                )
+
+            hooks.check_cancelled()
+            hooks.emit_step(
+                idx,
+                total,
+                img_path.name,
+                "llm",
+                f"Đang gửi {len(region_items)} vùng chữ lên {model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
+            )
+            prev_rgb = load_rgb(images[idx - 2]) if idx > 1 else None
+            next_rgb = load_rgb(images[idx]) if idx < total else None
+            translated_items, summary = llm.translate_page(
+                rgb=rgb,
+                regions=region_items,
+                source_lang=lang,
+                previous_summaries=previous_summaries,
+                extra_instructions=prompt,
+                story_bible=story_bible,
+                page_index=idx,
+                prev_rgb=prev_rgb,
+                next_rgb=next_rgb,
+                tags=tags,
+            )
+            if summary:
+                previous_summaries.append(summary)
+            translated_items = adapt_regions_for_readability(translated_items, w, h)
+
+            hooks.check_cancelled()
+            hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
+            doc = PageDocument(
+                image_path=str(img_path.resolve()),
+                cleaned_image_path=str(clean_path.resolve()),
+                width=w,
+                height=h,
+                mode="translate",
+                source_language=lang,
+                page_summary=summary,
+                regions=translated_items,
+            )
+            json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+
+            final_img = render_document(clean_rgb, doc)
+            save_image(final_img, out_img_path)
+            docs.append(doc)
+            hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+
+        if save_cbz:
+            package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
+        return out_dir, docs
+
+
+def run_compose_pipeline(
+    input_path: Path,
+    *,
+    output: Path | None = None,
+    style: ComposePreset = ComposePreset.CG_OVAL,
+    density: str = "medium",
+    prompt: str | None = None,
+    story: str | None = None,
+    tags: str | None = None,
+    story_pass: bool = True,
+    api_key: str | None = None,
+    api_keys: list[str] | None = None,
+    base_url: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    story_model: str | None = None,
+    font: str | None = None,
+    save_cbz: bool = False,
+    resume: bool = False,
+    hooks: PipelineHooks | None = None,
+) -> tuple[Path, list[PageDocument]]:
+    """Run Artist CG dialogue composition pipeline end-to-end."""
+    hooks = hooks or PipelineHooks()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        if not images:
+            raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
+
+        out_dir = output or input_path.parent / f"{base_name}_composed"
+        cache_dir = out_dir / ".koharu_cache"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        total = len(images)
+        eff_story_model = (story_model or "").strip() or model
+        hooks.emit_step(
+            0,
+            total,
+            base_name,
+            "init",
+            f"Khởi tạo sáng tác CG ({style.value} | Chính: {eff_story_model} -> Phụ: {model})...",
+        )
+        llm = VisionLLMClient(
+            api_key=api_key,
+            api_keys=api_keys,
+            model=model,
+            base_url=base_url,
+            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+        )
+        story_llm = (
+            llm
+            if eff_story_model == model
+            else VisionLLMClient(
+                api_key=api_key,
+                api_keys=api_keys,
+                model=eff_story_model,
+                base_url=base_url,
+                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            )
+        )
+
+        story_bible = _load_or_build_story_bible(
+            story_llm,
+            images,
+            cache_dir,
+            base_name,
+            mode="compose",
+            user_story=story,
+            prompt=prompt,
+            tags=tags,
+            enable_story_pass=story_pass,
+            resume=resume,
+            hooks=hooks,
+        )
+
+        previous_summaries: list[str] = []
+        docs: list[PageDocument] = []
+
+        # Fast 1-sheet batch composition when there are multiple CG pages (up to 36 per sheet)
+        sheet_results: dict[int, tuple[list[TextRegionItem], str]] = {}
+        if total > 1:
+            hooks.emit_step(
+                0,
+                total,
+                base_name,
+                "llm_sheet",
+                f"Đang gộp {total} ảnh thành 1 sheet tổng hợp để sáng tác nhanh trong 1 lượt...",
+            )
+            all_sizes: list[tuple[int, int]] = []
+            for p in images:
+                with Image.open(p) as im:
+                    all_sizes.append(im.size)
+            sheet_results = llm.compose_cg_sheet(
+                image_paths=images,
+                image_sizes=all_sizes,
+                preset=style,
+                density=density,
+                story_prompt=prompt,
+                story_bible=story_bible,
+                tags=tags,
+            )
+
+        for idx, img_path in enumerate(images, start=1):
+            hooks.check_cancelled()
+            out_img_path = out_dir / _output_image_name(img_path)
+            json_path = cache_dir / f"{img_path.stem}.koharu.json"
+
+            if resume and out_img_path.is_file() and json_path.is_file():
+                prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
+                if prev_doc.page_summary:
+                    previous_summaries.append(prev_doc.page_summary)
+                docs.append(prev_doc)
+                hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua ảnh đã sáng tác (--resume)")
+                hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
+                continue
+
+            rgb = load_rgb(img_path)
+            h, w = rgb.shape[:2]
+
+            if idx in sheet_results and sheet_results[idx][0]:
+                items, summary = sheet_results[idx]
+                hooks.emit_step(idx, total, img_path.name, "render", f"Áp thoại từ sheet ({len(items)} bóng)...")
+            else:
+                hooks.emit_step(
+                    idx,
+                    total,
+                    img_path.name,
+                    "llm",
+                    f"Phân tích bối cảnh CG ({w}×{h}) & sáng tác thoại [{style.value}]...",
+                )
+                items, summary = llm.compose_cg_page(
+                    rgb=rgb,
+                    preset=style,
+                    density=density,
+                    previous_summaries=previous_summaries,
+                    story_prompt=prompt,
+                    story_bible=story_bible,
+                    page_index=idx,
+                    tags=tags,
+                )
+            if font:
+                for it in items:
+                    it.font_name = font
+            if items:
+                items = expand_composed_boxes_if_tight(items, w, h)
+            if summary:
+                previous_summaries.append(summary)
+
+            hooks.check_cancelled()
+            hooks.emit_step(idx, total, img_path.name, "render", "Vẽ bubble/chữ thường & xuất ảnh CG...")
+            doc = PageDocument(
+                image_path=str(img_path.resolve()),
+                cleaned_image_path=str(img_path.resolve()),
+                width=w,
+                height=h,
+                mode="compose",
+                source_language="vi",
+                page_summary=summary,
+                regions=items,
+            )
+            json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+
+            final_img = render_document(rgb, doc)
+            save_image(final_img, out_img_path)
+            docs.append(doc)
+            hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+
+        if save_cbz:
+            package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
+        return out_dir, docs
+
+
+def run_rerender_pipeline(
+    output_dir: Path,
+    *,
+    font: str | None = None,
+    font_scale: float = 1.0,
+    hooks: PipelineHooks | None = None,
+) -> list[PageDocument]:
+    """Re-render cached `.koharu.json` pages locally without calling any API or ML detector."""
+    hooks = hooks or PipelineHooks()
+    cache_dir = output_dir / ".koharu_cache"
+    json_files = sorted(cache_dir.glob("*.koharu.json"), key=natural_key) if cache_dir.is_dir() else []
+    if not json_files:
+        raise FileNotFoundError(f"Không tìm thấy file .koharu.json nào trong {cache_dir}")
+
+    total = len(json_files)
+    docs: list[PageDocument] = []
+    for idx, jp in enumerate(json_files, start=1):
+        hooks.check_cancelled()
+        doc = PageDocument.model_validate_json(jp.read_text(encoding="utf-8"))
+        base_path = Path(doc.cleaned_image_path or doc.image_path)
+        if not base_path.is_file():
+            base_path = Path(doc.image_path)
+        base_rgb = load_rgb(base_path)
+
+        if font or abs(font_scale - 1.0) > 1e-3:
+            for reg in doc.regions:
+                if font:
+                    reg.font_name = font
+                if abs(font_scale - 1.0) > 1e-3:
+                    solved = solve_layout(reg)
+                    reg.font_size = max(10.0, solved.font_size * font_scale)
+
+        orig_name = Path(doc.image_path).name
+        out_path = output_dir / orig_name
+        hooks.emit_step(idx, total, orig_name, "render", "Render lại ảnh từ .koharu.json...")
+        out_img = render_document(base_rgb, doc)
+        save_image(out_img, out_path)
+        docs.append(doc)
+        hooks.emit_page_done(idx, total, orig_name, doc, out_path)
+
+    return docs

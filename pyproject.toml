@@ -1,0 +1,31 @@
+[project]
+name = "koharu-vn-cli"
+version = "0.1.0"
+description = "Vietnamese comic/doujinshi/CG translator & composer TUI/CLI (ONNX + LaMa-Manga + Gemini Vision)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "huggingface-hub>=2.4.0",
+    "numpy>=2.5.4",
+    "onnxruntime>=1.32.0",
+    "opencv-python-headless>=5.0.0.93",
+    "pillow>=13.0.0",
+    "pydantic>=2.14.3",
+    "rich>=15.0.0",
+    "textual>=8.2.8",
+    "typer>=0.29.1",
+]
+
+[project.scripts]
+koharu-vn = "koharu_vn_cli:main"
+koharu-vn-cli = "koharu_vn_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
