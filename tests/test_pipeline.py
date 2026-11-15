@@ -1270,3 +1270,82 @@ def test_tui_vision_slash_toggle(tmp_path: Path, monkeypatch):
     app_tui._handle_submission("/vision on")
     assert app_tui.cfg.vision_translate is True
     assert any("BẬT Vision" in m for m in logs)
+
+
+def test_ort_session_gpu_selection_and_runtime_cpu_fallback(monkeypatch, tmp_path: Path):
+    import onnxruntime as ort
+    from koharu_vn_cli.config import AppConfig
+    from koharu_vn_cli.pipeline import detector, inpaint
+    from koharu_vn_cli.tui import KoharuTUI
+
+    monkeypatch.setattr(detector, "_ORT_PRELOADED", True)
+    monkeypatch.setattr(
+        ort,
+        "get_available_providers",
+        lambda: ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+    )
+    assert detector._ort_providers(use_gpu=True) == [
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert detector._ort_providers(use_gpu=False) == ["CPUExecutionProvider"]
+
+    # If GPU provider raises during session creation, fall back cleanly to CPUExecutionProvider
+    seen_providers: list[list[str]] = []
+
+    class FakeSession:
+        def __init__(self, path, sess_options=None, providers=None):
+            seen_providers.append(list(providers or []))
+            if providers and providers[0] != "CPUExecutionProvider":
+                raise RuntimeError("mock GPU init failure")
+            self._p = list(providers or ["CPUExecutionProvider"])
+
+        def get_providers(self):
+            return self._p
+
+    monkeypatch.setattr(ort, "InferenceSession", FakeSession)
+    sess = detector._create_ort_session(tmp_path / "dummy.onnx", use_gpu=True)
+    assert seen_providers == [
+        ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+        ["CPUExecutionProvider"],
+    ]
+    assert detector.active_ort_provider_label(sess) == "CPU"
+
+    # HybridInpainter runtime fallback when GPU session raises inside run()
+    monkeypatch.setattr(inpaint, "hf_hub_download", lambda repo, fn: str(tmp_path / "lama.onnx"))
+
+    class RuntimeFailGpuSession:
+        def __init__(self, is_gpu: bool) -> None:
+            self._is_gpu = is_gpu
+
+        def get_providers(self):
+            return ["DmlExecutionProvider", "CPUExecutionProvider"] if self._is_gpu else ["CPUExecutionProvider"]
+
+        def run(self, _out, _feed):
+            if self._is_gpu:
+                raise RuntimeError("DirectML MatMul_5 failed")
+            return [np.zeros((1, 3, 512, 512), dtype=np.float32)]
+
+    create_calls: list[bool] = []
+    monkeypatch.setattr(
+        inpaint,
+        "_create_ort_session",
+        lambda path, use_gpu=True: (create_calls.append(use_gpu), RuntimeFailGpuSession(use_gpu))[1],
+    )
+    inp = inpaint.HybridInpainter(use_gpu=True)
+    patch_out = inp._run_lama_patch(np.zeros((64, 64, 3), dtype=np.uint8), np.full((64, 64), 255, dtype=np.uint8))
+    assert patch_out.shape == (64, 64, 3)
+    assert create_calls == [True, False]
+
+    # /gpu slash command toggle
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda cfg: None)
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: AppConfig(use_gpu=True))
+    app_tui = KoharuTUI()
+    logs: list[str] = []
+    app_tui._log_user = lambda _msg: None  # type: ignore[method-assign]
+    app_tui._log_ai = lambda msg, style="": logs.append(msg)  # type: ignore[method-assign]
+    app_tui._handle_submission("/gpu off")
+    assert app_tui.cfg.use_gpu is False
+    app_tui._handle_submission("/gpu on")
+    assert app_tui.cfg.use_gpu is True

@@ -7,11 +7,11 @@ import re
 from pathlib import Path
 
 import numpy as np
-import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
 from koharu_vn_cli.models import TextRegionItem
+from koharu_vn_cli.pipeline.detector import _create_ort_session
 
 MANGA_OCR_REPO = "mayocream/manga-ocr-onnx"
 _CLS_ID = 2
@@ -43,16 +43,16 @@ class MangaOcrONNX:
         vocab_path: str | Path | None = None,
         *,
         max_length: int = 128,
+        use_gpu: bool = True,
     ) -> None:
         if encoder_path and decoder_path and vocab_path:
             enc, dec, voc = Path(encoder_path), Path(decoder_path), Path(vocab_path)
         else:
             enc, dec, voc = _ensure_manga_ocr_files()
 
-        sess_opts = ort.SessionOptions()
-        sess_opts.intra_op_num_threads = max(1, min(4, os.cpu_count() or 2))
-        self.encoder = ort.InferenceSession(str(enc), sess_options=sess_opts, providers=["CPUExecutionProvider"])
-        self.decoder = ort.InferenceSession(str(dec), sess_options=sess_opts, providers=["CPUExecutionProvider"])
+        threads = max(1, min(4, os.cpu_count() or 2))
+        self.encoder = _create_ort_session(enc, use_gpu=use_gpu, cpu_threads=threads)
+        self.decoder = _create_ort_session(dec, use_gpu=use_gpu, cpu_threads=threads)
         self.vocab = voc.read_text(encoding="utf-8").splitlines()
         self.max_length = max(16, max_length)
 

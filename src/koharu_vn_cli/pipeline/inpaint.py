@@ -7,7 +7,7 @@ import numpy as np
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 
-from koharu_vn_cli.pipeline.detector import DetectedRegion, _ort_providers
+from koharu_vn_cli.pipeline.detector import DetectedRegion, _create_ort_session
 
 
 def _luma(rgb: tuple[int, int, int] | np.ndarray) -> float:
@@ -167,9 +167,10 @@ def classify_region_colors(
 class HybridInpainter:
     """Erases detected text using fast solid-fill for uniform bubbles and LaMa-Manga ONNX for complex areas."""
 
-    def __init__(self) -> None:
-        lama_path = hf_hub_download("mayocream/lama-manga-onnx", "lama-manga.onnx")
-        self._lama = ort.InferenceSession(lama_path, providers=_ort_providers())
+    def __init__(self, use_gpu: bool = True) -> None:
+        self._lama_path = hf_hub_download("mayocream/lama-manga-onnx", "lama-manga.onnx")
+        self._use_gpu = use_gpu
+        self._lama = _create_ort_session(self._lama_path, use_gpu=use_gpu)
 
     def _run_lama_patch(self, rgb_patch: np.ndarray, mask_patch: np.ndarray) -> np.ndarray:
         ph, pw = rgb_patch.shape[:2]
@@ -189,7 +190,15 @@ class HybridInpainter:
 
         inp_img = np.transpose(img_512, (2, 0, 1))[None]
         inp_msk = msk_bin[None, None]
-        out = self._lama.run(None, {"image": inp_img, "mask": inp_msk})[0][0]
+        try:
+            out = self._lama.run(None, {"image": inp_img, "mask": inp_msk})[0][0]
+        except Exception:
+            # DirectML fails on LaMa's FFC FFT MatMul_5 node; safely downgrade to CPU without losing progress.
+            if self._lama.get_providers() != ["CPUExecutionProvider"]:
+                self._lama = _create_ort_session(self._lama_path, use_gpu=False)
+                out = self._lama.run(None, {"image": inp_img, "mask": inp_msk})[0][0]
+            else:
+                raise
         # mayocream/lama-manga-onnx outputs float RGB in [0.0, 1.0]
         pred_512 = np.clip(np.transpose(out, (1, 2, 0)) * 255.0, 0.0, 255.0).astype(np.uint8)
         if ph <= 512 and pw <= 512:

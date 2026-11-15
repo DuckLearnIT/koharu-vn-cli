@@ -29,6 +29,7 @@ from textual.widgets.option_list import Option
 from koharu_vn_cli import __version__
 from koharu_vn_cli.config import CONFIG_FILE, AppConfig, load_config, parse_api_keys, save_config
 from koharu_vn_cli.models import CharacterProfile, ComposePreset, PageDocument, StoryBible
+from koharu_vn_cli.pipeline.detector import active_ort_provider_label
 from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
 from koharu_vn_cli.pipeline.runner import (
@@ -59,6 +60,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
     SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật game sau Pass 1"),
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
+    SlashSpec("/gpu", "[on|off]", "Bật/tắt tăng tốc GPU (CUDA) cho Detector, LaMa Inpaint & OCR"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
     SlashSpec("/lang", "", "Chọn ngôn ngữ nguồn ưu tiên (auto / ja / ko / zh / en)"),
     SlashSpec("/font", "", "Chọn font Tiếng Việt mặc định"),
@@ -1466,6 +1468,21 @@ class KoharuTUI(App[None]):
                 self._log_ai(
                     "Đã [bold yellow]TẮT Vision[/bold yellow] cho Pass 2: Model lớn xem ảnh dựng Story Bible theo tuyến -> OCR cục bộ CPU (manga-ocr-onnx) -> Model con chỉ dịch text theo tuyến (siêu nhanh, né lọc ảnh)."
                 )
+        elif cmd == "/gpu":
+            val = rest.strip().lower()
+            if val in {"on", "1", "true"}:
+                self.cfg.use_gpu = True
+            elif val in {"off", "0", "false", "cpu"}:
+                self.cfg.use_gpu = False
+            else:
+                self.cfg.use_gpu = not self.cfg.use_gpu
+            save_config(self.cfg)
+            if self.cfg.use_gpu:
+                self._log_ai(
+                    "Đã [bold cyan]BẬT tăng tốc GPU[/bold cyan] cho Detector + LaMa Inpaint + OCR (tự dùng CUDA/DirectML nếu khả dụng, tự lùi về CPU nếu lỗi)."
+                )
+            else:
+                self._log_ai("Đã chuyển Detector + LaMa Inpaint + OCR sang chạy [bold yellow]CPU[/bold yellow].")
         else:
             self._log_ai(f"Không rõ lệnh `[bold]{cmd}[/bold]`. Gõ `/help` hoặc `/` để xem các lệnh hỗ trợ.", style="yellow")
 
@@ -1843,6 +1860,7 @@ class KoharuTUI(App[None]):
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
                 vision_translate=self.cfg.vision_translate,
+                use_gpu=self.cfg.use_gpu,
                 resume=resume,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
@@ -1897,6 +1915,7 @@ class KoharuTUI(App[None]):
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
                 vision_translate=self.cfg.vision_translate,
+                use_gpu=self.cfg.use_gpu,
                 resume=resume,
                 hooks=self._build_hooks(),
             )
@@ -1977,11 +1996,13 @@ class KoharuTUI(App[None]):
             return
         self.call_from_thread(self._set_job_ui, True, "Kiểm tra & tải cache model ONNX...", 20.0)
         try:
-            self.model_cache.warmup_all(accurate=self.cfg.accurate_detector)
+            det, inp = self.model_cache.warmup_all(accurate=self.cfg.accurate_detector, use_gpu=self.cfg.use_gpu)
+            det_dev = active_ort_provider_label(getattr(det, "_rtdetr", None))
+            inp_dev = active_ort_provider_label(getattr(inp, "_lama", None))
             self.call_from_thread(self._set_job_ui, False, "[green]ONNX sẵn sàng![/green]", 100.0)
             self.call_from_thread(
                 self._log_ai,
-                "[bold green]Đã nạp sẵn 3 model ONNX[/bold green] (RT-DETR + CTD blk/seg/det, LaMa-Manga inpainter) & "
+                f"[bold green]Đã nạp sẵn 3 model ONNX[/bold green] (Detector={det_dev}, LaMa={inp_dev}) & "
                 f"{len(available_fonts())} font Tiếng Việt.",
             )
         except Exception as exc:

@@ -16,7 +16,7 @@ from PIL import Image
 
 from koharu_vn_cli.models import ComposePreset, PageDocument, StoryBible, TextRegionItem
 from koharu_vn_cli.pipeline.bubble_renderer import render_bubbles, resolve_box_overlaps
-from koharu_vn_cli.pipeline.detector import ComicDetector, _ensure_ctd_model
+from koharu_vn_cli.pipeline.detector import ComicDetector, _ensure_ctd_model, active_ort_provider_label
 from koharu_vn_cli.pipeline.gemini_client import (
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
@@ -83,30 +83,35 @@ class ModelCache:
 
     def __init__(self) -> None:
         self._detector: ComicDetector | None = None
-        self._detector_accurate: bool | None = None
+        self._detector_key: tuple[bool, bool] | None = None
         self._inpainter: HybridInpainter | None = None
+        self._inpainter_gpu: bool | None = None
         self._ocr: MangaOcrONNX | None = None
+        self._ocr_gpu: bool | None = None
 
-    def get_detector(self, accurate: bool = True) -> ComicDetector:
-        if self._detector is None or self._detector_accurate != accurate:
-            self._detector = ComicDetector(accurate=accurate)
-            self._detector_accurate = accurate
+    def get_detector(self, accurate: bool = True, use_gpu: bool = True) -> ComicDetector:
+        key = (accurate, use_gpu)
+        if self._detector is None or self._detector_key != key:
+            self._detector = ComicDetector(accurate=accurate, use_gpu=use_gpu)
+            self._detector_key = key
         return self._detector
 
-    def get_inpainter(self) -> HybridInpainter:
-        if self._inpainter is None:
-            self._inpainter = HybridInpainter()
+    def get_inpainter(self, use_gpu: bool = True) -> HybridInpainter:
+        if self._inpainter is None or self._inpainter_gpu != use_gpu:
+            self._inpainter = HybridInpainter(use_gpu=use_gpu)
+            self._inpainter_gpu = use_gpu
         return self._inpainter
 
-    def get_ocr(self) -> MangaOcrONNX:
-        if self._ocr is None:
-            self._ocr = MangaOcrONNX()
+    def get_ocr(self, use_gpu: bool = True) -> MangaOcrONNX:
+        if self._ocr is None or self._ocr_gpu != use_gpu:
+            self._ocr = MangaOcrONNX(use_gpu=use_gpu)
+            self._ocr_gpu = use_gpu
         return self._ocr
 
-    def warmup_all(self, accurate: bool = True) -> tuple[ComicDetector, HybridInpainter]:
-        det = self.get_detector(accurate=accurate)
+    def warmup_all(self, accurate: bool = True, use_gpu: bool = True) -> tuple[ComicDetector, HybridInpainter]:
+        det = self.get_detector(accurate=accurate, use_gpu=use_gpu)
         _ensure_ctd_model()
-        inp = self.get_inpainter()
+        inp = self.get_inpainter(use_gpu=use_gpu)
         return det, inp
 
 
@@ -404,6 +409,7 @@ def run_translate_pipeline(
     tags: str | None = None,
     story_pass: bool = True,
     vision_translate: bool = True,
+    use_gpu: bool = True,
     font: str | None = None,
     conf: float = 0.34,
     accurate_detector: bool = True,
@@ -457,9 +463,24 @@ def run_translate_pipeline(
                 on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
             )
         )
-        detector = cache.get_detector(accurate=accurate_detector)
-        inpainter = cache.get_inpainter()
-        ocr_engine = cache.get_ocr() if not vision_translate else None
+        if isinstance(cache, ModelCache):
+            detector = cache.get_detector(accurate=accurate_detector, use_gpu=use_gpu)
+            inpainter = cache.get_inpainter(use_gpu=use_gpu)
+            ocr_engine = cache.get_ocr(use_gpu=use_gpu) if not vision_translate else None
+        else:
+            detector = cache.get_detector(accurate=accurate_detector)
+            inpainter = cache.get_inpainter()
+            ocr_engine = cache.get_ocr() if not vision_translate else None
+
+        det_dev = active_ort_provider_label(getattr(detector, "_rtdetr", None))
+        inp_dev = active_ort_provider_label(getattr(inpainter, "_lama", None))
+        hooks.emit_step(
+            0,
+            total,
+            base_name,
+            "device",
+            f"Thiết bị ONNX: Detector={det_dev} · LaMa Inpaint={inp_dev}",
+        )
 
         scenes = cluster_story_scenes(images)
         if len(scenes) >= 2:

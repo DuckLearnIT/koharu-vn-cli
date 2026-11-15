@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,7 +44,26 @@ def _ensure_ctd_model() -> Path:
     return path
 
 
-def _ort_providers() -> list[str]:
+_ORT_PRELOADED = False
+
+
+def _preload_ort_dlls() -> None:
+    global _ORT_PRELOADED
+    if _ORT_PRELOADED:
+        return
+    _ORT_PRELOADED = True
+    preload = getattr(ort, "preload_dlls", None)
+    if callable(preload):
+        try:
+            preload()
+        except Exception:
+            pass
+
+
+def _ort_providers(use_gpu: bool = True) -> list[str]:
+    if not use_gpu:
+        return ["CPUExecutionProvider"]
+    _preload_ort_dlls()
     available = ort.get_available_providers()
     preferred = [
         p
@@ -51,6 +71,41 @@ def _ort_providers() -> list[str]:
         if p in available
     ]
     return preferred or ["CPUExecutionProvider"]
+
+
+def _create_ort_session(
+    model_path: str | Path,
+    *,
+    use_gpu: bool = True,
+    cpu_threads: int | None = None,
+) -> ort.InferenceSession:
+    """Create an ONNXRuntime session preferring GPU (CUDA/DirectML) with automatic CPU fallback."""
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    if cpu_threads is not None:
+        opts.intra_op_num_threads = max(1, cpu_threads)
+    providers = _ort_providers(use_gpu=use_gpu)
+    try:
+        return ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
+    except Exception:
+        if providers != ["CPUExecutionProvider"]:
+            return ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
+        raise
+
+
+def active_ort_provider_label(session: ort.InferenceSession | None) -> str:
+    """Return a concise human-readable execution device label for telemetry."""
+    if session is None:
+        return "CPU"
+    try:
+        provs = session.get_providers()
+    except Exception:
+        return "CPU"
+    if "CUDAExecutionProvider" in provs:
+        return "GPU (CUDA)"
+    if "DmlExecutionProvider" in provs:
+        return "GPU (DirectML)"
+    return "CPU"
 
 
 def box_area(b: tuple[int, int, int, int]) -> int:
@@ -496,14 +551,13 @@ def _decode_ctd_blk(
 class ComicDetector:
     """Combined RT-DETRv2 bubble/text detector + full 3-head ComicTextDetector (`blk` + UNet `seg` + DBNet `det`)."""
 
-    def __init__(self, accurate: bool = True) -> None:
-        providers = _ort_providers()
+    def __init__(self, accurate: bool = True, use_gpu: bool = True) -> None:
         det_filename = "detector.onnx" if accurate else "detector_int8.onnx"
         det_path = hf_hub_download("ogkalu/comic-text-and-bubble-detector", det_filename)
-        self._rtdetr = ort.InferenceSession(det_path, providers=providers)
+        self._rtdetr = _create_ort_session(det_path, use_gpu=use_gpu)
 
         ctd_path = _ensure_ctd_model()
-        self._ctd = ort.InferenceSession(str(ctd_path), providers=providers)
+        self._ctd = _create_ort_session(ctd_path, use_gpu=use_gpu)
 
     def _run_ctd_crop(
         self,
