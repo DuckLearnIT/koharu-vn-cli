@@ -53,6 +53,8 @@ class AppConfig(BaseModel):
     review_characters: bool = True
     theme: str = "tokyo-night"
     last_output_dir: Optional[str] = None
+    last_input_path: Optional[str] = None
+    last_job_mode: Optional[str] = None
 
     def effective_api_keys(self) -> list[str]:
         """Return all configured API keys in failover order (saved list + single key + env vars)."""

@@ -1037,3 +1037,71 @@ def test_long_chapter_keyframes_multisheets_and_batched_compose(tmp_path: Path):
     assert len(seen_prompts) == 3  # 12 + 12 + 1
     assert "Tóm tắt trang 12" in seen_prompts[1]
     assert set(res.keys()) == set(range(1, 26))
+
+
+def test_translate_skips_blocked_page_and_resumes_cleanly(tmp_path: Path, monkeypatch):
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    for i in range(1, 4):
+        Image.new("RGB", (240, 320), (240, 240, 240)).save(in_dir / f"p{i}.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            return [DetectedRegion((40, 40, 180, 120), (30, 30, 190, 130), None, True, False, 0.9)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeCache:
+        def get_detector(self, accurate=True):
+            return FakeDet()
+
+        def get_inpainter(self):
+            return FakeInp()
+
+    fail_p2 = {"flag": True}
+    calls: list[int] = []
+
+    def fake_translate_page(self, rgb, regions, **kwargs):
+        p_idx = kwargs["page_index"]
+        calls.append(p_idx)
+        if p_idx == 2 and fail_p2["flag"]:
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+        out = [r.model_copy(update={"source_text": "JP", "translated_text": f"Trang {p_idx}"}) for r in regions]
+        return out, f"Tóm tắt {p_idx}"
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.VisionLLMClient.translate_page", fake_translate_page)
+
+    out_dir, docs1 = run_translate_pipeline(
+        in_dir,
+        api_key="dummy",
+        story_pass=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    # Page 1 and 3 succeeded despite page 2 block; page 2 has fallback image but no .koharu.json
+    assert len(docs1) == 2
+    assert (out_dir / "p1.png").is_file() and (out_dir / "p2.png").is_file() and (out_dir / "p3.png").is_file()
+    assert (out_dir / ".koharu_cache" / "p1.koharu.json").is_file()
+    assert not (out_dir / ".koharu_cache" / "p2.koharu.json").is_file()
+    assert (out_dir / ".koharu_cache" / "p3.koharu.json").is_file()
+
+    # Resume after switching provider -> skips 1 & 3, retries only page 2!
+    fail_p2["flag"] = False
+    calls.clear()
+    _, docs2 = run_translate_pipeline(
+        in_dir,
+        output=out_dir,
+        api_key="dummy",
+        story_pass=False,
+        resume=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert calls == [2]
+    assert len(docs2) == 3
+    assert (out_dir / ".koharu_cache" / "p2.koharu.json").is_file()

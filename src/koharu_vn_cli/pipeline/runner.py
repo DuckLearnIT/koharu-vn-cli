@@ -17,7 +17,11 @@ from PIL import Image
 from koharu_vn_cli.models import ComposePreset, PageDocument, StoryBible, TextRegionItem
 from koharu_vn_cli.pipeline.bubble_renderer import render_bubbles, resolve_box_overlaps
 from koharu_vn_cli.pipeline.detector import ComicDetector, _ensure_ctd_model
-from koharu_vn_cli.pipeline.gemini_client import DEFAULT_GEMINI_MODEL, VisionLLMClient
+from koharu_vn_cli.pipeline.gemini_client import (
+    DEFAULT_GEMINI_MODEL,
+    ContentBlockedError,
+    VisionLLMClient,
+)
 from koharu_vn_cli.pipeline.inpaint import (
     HybridInpainter,
     build_erasure_mask,
@@ -348,13 +352,23 @@ def _load_or_build_story_bible(
         "story_pass",
         f"Pass 1 [Model chính: {llm.model}]: Tự động xem full {len(images)} ảnh -> phân tích cốt truyện, nhân vật & xưng hô...",
     )
-    bible = llm.build_story_bible(
-        images,
-        mode=mode,
-        user_story=resolved_story,
-        extra_instructions=prompt,
-        tags=tags,
-    )
+    try:
+        bible = llm.build_story_bible(
+            images,
+            mode=mode,
+            user_story=resolved_story,
+            extra_instructions=prompt,
+            tags=tags,
+        )
+    except ContentBlockedError as exc:
+        hooks.emit_step(
+            0,
+            len(images),
+            base_name,
+            "warn",
+            f"Pass 1 bị bộ lọc nội dung chặn ({exc}) — tiếp tục dịch từng trang...",
+        )
+        return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
     hooks.emit_story_bible(bible)
     confirmed = hooks.confirm_story_bible(bible)
     if confirmed is not bible:
@@ -384,6 +398,7 @@ def run_translate_pipeline(
     save_cbz: bool = False,
     output_format: str = "original",
     sequential_names: bool = False,
+    skip_blocked: bool = True,
     resume: bool = False,
     model_cache: ModelCache | None = None,
     hooks: PipelineHooks | None = None,
@@ -536,20 +551,34 @@ def run_translate_pipeline(
                 "llm",
                 f"Đang gửi {len(region_items)} vùng chữ lên {model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
             )
-            prev_rgb = load_rgb(images[idx - 2]) if idx > 1 else None
-            next_rgb = load_rgb(images[idx]) if idx < total else None
-            translated_items, summary = llm.translate_page(
-                rgb=rgb,
-                regions=region_items,
-                source_lang=lang,
-                previous_summaries=previous_summaries,
-                extra_instructions=prompt,
-                story_bible=story_bible,
-                page_index=idx,
-                prev_rgb=prev_rgb,
-                next_rgb=next_rgb,
-                tags=tags,
-            )
+            prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
+            next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
+            try:
+                translated_items, summary = llm.translate_page(
+                    rgb=rgb,
+                    regions=region_items,
+                    source_lang=lang,
+                    previous_summaries=previous_summaries,
+                    extra_instructions=prompt,
+                    story_bible=story_bible,
+                    page_index=idx,
+                    prev_rgb=prev_rgb,
+                    next_rgb=next_rgb,
+                    tags=tags,
+                )
+            except ContentBlockedError as exc:
+                if not skip_blocked:
+                    raise
+                # Save unmodified page without .koharu.json so `/resume` retries this page later
+                save_image(Image.fromarray(rgb), out_img_path)
+                hooks.emit_step(
+                    idx,
+                    total,
+                    img_path.name,
+                    "blocked",
+                    f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
+                )
+                continue
             if summary:
                 previous_summaries.append(summary)
             translated_items = adapt_regions_for_readability(translated_items, w, h)
@@ -597,6 +626,7 @@ def run_compose_pipeline(
     save_cbz: bool = False,
     output_format: str = "original",
     sequential_names: bool = False,
+    skip_blocked: bool = True,
     resume: bool = False,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
@@ -677,15 +707,25 @@ def run_compose_pipeline(
             for p in images:
                 with Image.open(p) as im:
                     all_sizes.append(im.size)
-            sheet_results = llm.compose_cg_sheet(
-                image_paths=images,
-                image_sizes=all_sizes,
-                preset=style,
-                density=density,
-                story_prompt=prompt,
-                story_bible=story_bible,
-                tags=tags,
-            )
+            try:
+                sheet_results = llm.compose_cg_sheet(
+                    image_paths=images,
+                    image_sizes=all_sizes,
+                    preset=style,
+                    density=density,
+                    story_prompt=prompt,
+                    story_bible=story_bible,
+                    tags=tags,
+                )
+            except ContentBlockedError as exc:
+                hooks.emit_step(
+                    0,
+                    total,
+                    base_name,
+                    "warn",
+                    f"Sheet bị bộ lọc nội dung chặn ({exc}) — chuyển sang sáng tác từng trang...",
+                )
+                sheet_results = {}
 
         seq_pad = max(3, len(str(total)))
         for idx, img_path in enumerate(images, start=1):
@@ -721,16 +761,27 @@ def run_compose_pipeline(
                     "llm",
                     f"Phân tích bối cảnh CG ({w}×{h}) & sáng tác thoại [{style.value}]...",
                 )
-                items, summary = llm.compose_cg_page(
-                    rgb=rgb,
-                    preset=style,
-                    density=density,
-                    previous_summaries=previous_summaries,
-                    story_prompt=prompt,
-                    story_bible=story_bible,
-                    page_index=idx,
-                    tags=tags,
-                )
+                try:
+                    items, summary = llm.compose_cg_page(
+                        rgb=rgb,
+                        preset=style,
+                        density=density,
+                        previous_summaries=previous_summaries,
+                        story_prompt=prompt,
+                        story_bible=story_bible,
+                        page_index=idx,
+                        tags=tags,
+                    )
+                except ContentBlockedError as exc:
+                    save_image(Image.fromarray(rgb), out_img_path)
+                    hooks.emit_step(
+                        idx,
+                        total,
+                        img_path.name,
+                        "blocked",
+                        f"⚠ Ảnh {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục ảnh sau!",
+                    )
+                    continue
             if font:
                 for it in items:
                     it.font_name = font

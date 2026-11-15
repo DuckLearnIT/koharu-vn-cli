@@ -51,8 +51,9 @@ class SlashSpec:
 
 
 SLASH_COMMANDS: tuple[SlashSpec, ...] = (
-    SlashSpec("/translate", "<đường_dẫn>", "Dịch truyện tranh (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
-    SlashSpec("/compose", "<đường_dẫn>", "Tự sáng tác thoại cho Artist CG không lời"),
+    SlashSpec("/translate", "<đường_dẫn> [--resume]", "Dịch truyện tranh (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
+    SlashSpec("/compose", "<đường_dẫn> [--resume]", "Tự sáng tác thoại cho Artist CG không lời"),
+    SlashSpec("/resume", "[đường_dẫn]", "Chạy tiếp tác vụ bị dừng/lỗi từ trang chưa xong (bỏ qua trang đã dịch)"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
     SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
@@ -322,10 +323,10 @@ class KeySetupModal(ModalScreen[tuple[str, str] | None]):
                 placeholder="AIzaSyKey1..., AIzaSyKey2..., AIzaSyKey3...",
                 id="key-input",
             )
-            yield Label("Base URL tùy chọn (OpenAI-compatible proxy):")
+            yield Label("Base URL tùy chọn (OpenAI-compatible — không bị bộ lọc Google khi dịch R18):")
             yield Input(
                 value=self.current_base_url,
-                placeholder="http://127.0.0.1:8317/v1",
+                placeholder="https://openrouter.ai/api/v1 | https://api.x.ai/v1 | http://127.0.0.1:11434/v1",
                 id="url-input",
             )
             with Horizontal(id="modal-actions"):
@@ -1359,23 +1360,36 @@ class KoharuTUI(App[None]):
         elif cmd == "/open":
             self._open_last_output()
         elif cmd == "/translate":
-            p_str, hint = split_cmd_and_hint(rest)
+            resume_flag = "--resume" in rest
+            cleaned_rest = rest.replace("--resume", "").strip()
+            p_str, hint = split_cmd_and_hint(cleaned_rest)
             if p_str:
-                self._launch_translate(Path(p_str), hint)
+                self._launch_translate(Path(p_str), hint, resume=resume_flag)
             else:
                 self.push_screen(
                     RunJobModal("translate", "", self.cfg.custom_prompt, initial_tags=self.cfg.tags),
-                    lambda res: self._launch_translate(Path(res[0]), res[1], res[2]) if res else None,
+                    lambda res: self._launch_translate(Path(res[0]), res[1], res[2], resume=resume_flag) if res else None,
                 )
         elif cmd == "/compose":
-            p_str, hint = split_cmd_and_hint(rest)
+            resume_flag = "--resume" in rest
+            cleaned_rest = rest.replace("--resume", "").strip()
+            p_str, hint = split_cmd_and_hint(cleaned_rest)
             if p_str:
-                self._launch_compose(Path(p_str), hint)
+                self._launch_compose(Path(p_str), hint, resume=resume_flag)
             else:
                 self.push_screen(
                     RunJobModal("compose", "", self.cfg.custom_prompt, self.cfg.compose_style.value, self.cfg.tags),
-                    lambda res: self._launch_compose(Path(res[0]), res[1], res[2]) if res else None,
+                    lambda res: self._launch_compose(Path(res[0]), res[1], res[2], resume=resume_flag) if res else None,
                 )
+        elif cmd == "/resume":
+            p_str, hint = split_cmd_and_hint(rest)
+            target_str = p_str or self.cfg.last_input_path or ""
+            if not target_str:
+                self._log_ai("Chưa có tác vụ trước đó. Hãy chạy `/translate <đường_dẫn> --resume`.", style="yellow")
+            elif self.cfg.last_job_mode == "compose":
+                self._launch_compose(Path(target_str), hint, resume=True)
+            else:
+                self._launch_translate(Path(target_str), hint, resume=True)
         elif cmd == "/rerender":
             p_str, _ = split_cmd_and_hint(rest)
             target = p_str or self.cfg.last_output_dir
@@ -1751,21 +1765,31 @@ class KoharuTUI(App[None]):
             is_cancelled=self.cancel_event.is_set,
         )
 
-    def _launch_translate(self, input_path: Path, extra_prompt: str = "", extra_tags: str = "") -> None:
+    def _launch_translate(
+        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+    ) -> None:
         if not self._require_job_idle_and_key(needs_llm=True):
             return
         if not input_path.exists():
             self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
             return
-        self._start_translate(input_path, extra_prompt, extra_tags)
+        self.cfg.last_input_path = str(input_path)
+        self.cfg.last_job_mode = "translate"
+        save_config(self.cfg)
+        self._start_translate(input_path, extra_prompt, extra_tags, resume=resume)
 
-    def _launch_compose(self, input_path: Path, extra_prompt: str = "", extra_tags: str = "") -> None:
+    def _launch_compose(
+        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+    ) -> None:
         if not self._require_job_idle_and_key(needs_llm=True):
             return
         if not input_path.exists():
             self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
             return
-        self._start_compose(input_path, extra_prompt, extra_tags)
+        self.cfg.last_input_path = str(input_path)
+        self.cfg.last_job_mode = "compose"
+        save_config(self.cfg)
+        self._start_compose(input_path, extra_prompt, extra_tags, resume=resume)
 
     def _launch_rerender(self, output_dir: Path) -> None:
         if not self._require_job_idle_and_key(needs_llm=False):
@@ -1773,9 +1797,12 @@ class KoharuTUI(App[None]):
         self._start_rerender(output_dir)
 
     @work(thread=True)
-    def _start_translate(self, input_path: Path, extra_prompt: str = "", extra_tags: str = "") -> None:
+    def _start_translate(
+        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+    ) -> None:
         self.cancel_event.clear()
-        self.call_from_thread(self._set_job_ui, True, f"Dịch truyện: {input_path.name}", 2.0)
+        mode_lbl = "Tiếp tục dịch" if resume else "Dịch truyện"
+        self.call_from_thread(self._set_job_ui, True, f"{mode_lbl}: {input_path.name}", 2.0)
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
 
@@ -1797,6 +1824,7 @@ class KoharuTUI(App[None]):
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
+                resume=resume,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
             )
@@ -1811,16 +1839,23 @@ class KoharuTUI(App[None]):
             )
         except PipelineCancelledError:
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
-            self.call_from_thread(self._log_ai, "Tác vụ đã được hủy theo yêu cầu.", "yellow")
+            self.call_from_thread(self._log_ai, "Tác vụ đã được hủy theo yêu cầu. Gõ `/resume` để chạy tiếp.", "yellow")
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
-            self.call_from_thread(self._log_ai, f"Lỗi khi dịch truyện: [red]{exc}[/red]", "red")
+            self.call_from_thread(
+                self._log_ai,
+                f"Lỗi khi dịch truyện: [red]{exc}[/red]\n[dim]Mẹo: Gõ `/resume` để dịch tiếp từ trang đang dừng mà không tốn công dịch lại các trang đã xong.[/dim]",
+                "red",
+            )
 
     @work(thread=True)
-    def _start_compose(self, input_path: Path, extra_prompt: str = "", extra_tags: str = "") -> None:
+    def _start_compose(
+        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+    ) -> None:
         self.cancel_event.clear()
+        mode_lbl = "Tiếp tục CG" if resume else f"Sáng tác CG ({self.cfg.compose_style.value})"
         self.call_from_thread(
-            self._set_job_ui, True, f"Sáng tác CG ({self.cfg.compose_style.value}): {input_path.name}", 2.0
+            self._set_job_ui, True, f"{mode_lbl}: {input_path.name}", 2.0
         )
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
@@ -1842,6 +1877,7 @@ class KoharuTUI(App[None]):
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
+                resume=resume,
                 hooks=self._build_hooks(),
             )
             self.cfg.last_output_dir = str(out_dir)
@@ -1855,10 +1891,14 @@ class KoharuTUI(App[None]):
             )
         except PipelineCancelledError:
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
-            self.call_from_thread(self._log_ai, "Tác vụ đã được hủy.", "yellow")
+            self.call_from_thread(self._log_ai, "Tác vụ đã được hủy. Gõ `/resume` để chạy tiếp.", "yellow")
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
-            self.call_from_thread(self._log_ai, f"Lỗi khi sáng tác CG: [red]{exc}[/red]", "red")
+            self.call_from_thread(
+                self._log_ai,
+                f"Lỗi khi sáng tác CG: [red]{exc}[/red]\n[dim]Mẹo: Gõ `/resume` để chạy tiếp từ trang đang dừng.[/dim]",
+                "red",
+            )
 
     def _launch_rename(self, input_path: Path, in_place: bool = False) -> None:
         if self.is_running_job:
