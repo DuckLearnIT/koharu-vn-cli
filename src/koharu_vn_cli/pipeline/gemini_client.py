@@ -46,27 +46,133 @@ def _pil_to_jpeg_b64(img: Image.Image, max_side: int = 1600, quality: int = 90) 
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before `}` or `]` outside quoted strings."""
+    out: list[str] = []
+    in_str = False
+    escape = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_truncated_json(text: str) -> str:
+    """Best-effort close open string/arrays/objects when output was truncated near the tail."""
+    stack: list[str] = []
+    in_str = False
+    escape = False
+    for ch in text:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and stack[-1] == ch:
+            stack.pop()
+    repaired = text.rstrip()
+    if in_str:
+        if repaired.endswith("\\"):
+            repaired = repaired[:-1]
+        repaired += '"'
+    repaired = re.sub(r"[:,]\s*$", "", repaired)
+    repaired = _strip_trailing_commas(repaired)
+    return repaired + "".join(reversed(stack))
+
+
 def _extract_json_block(raw: str) -> Any:
-    text = raw.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if not raw or not raw.strip():
+        raise ValueError("Empty LLM response (no JSON content)")
+    text = re.sub(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", "", raw, flags=re.IGNORECASE).strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
     if fence:
         text = fence.group(1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Recover first top-level JSON object or array
-        start_obj = text.find("{")
-        start_arr = text.find("[")
-        starts = [idx for idx in (start_obj, start_arr) if idx >= 0]
-        if not starts:
-            raise
-        start = min(starts)
-        opener = text[start]
-        closer = "}" if opener == "{" else "]"
-        end = text.rfind(closer)
-        if end > start:
-            return json.loads(text[start : end + 1])
-        raise
+    else:
+        open_fence = re.search(r"```(?:json)?\s*([\s\S]+)$", text, flags=re.IGNORECASE)
+        if open_fence:
+            text = open_fence.group(1).strip()
+
+    stripped = text.lstrip()
+    if stripped.startswith(("{", "[")):
+        for candidate in (stripped, _strip_trailing_commas(stripped)):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        decoder = json.JSONDecoder()
+        for candidate in (stripped, _strip_trailing_commas(stripped)):
+            try:
+                obj, _ = decoder.raw_decode(candidate)
+                if isinstance(obj, (dict, list)):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+        for trim_last in (stripped, stripped.rsplit(",", 1)[0]):
+            repaired = _repair_truncated_json(trim_last)
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                continue
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        snippet = text[idx:]
+        for attempt in (snippet, _strip_trailing_commas(snippet)):
+            try:
+                obj, _ = decoder.raw_decode(attempt)
+                if isinstance(obj, (dict, list)):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+
+    # Last-resort repair for truncated JSON responses with leading prose
+    start_candidates = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    if start_candidates:
+        sliced = text[min(start_candidates) :]
+        for trim_last in (sliced, sliced.rsplit(",", 1)[0]):
+            repaired = _repair_truncated_json(trim_last)
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                continue
+
+    return json.loads(text)
 
 
 def _build_annotated_page_and_collage(
@@ -376,8 +482,9 @@ class VisionLLMClient:
                 if transient_attempt < max_transient:
                     wait_s = 1.5 * (2**transient_attempt)
                     transient_attempt += 1
+                    detail = str(exc).replace("\n", " ")[:120]
                     self._emit_status(
-                        f"Lỗi tạm thời ({type(exc).__name__}), thử lại lần {transient_attempt}/{max_transient} sau {wait_s:.1f}s..."
+                        f"Lỗi tạm thời ({type(exc).__name__}: {detail}), thử lại lần {transient_attempt}/{max_transient} sau {wait_s:.1f}s..."
                     )
                     time.sleep(wait_s)
                     continue
@@ -403,7 +510,7 @@ class VisionLLMClient:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
         parts.append({"text": user_prompt})
 
-        gen_cfg: dict[str, Any] = {"temperature": temperature}
+        gen_cfg: dict[str, Any] = {"temperature": temperature, "maxOutputTokens": 16384}
         if json_mode:
             gen_cfg["responseMimeType"] = "application/json"
 
@@ -448,8 +555,14 @@ class VisionLLMClient:
                 f"Gemini API chặn phản hồi ({finish_reason}, model={self.model}). "
                 "Hãy dùng /key với endpoint --base-url phù hợp nếu xử lý nội dung R18."
             )
-        text_parts = [p.get("text", "") for p in candidates[0].get("content", {}).get("parts", [])]
-        return "\n".join(text_parts)
+        parts_out = candidates[0].get("content", {}).get("parts", [])
+        text_parts = [p.get("text", "") for p in parts_out if not p.get("thought") and p.get("text")]
+        if not text_parts:
+            text_parts = [p.get("text", "") for p in parts_out if p.get("text")]
+        joined = "\n".join(text_parts)
+        if not joined.strip():
+            raise ValueError(f"Gemini returned empty text (finishReason={finish_reason or 'unknown'})")
+        return joined
 
     def _call_openai_compatible(
         self,
@@ -490,7 +603,14 @@ class VisionLLMClient:
                     response=resp,
                 )
             data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        msg_content = data["choices"][0]["message"].get("content", "")
+        if isinstance(msg_content, list):
+            return "\n".join(
+                str(part.get("text", ""))
+                for part in msg_content
+                if isinstance(part, dict) and part.get("type", "text") == "text"
+            )
+        return str(msg_content or "")
 
     def ask_assistant(self, user_prompt: str, session_summary: str = "") -> str:
         """Short conversational helper inside Koharu-VN TUI (translation tips, prompts, usage)."""

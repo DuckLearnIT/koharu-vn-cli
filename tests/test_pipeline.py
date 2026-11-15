@@ -949,3 +949,21 @@ def test_story_bible_confirm_hook_allows_character_edits(tmp_path: Path):
     assert "Honkai: Star Rail" in bible.to_prompt_block()
     saved = StoryBible.model_validate_json((cache_dir / "story_bible.json").read_text(encoding="utf-8"))
     assert saved.characters[0].name == "Robin"
+
+
+def test_extract_json_block_handles_think_tags_trailing_commas_and_truncation():
+    from koharu_vn_cli.pipeline.gemini_client import _extract_json_block
+
+    raw_think = (
+        "<think>Checking {character: Robin} and braces [1,2]</think>\n"
+        'Here is the JSON:\n{"title": "Test", "characters": [{"name": "Robin",},],}\n'
+        "Note: hope this {helps}!"
+    )
+    parsed = _extract_json_block(raw_think)
+    assert parsed["title"] == "Test"
+    assert parsed["characters"][0]["name"] == "Robin"
+
+    truncated = '{"title": "Trunc", "characters": [{"name": "Firefly", "pronoun_rules": "anh - em"}'
+    repaired = _extract_json_block(truncated)
+    assert repaired["title"] == "Trunc"
+    assert repaired["characters"][0]["name"] == "Firefly"
