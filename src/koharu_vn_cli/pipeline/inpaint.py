@@ -49,18 +49,24 @@ def build_erasure_mask(
         roi_gray = gray[py1:py2, px1:px2]
         fg_ratio = np.count_nonzero(local_mask) / max(1, local_mask.size)
         if reg.is_bubble or fg_ratio < 0.08:
-            border_pixels = np.concatenate([
-                roi_gray[0, :],
-                roi_gray[-1, :],
-                roi_gray[:, 0],
-                roi_gray[:, -1],
-            ])
-            bg_med = float(np.median(border_pixels)) if border_pixels.size > 0 else float(np.median(roi_gray))
+            # Prefer unmasked interior pixels (avoids outer hair/skin/border corrupting translucent bubbles)
+            dilated_seed = cv2.dilate(local_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+            interior_bg = roi_gray[dilated_seed == 0]
+            if interior_bg.size >= 24:
+                bg_sample = interior_bg
+            else:
+                bg_sample = np.concatenate([
+                    roi_gray[0, :],
+                    roi_gray[-1, :],
+                    roi_gray[:, 0],
+                    roi_gray[:, -1],
+                ])
+            bg_med = float(np.median(bg_sample)) if bg_sample.size > 0 else float(np.median(roi_gray))
             diff = np.abs(roi_gray.astype(np.float32) - bg_med)
             otsu_val, _ = cv2.threshold(
                 np.clip(diff, 0, 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
-            thresh = max(16.0, min(40.0, float(otsu_val) * 0.62)) if reg.is_bubble else max(26.0, float(otsu_val))
+            thresh = max(14.0, min(34.0, float(otsu_val) * 0.58)) if reg.is_bubble else max(26.0, float(otsu_val))
             extra = (diff > thresh).astype(np.uint8) * 255
             local_mask = cv2.bitwise_or(local_mask, extra)
         else:
@@ -79,20 +85,19 @@ def build_erasure_mask(
                 ).astype(np.uint8) * 255
                 local_mask = cv2.bitwise_or(local_mask, halo_outliers)
 
-        # Slightly fuller dilation for floating text so LaMa never sees residual dark stroke outlines
-        k_size = 7 if reg.is_bubble else 9
+        # Slightly fuller dilation so LaMa never sees residual dark stroke halos or furigana
+        k_size = 9 if reg.is_bubble else 11
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
         local_mask = cv2.dilate(local_mask, kernel, iterations=1)
 
-        # If inside a known bubble, clip mask slightly inside the bubble border
-        # so we don't accidentally erase black speech bubble outlines
+        # Only trim 2px at an edge if text_bbox actually touches that bubble border —
+        # NEVER chop pixels when text_bbox extends beyond an underestimated bubble_bbox!
         if reg.bubble_bbox is not None and reg.is_bubble:
             bx1, by1, bx2, by2 = reg.bubble_bbox
-            # Keep 2px inner safety margin inside bubble bounds only if text_bbox is near edge
-            safe_x1 = max(px1, bx1 + 2) if x1 <= bx1 + 3 else px1
-            safe_y1 = max(py1, by1 + 2) if y1 <= by1 + 3 else py1
-            safe_x2 = min(px2, bx2 - 2) if x2 >= bx2 - 3 else px2
-            safe_y2 = min(py2, by2 - 2) if y2 >= by2 - 3 else py2
+            safe_x1 = max(px1, bx1 + 2) if bx1 - 2 <= x1 <= bx1 + 3 else px1
+            safe_y1 = max(py1, by1 + 2) if by1 - 2 <= y1 <= by1 + 3 else py1
+            safe_x2 = min(px2, bx2 - 2) if bx2 - 3 <= x2 <= bx2 + 2 else px2
+            safe_y2 = min(py2, by2 - 2) if by2 - 3 <= y2 <= by2 + 2 else py2
             clip = np.zeros_like(local_mask)
             if safe_x2 > safe_x1 and safe_y2 > safe_y1:
                 clip[safe_y1 - py1 : safe_y2 - py1, safe_x1 - px1 : safe_x2 - px1] = 255

@@ -263,9 +263,13 @@ def _flood_fill_bubble_contour(
     filled_box = (roi_x1 + x, roi_y1 + y, roi_x1 + x + cw, roi_y1 + y + ch)
 
     if known_bubble_box is not None:
-        # Intersect with known bubble box + small margin so contour stays inside detected bubble
+        # Never let a partial translucent flood-fill shrink RT-DETR's bubble box or chop off text
         kb = known_bubble_box
-        if containment_ratio(filled_box, (kb[0] - 8, kb[1] - 8, kb[2] + 8, kb[3] + 8)) >= 0.45:
+        if (
+            containment_ratio(seed_box, filled_box) >= 0.96
+            and box_area(filled_box) >= box_area(kb) * 0.72
+            and containment_ratio(filled_box, (kb[0] - 8, kb[1] - 8, kb[2] + 8, kb[3] + 8)) >= 0.45
+        ):
             return filled_box, pts if len(pts) >= 4 else None, is_dark
         return known_bubble_box, None, is_dark
 
@@ -319,11 +323,123 @@ def _expand_box_with_seg_mask(
             # Verify component actually belongs to the glyphs inside the box
             comp_in_orig = labels[max(0, oy1 - 3) : min(ry2 - ry1, oy2 + 3), max(0, ox1 - 3) : min(rx2 - rx1, ox2 + 3)]
             if np.any(comp_in_orig == lbl):
-                nx1 = min(nx1, rx1 + cx)
-                ny1 = min(ny1, ry1 + cy)
-                nx2 = max(nx2, rx1 + cx + cw)
-                ny2 = max(ny2, ry1 + cy + ch)
-    return (max(0, nx1), max(0, ny1), min(w, nx2), min(h, ny2))
+                nx1 = min(nx1, rx1 + int(cx))
+                ny1 = min(ny1, ry1 + int(cy))
+                nx2 = max(nx2, rx1 + int(cx) + int(cw))
+                ny2 = max(ny2, ry1 + int(cy) + int(ch))
+    return (int(max(0, nx1)), int(max(0, ny1)), int(min(w, nx2)), int(min(h, ny2)))
+
+
+def _enhance_contrast(rgb: np.ndarray) -> np.ndarray:
+    """Apply gentle LAB-luminance CLAHE to boost faint translucent bubbles & colored SFX."""
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
+def _tile_clip_score(
+    score: float,
+    box: tuple[int, int, int, int],
+    tile_rect: tuple[int, int, int, int],
+    full_w: int,
+    full_h: int,
+) -> float:
+    """Downweight boxes clipped along an interior tile boundary so unclipped boxes win NMS."""
+    tx1, ty1, tx2, ty2 = tile_rect
+    if (tx1, ty1, tx2, ty2) == (0, 0, full_w, full_h):
+        return score
+    x1, y1, x2, y2 = box
+    clipped = (
+        (tx1 > 0 and x1 <= tx1 + 3)
+        or (ty1 > 0 and y1 <= ty1 + 3)
+        or (tx2 < full_w and x2 >= tx2 - 3)
+        or (ty2 < full_h and y2 >= ty2 - 3)
+    )
+    return score * 0.78 if clipped else score
+
+
+def _promote_complete_boxes(
+    items: list[tuple[tuple[int, int, int, int], float, int]],
+    text_mask: np.ndarray,
+) -> list[tuple[tuple[int, int, int, int], float, int]]:
+    """
+    When a lower-confidence complete box `L` encloses a higher-confidence partial fragment `S`
+    AND the uncovered extra region `L \\ S` actually contains text pixels in `text_mask`,
+    promote `L` so `_containment_nms` does not discard top/bottom characters of vertical lines.
+    """
+    if len(items) < 2:
+        return items
+
+    h, w = text_mask.shape[:2]
+    fg = text_mask > 65
+    promoted: list[tuple[tuple[int, int, int, int], float, int]] = []
+    for box_l, sc_l, lbl_l in items:
+        best_sc = sc_l
+        area_l = box_area(box_l)
+        if sc_l >= 0.24 and area_l > 0:
+            for box_s, sc_s, _ in items:
+                if sc_s <= best_sc:
+                    continue
+                area_s = box_area(box_s)
+                if area_s <= 0 or area_l <= area_s * 1.15 or area_l > area_s * 4.5:
+                    continue
+                if containment_ratio(box_s, box_l) < 0.80:
+                    continue
+                lx1, ly1, lx2, ly2 = max(0, box_l[0]), max(0, box_l[1]), min(w, box_l[2]), min(h, box_l[3])
+                sx1, sy1, sx2, sy2 = max(lx1, box_s[0]), max(ly1, box_s[1]), min(lx2, box_s[2]), min(ly2, box_s[3])
+                sub_fg = fg[ly1:ly2, lx1:lx2].copy()
+                sub_fg[sy1 - ly1 : sy2 - ly1, sx1 - lx1 : sx2 - lx1] = False
+                extra_area = max(1, (lx2 - lx1) * (ly2 - ly1) - (sx2 - sx1) * (sy2 - sy1))
+                extra_px = int(np.count_nonzero(sub_fg))
+                if extra_px >= 18 and (extra_px / extra_area) >= 0.03:
+                    best_sc = max(best_sc, sc_s + 0.01)
+        promoted.append((box_l, best_sc, lbl_l))
+    return promoted
+
+
+def _discover_unboxed_text_regions(
+    rgb: np.ndarray,
+    text_mask: np.ndarray,
+    existing_boxes: list[tuple[int, int, int, int]],
+) -> list[DetectedRegion]:
+    """Recover standalone glyph clusters lit up in UNet+DBNet `text_mask` that box detectors missed."""
+    h, w = text_mask.shape[:2]
+    uncovered = (text_mask > 105).astype(np.uint8) * 255
+    for ex1, ey1, ex2, ey2 in existing_boxes:
+        pad = 5
+        uncovered[max(0, ey1 - pad) : min(h, ey2 + pad), max(0, ex1 - pad) : min(w, ex2 + pad)] = 0
+
+    if np.count_nonzero(uncovered) < 120:
+        return []
+
+    closed = cv2.morphologyEx(uncovered, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+    num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(closed)
+    recovered: list[DetectedRegion] = []
+    page_area = h * w
+    for lbl in range(1, num_lbl):
+        cx, cy, cw, ch, area = (int(v) for v in stats[lbl])
+        if cw < 12 or ch < 12 or area < 140 or area > page_area * 0.25:
+            continue
+        aspect = cw / max(1, ch)
+        if aspect < 0.06 or aspect > 15.0:
+            continue
+        box = (max(0, cx - 2), max(0, cy - 2), min(w, cx + cw + 2), min(h, cy + ch + 2))
+        crop_m = text_mask[box[1] : box[3], box[0] : box[2]]
+        if crop_m.size == 0 or int(crop_m.max()) < 155:
+            continue
+        refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, box, None)
+        recovered.append(
+            DetectedRegion(
+                text_bbox=box,
+                bubble_bbox=refined_box,
+                bubble_contour=contour,
+                is_bubble=refined_box is not None,
+                is_dark_bubble=is_dark,
+                confidence=0.45,
+            )
+        )
+    return recovered
 
 
 def _to_prob_01(arr: np.ndarray) -> np.ndarray:
@@ -417,7 +533,10 @@ class ComicDetector:
         return mask, blk_hits
 
     def detect_ctd(
-        self, rgb: np.ndarray, blk_conf_thresh: float = 0.36
+        self,
+        rgb: np.ndarray,
+        blk_conf_thresh: float = 0.28,
+        enhanced_rgb: np.ndarray | None = None,
     ) -> tuple[np.ndarray, list[tuple[tuple[int, int, int, int], float, int]]]:
         """Return fused uint8 (H, W) UNet+DBNet text mask and mask-verified CTD `blk` text boxes."""
         h, w = rgb.shape[:2]
@@ -430,7 +549,17 @@ class ComicDetector:
                     rgb[wy1:wy2, wx1:wx2], wx1, wy1, blk_conf_thresh=blk_conf_thresh
                 )
                 full_mask[wy1:wy2, wx1:wx2] = np.maximum(full_mask[wy1:wy2, wx1:wx2], tile_mask)
-                raw_blks.extend(tile_blks)
+                raw_blks.extend(
+                    (b, _tile_clip_score(s, b, (wx1, wy1, wx2, wy2), w, h), l) for b, s, l in tile_blks
+                )
+
+        # Contrast-boosted pass captures translucent/low-contrast kanji & colored SFX
+        if enhanced_rgb is not None:
+            enh_mask, enh_blks = self._run_ctd_crop(
+                enhanced_rgb, 0, 0, blk_conf_thresh=max(0.22, blk_conf_thresh - 0.04)
+            )
+            full_mask = np.maximum(full_mask, enh_mask)
+            raw_blks.extend((b, s * 0.94, l) for b, s, l in enh_blks)
 
         # Keep CTD `blk` hits backed by CTD's own fused UNet+DBNet mask to suppress texture/hair noise
         verified_blks: list[tuple[tuple[int, int, int, int], float, int]] = []
@@ -449,9 +578,19 @@ class ComicDetector:
         return self.detect_ctd(rgb)[0]
 
     def _run_rtdetr_tile(
-        self, rgb_tile: np.ndarray, offset_x: int, offset_y: int, conf_thresh: float
+        self,
+        rgb_tile: np.ndarray,
+        offset_x: int,
+        offset_y: int,
+        conf_thresh: float,
+        full_w: int | None = None,
+        full_h: int | None = None,
     ) -> tuple[list[tuple[tuple[int, int, int, int], float, int]], list[tuple[tuple[int, int, int, int], float, int]]]:
         th, tw = rgb_tile.shape[:2]
+        fw = full_w if full_w is not None else offset_x + tw
+        fh = full_h if full_h is not None else offset_y + th
+        tile_rect = (offset_x, offset_y, offset_x + tw, offset_y + th)
+
         resized = cv2.resize(rgb_tile, (640, 640), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
         inp = np.transpose(resized, (2, 0, 1))[None]
         labels, boxes, scores = self._rtdetr.run(
@@ -463,17 +602,18 @@ class ComicDetector:
         for lbl, box, sc in zip(labels[0], boxes[0], scores[0]):
             score = float(sc)
             label = int(lbl)
-            min_score = 0.18 if label == 2 else conf_thresh
+            min_score = 0.18 if label in (1, 2) else conf_thresh
             if score < min_score:
                 continue
             x1, y1, x2, y2 = float(box[0]) + offset_x, float(box[1]) + offset_y, float(box[2]) + offset_x, float(box[3]) + offset_y
             clamped = _clamp_box((x1, y1, x2, y2), offset_x + tw, offset_y + th)
             if box_area(clamped) < 36:
                 continue
+            ranked_score = _tile_clip_score(score, clamped, tile_rect, fw, fh)
             if label == 0:
-                bubbles.append((clamped, score, label))
+                bubbles.append((clamped, ranked_score, label))
             elif label in (1, 2):
-                texts.append((clamped, score, label))
+                texts.append((clamped, ranked_score, label))
         return bubbles, texts
 
     def detect(
@@ -483,20 +623,29 @@ class ComicDetector:
     ) -> tuple[list[DetectedRegion], np.ndarray]:
         """Detect deduplicated text/bubble regions and pixel-level text mask."""
         h, w = rgb.shape[:2]
-        text_mask, ctd_texts = self.detect_ctd(rgb, blk_conf_thresh=max(0.32, conf_thresh))
+        enhanced = _enhance_contrast(rgb)
+        text_mask, ctd_texts = self.detect_ctd(rgb, blk_conf_thresh=0.26, enhanced_rgb=enhanced)
 
         raw_bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
         raw_texts: list[tuple[tuple[int, int, int, int], float, int]] = list(ctd_texts)
 
         for wx1, wy1, wx2, wy2 in _compute_tile_windows(w, h):
-            b_hits, t_hits = self._run_rtdetr_tile(rgb[wy1:wy2, wx1:wx2], wx1, wy1, conf_thresh)
+            b_hits, t_hits = self._run_rtdetr_tile(
+                rgb[wy1:wy2, wx1:wx2], wx1, wy1, conf_thresh, full_w=w, full_h=h
+            )
             raw_bubbles.extend(b_hits)
             raw_texts.extend(t_hits)
 
+        # Secondary contrast pass captures faint/translucent bubbles & colored SFX
+        cb_hits, ct_hits = self._run_rtdetr_tile(enhanced, 0, 0, conf_thresh, full_w=w, full_h=h)
+        raw_bubbles.extend((b, s * 0.94, l) for b, s, l in cb_hits)
+        raw_texts.extend((b, s * 0.94, l) for b, s, l in ct_hits)
+
         bubbles = _containment_nms(raw_bubbles, iou_thresh=0.45, contain_thresh=0.70)
+        raw_texts = _promote_complete_boxes(raw_texts, text_mask)
         texts = _containment_nms(raw_texts, iou_thresh=0.40, contain_thresh=0.52)
 
-        # Verify low-confidence floating text candidates (0.18..conf_thresh) against text_mask
+        # Verify low-confidence text candidates (0.18..conf_thresh) against fused UNet+DBNet text_mask
         verified_texts: list[tuple[tuple[int, int, int, int], float, int]] = []
         for t_box, t_score, t_lbl in texts:
             if t_score < conf_thresh:
@@ -532,7 +681,7 @@ class ComicDetector:
         for b_idx, members in bubble_groups.items():
             b_box, b_score, _ = bubbles[b_idx]
             merged_tbox = union_box([m[0] for m in members])
-            merged_tbox = _expand_box_with_seg_mask(merged_tbox, text_mask, bounds=b_box, max_expand=16)
+            merged_tbox = _expand_box_with_seg_mask(merged_tbox, text_mask, bounds=b_box, max_expand=24)
             avg_conf = max(b_score, max(m[1] for m in members))
             refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, merged_tbox, b_box)
             regions.append(
@@ -548,7 +697,7 @@ class ComicDetector:
 
         # 2. Standalone texts (may still sit inside an undetected white/dark translucent bubble!)
         for t_box, t_score, t_lbl in standalone_texts:
-            expanded_tbox = _expand_box_with_seg_mask(t_box, text_mask, bounds=None, max_expand=26)
+            expanded_tbox = _expand_box_with_seg_mask(t_box, text_mask, bounds=None, max_expand=28)
             refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, expanded_tbox, None)
             is_bubble = refined_box is not None or t_lbl == 1
             regions.append(
@@ -561,6 +710,9 @@ class ComicDetector:
                     confidence=t_score,
                 )
             )
+
+        # 3. Fallback: recover strong UNet+DBNet glyph clusters missed by box detectors
+        regions.extend(_discover_unboxed_text_regions(rgb, text_mask, [r.text_bbox for r in regions]))
 
         # Sort in Manga reading order: top-to-bottom bands, right-to-left within bands
         regions.sort(key=lambda r: (r.text_bbox[1] // max(40, h // 8), -((r.text_bbox[0] + r.text_bbox[2]) // 2)))

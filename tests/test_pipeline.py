@@ -797,3 +797,61 @@ def test_lama_manga_patch_scaling_and_padding():
     pred_big = inpainter._run_lama_patch(rgb_big, msk_big)
     assert pred_big.shape == (700, 640, 3)
     assert len(recorded_shapes) == 3
+
+
+def test_promote_complete_boxes_and_tile_clip_penalty():
+    from koharu_vn_cli.pipeline.detector import (
+        _containment_nms,
+        _promote_complete_boxes,
+        _tile_clip_score,
+    )
+
+    # Full vertical span (conf 0.42) encompasses partial lower fragment (conf 0.78),
+    # and the top extension (y=30..65) contains real glyph pixels in text_mask.
+    text_mask = np.zeros((150, 120), dtype=np.uint8)
+    text_mask[35:62, 40:65] = 200
+    text_mask[72:105, 40:65] = 210
+    full_box = (36, 30, 70, 110)
+    frag_box = (38, 68, 68, 108)
+    promoted = _promote_complete_boxes([(frag_box, 0.78, 2), (full_box, 0.42, 2)], text_mask)
+    kept = _containment_nms(promoted, iou_thresh=0.40, contain_thresh=0.52)
+    assert len(kept) == 1
+    assert kept[0][0] == full_box
+
+    # Clipped tile-edge box vs unclipped full-page box -> unclipped box wins!
+    unclipped = (137, 6, 226, 244)
+    clipped = (146, 7, 226, 243)
+    s_unclipped = _tile_clip_score(0.89, unclipped, (0, 0, 786, 245), 786, 245)
+    s_clipped = _tile_clip_score(0.92, clipped, (146, 0, 786, 245), 786, 245)
+    assert s_unclipped > s_clipped
+
+
+def test_translucent_bubble_never_chops_top_glyphs_in_erasure_mask():
+    from koharu_vn_cli.pipeline.detector import _flood_fill_bubble_contour
+    from koharu_vn_cli.pipeline.inpaint import build_erasure_mask
+
+    # Translucent gradient bubble (top darkened over hair, bottom bright over skin)
+    rgb = np.full((200, 160, 3), 210, dtype=np.uint8)
+    rgb[:75, :] = 95  # darker top region breaks naive fixed-range floodFill
+    rgb[20:55, 65:95] = 20  # dark kanji glyphs at the top!
+    text_mask = np.zeros((200, 160), dtype=np.uint8)
+    text_mask[22:52, 68:92] = 220
+
+    known_box = (45, 5, 115, 190)
+    seed_text = (58, 15, 102, 180)
+    refined, _, _ = _flood_fill_bubble_contour(rgb, text_mask, seed_text, known_box)
+    assert refined is not None
+    # Must preserve full top extent instead of chopping below y=75!
+    assert refined[1] <= 15
+
+    # Even if an underestimated bubble_bbox starts below text_bbox, build_erasure_mask must NOT clip top glyphs
+    reg = DetectedRegion(
+        text_bbox=seed_text,
+        bubble_bbox=(45, 80, 115, 190),
+        bubble_contour=None,
+        is_bubble=True,
+        is_dark_bubble=False,
+        confidence=0.90,
+    )
+    mask = build_erasure_mask(rgb, text_mask, [reg])
+    assert int(np.count_nonzero(mask[20:55, 65:95])) > 500
