@@ -48,6 +48,9 @@ class AppConfig(BaseModel):
     conf_thresh: float = Field(default=0.34, ge=0.15, le=0.85)
     accurate_detector: bool = True
     save_cbz: bool = False
+    output_format: str = "webp"
+    sequential_names: bool = True
+    review_characters: bool = True
     theme: str = "tokyo-night"
     last_output_dir: Optional[str] = None
 

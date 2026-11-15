@@ -43,6 +43,7 @@ class PipelineHooks:
     on_step: Optional[Callable[[int, int, str, str, str], None]] = None
     on_page_done: Optional[Callable[[int, int, str, PageDocument, Path], None]] = None
     on_story_bible: Optional[Callable[[StoryBible], None]] = None
+    on_confirm_story_bible: Optional[Callable[[StoryBible], StoryBible | None]] = None
     is_cancelled: Optional[Callable[[], bool]] = None
 
     def emit_step(self, idx: int, total: int, name: str, stage: str, detail: str = "") -> None:
@@ -58,6 +59,13 @@ class PipelineHooks:
     def emit_story_bible(self, bible: StoryBible) -> None:
         if self.on_story_bible:
             self.on_story_bible(bible)
+
+    def confirm_story_bible(self, bible: StoryBible) -> StoryBible:
+        if self.on_confirm_story_bible:
+            updated = self.on_confirm_story_bible(bible)
+            if updated is not None:
+                return updated
+        return bible
 
     def check_cancelled(self) -> None:
         if self.is_cancelled and self.is_cancelled():
@@ -124,11 +132,33 @@ def _is_supported_image(path: Path) -> bool:
     return path.is_file() and _detect_image_ext(path) is not None
 
 
-def _output_image_name(path: Path) -> str:
+def _resolve_output_ext(path: Path, output_format: str = "original") -> str:
+    fmt = (output_format or "original").strip().lower().lstrip(".")
+    if fmt == "webp":
+        return ".webp"
+    if fmt in {"jpg", "jpeg"}:
+        return ".jpg"
+    if fmt == "png":
+        return ".png"
     if path.suffix.lower() in IMAGE_EXTS:
+        return path.suffix.lower()
+    return _detect_image_ext(path) or ".png"
+
+
+def _output_image_name(
+    path: Path,
+    *,
+    output_format: str = "original",
+    seq_index: int | None = None,
+    seq_pad: int = 3,
+) -> str:
+    ext = _resolve_output_ext(path, output_format=output_format)
+    if seq_index is not None:
+        return f"{seq_index:0{seq_pad}d}{ext}"
+    if path.suffix.lower() in IMAGE_EXTS and output_format in ("original", "", None):
         return path.name
-    ext = _detect_image_ext(path) or ".png"
-    return f"{path.name}{ext}"
+    stem = path.stem if path.suffix.lower() in IMAGE_EXTS else path.name
+    return f"{stem}{ext}"
 
 
 def natural_key(path: Path) -> tuple[int, int, list[int | str]]:
@@ -186,9 +216,9 @@ def save_image(pil_img: Image.Image, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ext = out_path.suffix.lower()
     if ext in {".jpg", ".jpeg"}:
-        pil_img.convert("RGB").save(out_path, format="JPEG", quality=94)
+        pil_img.convert("RGB").save(out_path, format="JPEG", quality=96)
     elif ext == ".webp":
-        pil_img.convert("RGB").save(out_path, format="WEBP", quality=92)
+        pil_img.convert("RGB").save(out_path, format="WEBP", quality=100, method=6)
     else:
         pil_img.convert("RGB").save(out_path, format="PNG")
 
@@ -213,28 +243,63 @@ def package_cbz(output_dir: Path, cbz_path: Path) -> None:
 def expand_composed_boxes_if_tight(
     regions: list[TextRegionItem], img_w: int, img_h: int
 ) -> list[TextRegionItem]:
-    """Gently enlarge proposed compose boxes when text would otherwise shrink below readable size."""
+    """Ensure compose bubbles & floating boxes are comfortably large and readable on mobile/desktop."""
+    min_dim = min(img_w, img_h)
+    bubble_target_font = max(18, int(round(min_dim * 0.024)))
+    floating_target_font = max(16, int(round(min_dim * 0.020)))
+    max_bw = max(200, int(round(img_w * 0.36)))
+    max_bh = max(160, int(round(img_h * 0.36)))
+
     adjusted: list[TextRegionItem] = []
     for reg in regions:
-        layout = solve_layout(reg)
         copy = reg.model_copy()
-        if layout.font_size < 14 or layout.overflowed:
-            bx1, by1, bx2, by2 = copy.bubble_bbox or copy.text_bbox
-            bw, bh = bx2 - bx1, by2 - by1
-            scale = 1.28 if layout.overflowed else 1.18
-            nbw = int(bw * scale)
-            nbh = int(bh * scale)
-            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-            nx1 = max(8, cx - nbw // 2)
-            ny1 = max(8, cy - nbh // 2)
-            nx2 = min(img_w - 8, nx1 + nbw)
-            ny2 = min(img_h - 8, ny1 + nbh)
-            box = (nx1, ny1, max(nx1 + 24, nx2), max(ny1 + 20, ny2))
+        text_len = len((copy.translated_text or copy.source_text or "").strip())
+        is_bubble = copy.kind == "bubble"
+        target_font = bubble_target_font if is_bubble else floating_target_font
+
+        if is_bubble:
+            if text_len <= 12:
+                min_bw = max(112, int(round(img_w * 0.095)))
+                min_bh = max(86, int(round(img_h * 0.095)))
+            else:
+                min_bw = max(150, int(round(img_w * 0.125)))
+                min_bh = max(110, int(round(img_h * 0.12)))
+        else:
+            min_bw, min_bh = 48, 28
+
+        bx1, by1, bx2, by2 = copy.bubble_bbox or copy.text_bbox
+        bw = max(min_bw, bx2 - bx1)
+        bh = max(min_bh, by2 - by1)
+        cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+
+        def _clamp_centered(cur_w: int, cur_h: int) -> tuple[int, int, int, int]:
+            cw = min(max_bw, max(24, cur_w))
+            ch = min(max_bh, max(20, cur_h))
+            nx1 = max(8, min(img_w - 8 - cw, cx - cw // 2))
+            ny1 = max(8, min(img_h - 8 - ch, cy - ch // 2))
+            return (nx1, ny1, min(img_w - 8, nx1 + cw), min(img_h - 8, ny1 + ch))
+
+        box = _clamp_centered(bw, bh)
+        copy.text_bbox = box
+        if is_bubble:
+            copy.bubble_bbox = box
+
+        for _ in range(5):
+            layout = solve_layout(copy)
+            if layout.font_size >= target_font and not layout.overflowed:
+                break
+            scale = 1.24 if layout.overflowed else 1.18
+            nbw = int(round((copy.text_bbox[2] - copy.text_bbox[0]) * scale))
+            nbh = int(round((copy.text_bbox[3] - copy.text_bbox[1]) * scale))
+            if nbw >= max_bw and nbh >= max_bh:
+                break
+            box = _clamp_centered(nbw, nbh)
             copy.text_bbox = box
-            if copy.kind == "bubble":
+            if is_bubble:
                 copy.bubble_bbox = box
+
         adjusted.append(copy)
-    return resolve_box_overlaps(adjusted, img_w, img_h)
+    return resolve_box_overlaps(adjusted, img_w, img_h, gap=max(10, int(min_dim * 0.012)))
 
 
 def resolve_story_text(story: str | None) -> str | None:
@@ -290,8 +355,12 @@ def _load_or_build_story_bible(
         extra_instructions=prompt,
         tags=tags,
     )
-    bible_path.write_text(bible.model_dump_json(indent=2), encoding="utf-8")
     hooks.emit_story_bible(bible)
+    confirmed = hooks.confirm_story_bible(bible)
+    if confirmed is not bible:
+        bible = confirmed
+        hooks.emit_story_bible(bible)
+    bible_path.write_text(bible.model_dump_json(indent=2), encoding="utf-8")
     return bible
 
 
@@ -313,6 +382,8 @@ def run_translate_pipeline(
     conf: float = 0.34,
     accurate_detector: bool = True,
     save_cbz: bool = False,
+    output_format: str = "original",
+    sequential_names: bool = False,
     resume: bool = False,
     model_cache: ModelCache | None = None,
     hooks: PipelineHooks | None = None,
@@ -377,10 +448,16 @@ def run_translate_pipeline(
 
         previous_summaries: list[str] = []
         docs: list[PageDocument] = []
+        seq_pad = max(3, len(str(total)))
 
         for idx, img_path in enumerate(images, start=1):
             hooks.check_cancelled()
-            out_img_path = out_dir / _output_image_name(img_path)
+            out_img_path = out_dir / _output_image_name(
+                img_path,
+                output_format=output_format,
+                seq_index=idx if sequential_names else None,
+                seq_pad=seq_pad,
+            )
             json_path = cache_dir / f"{img_path.stem}.koharu.json"
 
             if resume and out_img_path.is_file() and json_path.is_file():
@@ -518,6 +595,8 @@ def run_compose_pipeline(
     story_model: str | None = None,
     font: str | None = None,
     save_cbz: bool = False,
+    output_format: str = "original",
+    sequential_names: bool = False,
     resume: bool = False,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
@@ -603,9 +682,15 @@ def run_compose_pipeline(
                 tags=tags,
             )
 
+        seq_pad = max(3, len(str(total)))
         for idx, img_path in enumerate(images, start=1):
             hooks.check_cancelled()
-            out_img_path = out_dir / _output_image_name(img_path)
+            out_img_path = out_dir / _output_image_name(
+                img_path,
+                output_format=output_format,
+                seq_index=idx if sequential_names else None,
+                seq_pad=seq_pad,
+            )
             json_path = cache_dir / f"{img_path.stem}.koharu.json"
 
             if resume and out_img_path.is_file() and json_path.is_file():
@@ -678,6 +763,8 @@ def run_rerender_pipeline(
     *,
     font: str | None = None,
     font_scale: float = 1.0,
+    output_format: str = "original",
+    sequential_names: bool = False,
     hooks: PipelineHooks | None = None,
 ) -> list[PageDocument]:
     """Re-render cached `.koharu.json` pages locally without calling any API or ML detector."""
@@ -688,6 +775,7 @@ def run_rerender_pipeline(
         raise FileNotFoundError(f"Không tìm thấy file .koharu.json nào trong {cache_dir}")
 
     total = len(json_files)
+    seq_pad = max(3, len(str(total)))
     docs: list[PageDocument] = []
     for idx, jp in enumerate(json_files, start=1):
         hooks.check_cancelled()
@@ -705,12 +793,93 @@ def run_rerender_pipeline(
                     solved = solve_layout(reg)
                     reg.font_size = max(10.0, solved.font_size * font_scale)
 
-        orig_name = Path(doc.image_path).name
-        out_path = output_dir / orig_name
-        hooks.emit_step(idx, total, orig_name, "render", "Render lại ảnh từ .koharu.json...")
+        orig_path = Path(doc.image_path)
+        out_name = _output_image_name(
+            orig_path,
+            output_format=output_format,
+            seq_index=idx if sequential_names else None,
+            seq_pad=seq_pad,
+        )
+        out_path = output_dir / out_name
+        hooks.emit_step(idx, total, out_name, "render", "Render lại ảnh từ .koharu.json...")
         out_img = render_document(base_rgb, doc)
         save_image(out_img, out_path)
         docs.append(doc)
-        hooks.emit_page_done(idx, total, orig_name, doc, out_path)
+        hooks.emit_page_done(idx, total, out_name, doc, out_path)
 
     return docs
+
+
+def pack_images_to_webp(
+    input_path: Path,
+    *,
+    output: Path | None = None,
+    in_place: bool = False,
+    sequential_names: bool = True,
+    hooks: PipelineHooks | None = None,
+) -> tuple[Path, list[Path]]:
+    """
+    Sort messy image filenames in natural reading order, convert to WebP max quality (100),
+    and rename sequentially (001.webp, 002.webp, ...).
+    """
+    hooks = hooks or PipelineHooks()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        if not images:
+            raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
+
+        total = len(images)
+        seq_pad = max(3, len(str(total)))
+        written: list[Path] = []
+
+        if in_place and input_path.is_dir():
+            out_dir = input_path
+            staging = input_path / f".koharu_pack_{os.getpid()}"
+            staging.mkdir(parents=True, exist_ok=True)
+            try:
+                staged_files: list[tuple[Path, str]] = []
+                for idx, img_path in enumerate(images, start=1):
+                    hooks.check_cancelled()
+                    out_name = _output_image_name(
+                        img_path,
+                        output_format="webp",
+                        seq_index=idx if sequential_names else None,
+                        seq_pad=seq_pad,
+                    )
+                    hooks.emit_step(idx, total, img_path.name, "pack", f"Chuyển {img_path.name} -> {out_name} (WebP 100%)")
+                    staged_path = staging / out_name
+                    with Image.open(img_path) as im:
+                        save_image(im, staged_path)
+                    staged_files.append((staged_path, out_name))
+
+                # Remove original images only after all WebP files succeeded
+                for old_img in images:
+                    if old_img.is_file():
+                        old_img.unlink()
+                for staged_path, out_name in staged_files:
+                    dest = out_dir / out_name
+                    staged_path.replace(dest)
+                    written.append(dest)
+            finally:
+                if staging.exists():
+                    for leftover in staging.iterdir():
+                        leftover.unlink(missing_ok=True)
+                    staging.rmdir()
+            return out_dir, written
+
+        out_dir = output or input_path.parent / f"{base_name}_webp"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for idx, img_path in enumerate(images, start=1):
+            hooks.check_cancelled()
+            out_name = _output_image_name(
+                img_path,
+                output_format="webp",
+                seq_index=idx if sequential_names else None,
+                seq_pad=seq_pad,
+            )
+            hooks.emit_step(idx, total, img_path.name, "pack", f"Chuyển {img_path.name} -> {out_name} (WebP 100%)")
+            dest = out_dir / out_name
+            with Image.open(img_path) as im:
+                save_image(im, dest)
+            written.append(dest)
+        return out_dir, written

@@ -21,14 +21,14 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, OptionList, ProgressBar, RichLog, Static
 from textual.widgets.option_list import Option
 
 from koharu_vn_cli import __version__
 from koharu_vn_cli.config import CONFIG_FILE, AppConfig, load_config, parse_api_keys, save_config
-from koharu_vn_cli.models import ComposePreset, PageDocument, StoryBible
+from koharu_vn_cli.models import CharacterProfile, ComposePreset, PageDocument, StoryBible
 from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
 from koharu_vn_cli.pipeline.runner import (
@@ -36,6 +36,7 @@ from koharu_vn_cli.pipeline.runner import (
     ModelCache,
     PipelineCancelledError,
     PipelineHooks,
+    pack_images_to_webp,
     run_compose_pipeline,
     run_rerender_pipeline,
     run_translate_pipeline,
@@ -53,6 +54,9 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/translate", "<đường_dẫn>", "Dịch truyện tranh (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
     SlashSpec("/compose", "<đường_dẫn>", "Tự sáng tác thoại cho Artist CG không lời"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
+    SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
+    SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
+    SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật game sau Pass 1"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
     SlashSpec("/lang", "", "Chọn ngôn ngữ nguồn ưu tiên (auto / ja / ko / zh / en)"),
     SlashSpec("/font", "", "Chọn font Tiếng Việt mặc định"),
@@ -531,6 +535,67 @@ class TagEditModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class StoryBibleReviewModal(ModalScreen[StoryBible | None]):
+    """Interactive modal after Pass 1 so the user can fix detected game & character names/pronouns."""
+
+    BINDINGS = [Binding("escape", "cancel", "Giữ nguyên")]
+
+    def __init__(self, bible: StoryBible) -> None:
+        super().__init__()
+        self.bible = bible
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal-card"):
+            yield Label("Kiểm tra Game & Nhân vật (Pass 1)", id="modal-title")
+            yield Static(
+                "Model chính đã nhận diện bên dưới. Nếu chưa chuẩn, bạn có thể sửa lại trước khi dịch/sáng tác:",
+                id="modal-subtitle",
+            )
+            yield Label("Game / Series gốc:", classes="field-label")
+            yield Input(value=self.bible.source_game, placeholder="vd: Honkai: Star Rail / Blue Archive...", id="rev-game-input")
+            with VerticalScroll(id="review-scroll"):
+                for idx, ch in enumerate(self.bible.characters):
+                    yield Label(
+                        f"Nhân vật #{idx + 1} ({ch.appearance or 'chưa rõ ngoại hình'}):",
+                        classes="field-label",
+                    )
+                    with Horizontal(classes="char-row"):
+                        yield Input(value=ch.name, placeholder="Tên nhân vật", id=f"rev-name-{idx}")
+                        yield Input(value=ch.pronoun_rules, placeholder="Xưng hô (vd: anh - em)", id=f"rev-pron-{idx}")
+                # Extra blank row so user can add a missed character
+                add_idx = len(self.bible.characters)
+                yield Label("Thêm nhân vật mới (nếu model nhận thiếu):", classes="field-label")
+                with Horizontal(classes="char-row"):
+                    yield Input(value="", placeholder="Tên nhân vật thêm (bỏ trống nếu không)", id=f"rev-name-{add_idx}")
+                    yield Input(value="", placeholder="Xưng hô (vd: tôi - cô ấy)", id=f"rev-pron-{add_idx}")
+            with Horizontal(id="modal-actions"):
+                yield Button("Giữ nguyên AI", id="skip-review-btn")
+                yield Button("Xác nhận & Tiếp tục", variant="primary", id="save-review-btn")
+
+    @on(Button.Pressed, "#save-review-btn")
+    def _save(self) -> None:
+        new_game = self.query_one("#rev-game-input", Input).value.strip()
+        updated_chars: list[CharacterProfile] = []
+        for idx, ch in enumerate(self.bible.characters):
+            name = self.query_one(f"#rev-name-{idx}", Input).value.strip()
+            pron = self.query_one(f"#rev-pron-{idx}", Input).value.strip()
+            if name:
+                updated_chars.append(ch.model_copy(update={"name": name, "pronoun_rules": pron}))
+        add_idx = len(self.bible.characters)
+        extra_name = self.query_one(f"#rev-name-{add_idx}", Input).value.strip()
+        extra_pron = self.query_one(f"#rev-pron-{add_idx}", Input).value.strip()
+        if extra_name:
+            updated_chars.append(CharacterProfile(name=extra_name, pronoun_rules=extra_pron))
+        self.dismiss(self.bible.model_copy(update={"source_game": new_game, "characters": updated_chars}))
+
+    @on(Button.Pressed, "#skip-review-btn")
+    def _skip(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class KoharuCommandProvider(Provider):
     """Textual Command Palette (`Ctrl+P`) entries matching OpenCode shortcuts."""
 
@@ -709,6 +774,21 @@ class KoharuTUI(App[None]):
 
     #modal-actions Button {
         margin-left: 1;
+    }
+
+    #review-scroll {
+        max-height: 18;
+        margin: 1 0;
+    }
+
+    .char-row {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    .char-row Input {
+        width: 1fr;
+        margin-right: 1;
     }
     """
 
@@ -904,6 +984,8 @@ class KoharuTUI(App[None]):
         lines: list[str] = []
         if bible.title or bible.genre_and_tone:
             lines.append(f"[bold cyan]{bible.title or 'Story Bible'}[/bold cyan] [dim]({bible.genre_and_tone})[/dim]")
+        if bible.source_game:
+            lines.append(f"[bold magenta]Game / Series gốc:[/bold magenta] [bold white]{bible.source_game}[/bold white]")
         if bible.pre_event_backstory:
             lines.append(f"[bold yellow]Trước sự kiện ảnh:[/bold yellow] [white]{bible.pre_event_backstory}[/white]")
         if bible.during_event_plot:
@@ -1296,6 +1378,57 @@ class KoharuTUI(App[None]):
                 self._launch_rerender(Path(target))
             else:
                 self._log_ai("Chưa có thư mục output nào. Hãy truyền đường dẫn: `/rerender <thư_mục_output>`", style="yellow")
+        elif cmd == "/rename":
+            in_place = "--in-place" in rest
+            cleaned = rest.replace("--in-place", "").strip()
+            p_str, _ = split_cmd_and_hint(cleaned)
+            target = p_str or self.cfg.last_output_dir
+            if target:
+                self._launch_rename(Path(target), in_place=in_place)
+            else:
+                self._log_ai("Hãy truyền thư mục cần đổi tên & chuyển WebP: `/rename <thư_mục> [--in-place]`", style="yellow")
+        elif cmd == "/format":
+            val = rest.strip().lower()
+            if val in {"webp", "original", "png", "jpg"}:
+                self.cfg.output_format = val
+                save_config(self.cfg)
+                self._log_ai(f"Đã đặt định dạng xuất mặc định: [bold cyan]{val}[/bold cyan] (WebP = max quality 100).")
+            elif val in {"seq-on", "seq", "on"}:
+                self.cfg.sequential_names = True
+                save_config(self.cfg)
+                self._log_ai("Đã BẬT tự động đánh số thứ tự đọc (`001.webp`, `002.webp`...).")
+            elif val in {"seq-off", "off"}:
+                self.cfg.sequential_names = False
+                save_config(self.cfg)
+                self._log_ai("Đã TẮT đánh số tuần tự (giữ tên file gốc).")
+            else:
+                self._open_picker(
+                    "Định dạng & đặt tên ảnh xuất",
+                    f"Hiện tại: format={self.cfg.output_format}, đánh số 001..={'BẬT' if self.cfg.sequential_names else 'TẮT'}",
+                    [
+                        ("webp_seq", "WebP Max Quality (100) + Đánh số 001.webp, 002.webp... (Recommended)"),
+                        ("webp_orig", "WebP Max Quality (100) + Giữ tên gốc"),
+                        ("original_seq", "Giữ định dạng gốc + Đánh số 001, 002..."),
+                        ("original_orig", "Giữ định dạng & tên gốc"),
+                    ],
+                    f"{self.cfg.output_format}_{'seq' if self.cfg.sequential_names else 'orig'}",
+                    self._set_format_combo,
+                )
+        elif cmd == "/chars":
+            val = rest.strip().lower()
+            if val in {"on", "1", "true"}:
+                self.cfg.review_characters = True
+                save_config(self.cfg)
+                self._log_ai("Đã BẬT kiểm tra & sửa tên nhân vật game sau Pass 1.")
+            elif val in {"off", "0", "false"}:
+                self.cfg.review_characters = False
+                save_config(self.cfg)
+                self._log_ai("Đã TẮT hộp thoại kiểm tra nhân vật sau Pass 1.")
+            else:
+                self.cfg.review_characters = not self.cfg.review_characters
+                save_config(self.cfg)
+                state = "BẬT" if self.cfg.review_characters else "TẮT"
+                self._log_ai(f"Kiểm tra & sửa tên nhân vật game sau Pass 1: [bold cyan]{state}[/bold cyan].")
         else:
             self._log_ai(f"Không rõ lệnh `[bold]{cmd}[/bold]`. Gõ `/help` hoặc `/` để xem các lệnh hỗ trợ.", style="yellow")
 
@@ -1552,6 +1685,28 @@ class KoharuTUI(App[None]):
         pb.update(progress=pct)
         self._refresh_chrome()
 
+    def _set_format_combo(self, val: str) -> None:
+        fmt, seq = val.split("_", 1)
+        self.cfg.output_format = fmt
+        self.cfg.sequential_names = (seq == "seq")
+        save_config(self.cfg)
+        self._log_ai(
+            f"Đã cập nhật xuất ảnh: [bold cyan]{fmt}[/bold cyan] · "
+            f"Đánh số 001..={'[green]BẬT[/green]' if self.cfg.sequential_names else '[dim]TẮT[/dim]'}"
+        )
+
+    def _open_story_review_modal(
+        self,
+        bible: StoryBible,
+        done_evt: threading.Event,
+        result_holder: list[StoryBible | None],
+    ) -> None:
+        def _on_done(edited: StoryBible | None) -> None:
+            result_holder.append(edited)
+            done_evt.set()
+
+        self.push_screen(StoryBibleReviewModal(bible), _on_done)
+
     def _build_hooks(self) -> PipelineHooks:
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
             pct = (idx / max(1, total)) * 100.0 if idx > 0 else 5.0
@@ -1565,10 +1720,23 @@ class KoharuTUI(App[None]):
         def on_story_bible(bible: StoryBible) -> None:
             self.call_from_thread(self._log_story_bible, bible)
 
+        def on_confirm_story_bible(bible: StoryBible) -> StoryBible | None:
+            if not self.cfg.review_characters:
+                return None
+            done_evt = threading.Event()
+            result_holder: list[StoryBible | None] = []
+            self.call_from_thread(self._set_job_ui, True, "Đang chờ bạn xác nhận nhân vật game...", 15.0)
+            self.call_from_thread(self._open_story_review_modal, bible, done_evt, result_holder)
+            while not done_evt.wait(timeout=0.25):
+                if self.cancel_event.is_set():
+                    return None
+            return result_holder[0] if result_holder else None
+
         return PipelineHooks(
             on_step=on_step,
             on_page_done=on_page_done,
             on_story_bible=on_story_bible,
+            on_confirm_story_bible=on_confirm_story_bible,
             is_cancelled=self.cancel_event.is_set,
         )
 
@@ -1616,6 +1784,8 @@ class KoharuTUI(App[None]):
                 conf=self.cfg.conf_thresh,
                 accurate_detector=self.cfg.accurate_detector,
                 save_cbz=self.cfg.save_cbz,
+                output_format=self.cfg.output_format,
+                sequential_names=self.cfg.sequential_names,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
             )
@@ -1659,6 +1829,8 @@ class KoharuTUI(App[None]):
                 story_model=self.cfg.story_model or None,
                 font=self.cfg.font,
                 save_cbz=self.cfg.save_cbz,
+                output_format=self.cfg.output_format,
+                sequential_names=self.cfg.sequential_names,
                 hooks=self._build_hooks(),
             )
             self.cfg.last_output_dir = str(out_dir)
@@ -1677,6 +1849,36 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(self._log_ai, f"Lỗi khi sáng tác CG: [red]{exc}[/red]", "red")
 
+    def _launch_rename(self, input_path: Path, in_place: bool = False) -> None:
+        if self.is_running_job:
+            self._log_ai("Đang có tác vụ khác chạy. Hãy chờ xong hoặc nhấn ESC để hủy.", style="yellow")
+            return
+        if not input_path.exists():
+            self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            return
+        self._start_rename(input_path, in_place=in_place)
+
+    @work(thread=True)
+    def _start_rename(self, input_path: Path, in_place: bool = False) -> None:
+        self.cancel_event.clear()
+        self.call_from_thread(self._set_job_ui, True, f"Đổi tên & nén WebP 100%: {input_path.name}", 10.0)
+        try:
+            out_dir, files = pack_images_to_webp(
+                input_path,
+                in_place=in_place,
+                hooks=self._build_hooks(),
+            )
+            self.cfg.last_output_dir = str(out_dir)
+            save_config(self.cfg)
+            self.call_from_thread(self._set_job_ui, False, f"[green]Xong {len(files)} ảnh WebP![/green]", 100.0)
+            self.call_from_thread(
+                self._log_ai,
+                f"[bold green]Đã đổi tên 001..{len(files):03d}.webp (max quality 100)![/bold green] Lưu tại: [cyan]{out_dir}[/cyan]",
+            )
+        except Exception as exc:
+            self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
+            self.call_from_thread(self._log_ai, f"Lỗi khi đổi tên & chuyển WebP: [red]{exc}[/red]", "red")
+
     @work(thread=True)
     def _start_rerender(self, output_dir: Path) -> None:
         self.cancel_event.clear()
@@ -1685,6 +1887,8 @@ class KoharuTUI(App[None]):
             docs = run_rerender_pipeline(
                 output_dir,
                 font=self.cfg.font,
+                output_format="original",
+                sequential_names=False,
                 hooks=self._build_hooks(),
             )
             self.call_from_thread(self._set_job_ui, False, f"[green]Rerender {len(docs)} trang![/green]", 100.0)

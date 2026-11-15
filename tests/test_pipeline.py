@@ -855,3 +855,97 @@ def test_translucent_bubble_never_chops_top_glyphs_in_erasure_mask():
     )
     mask = build_erasure_mask(rgb, text_mask, [reg])
     assert int(np.count_nonzero(mask[20:55, 65:95])) > 500
+
+
+def test_compose_oval_enlarged_to_readable_size_on_cg():
+    from koharu_vn_cli.models import BubbleStyle, TextRegionItem
+    from koharu_vn_cli.pipeline.runner import expand_composed_boxes_if_tight
+    from koharu_vn_cli.pipeline.typesetter import solve_layout
+
+    tiny_oval = TextRegionItem(
+        id=1,
+        kind="bubble",
+        bubble_style=BubbleStyle.WHITE_OVAL,
+        text_bbox=(240, 560, 305, 625),  # 65x65px tiny box on 1280x885 CG
+        bubble_bbox=(240, 560, 305, 625),
+        translated_text="THA CHO EM ĐI MÀ...",
+        draw_bubble=True,
+    )
+    enlarged = expand_composed_boxes_if_tight([tiny_oval], 1280, 885)
+    box = enlarged[0].bubble_bbox
+    assert box is not None
+    assert (box[2] - box[0]) >= 150
+    assert (box[3] - box[1]) >= 105
+    layout = solve_layout(enlarged[0])
+    assert layout.font_size >= 18
+    assert not layout.overflowed
+
+
+def test_pack_images_to_webp_sequential_in_place_and_copy(tmp_path: Path):
+    from koharu_vn_cli.pipeline.runner import pack_images_to_webp
+
+    in_dir = tmp_path / "messy_cg"
+    in_dir.mkdir()
+    Image.new("RGB", (64, 64), (200, 10, 10)).save(in_dir / "file_1745069383855_10_webp", format="WEBP")
+    Image.new("RGB", (64, 64), (10, 200, 10)).save(in_dir / "file_1745069383855_2_webp", format="WEBP")
+    Image.new("RGB", (64, 64), (10, 10, 200)).save(in_dir / "file_1745069383855_3_webp", format="WEBP")
+
+    out_dir, files = pack_images_to_webp(in_dir)
+    assert [f.name for f in files] == ["001.webp", "002.webp", "003.webp"]
+    # Verify reading order preserved: 2 (green) -> 3 (blue) -> 10 (red)
+    with Image.open(out_dir / "001.webp") as im1:
+        assert im1.format == "WEBP"
+        assert im1.getpixel((32, 32))[1] > 150
+    with Image.open(out_dir / "002.webp") as im2:
+        assert im2.getpixel((32, 32))[2] > 150
+    with Image.open(out_dir / "003.webp") as im3:
+        assert im3.getpixel((32, 32))[0] > 150
+
+    # Test safe in-place conversion
+    _, in_place_files = pack_images_to_webp(in_dir, in_place=True)
+    assert sorted(p.name for p in in_dir.iterdir()) == ["001.webp", "002.webp", "003.webp"]
+    assert len(in_place_files) == 3
+
+
+def test_story_bible_confirm_hook_allows_character_edits(tmp_path: Path):
+    from koharu_vn_cli.models import CharacterProfile, StoryBible
+    from koharu_vn_cli.pipeline.runner import PipelineHooks, _load_or_build_story_bible
+
+    class FakeLLM:
+        model = "gemini-3.1-pro-preview"
+
+        def build_story_bible(self, *args, **kwargs) -> StoryBible:
+            return StoryBible(
+                title="Cảnh CG",
+                source_game="Honkai: Star Rail",
+                characters=[CharacterProfile(name="Cô gái tóc xanh", pronoun_rules="anh - em")],
+            )
+
+    cache_dir = tmp_path / ".koharu_cache"
+    cache_dir.mkdir()
+
+    def confirm(b: StoryBible) -> StoryBible:
+        return b.model_copy(
+            update={
+                "characters": [CharacterProfile(name="Robin", pronoun_rules="anh - em")]
+            }
+        )
+
+    bible = _load_or_build_story_bible(
+        FakeLLM(),  # type: ignore[arg-type]
+        [],
+        cache_dir,
+        "cg_test",
+        mode="compose",
+        user_story=None,
+        prompt=None,
+        enable_story_pass=True,
+        resume=False,
+        hooks=PipelineHooks(on_confirm_story_bible=confirm),
+    )
+    assert bible is not None
+    assert bible.source_game == "Honkai: Star Rail"
+    assert bible.characters[0].name == "Robin"
+    assert "Honkai: Star Rail" in bible.to_prompt_block()
+    saved = StoryBible.model_validate_json((cache_dir / "story_bible.json").read_text(encoding="utf-8"))
+    assert saved.characters[0].name == "Robin"

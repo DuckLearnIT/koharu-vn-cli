@@ -63,6 +63,7 @@ class StoryBible(BaseModel):
     """Global story context built automatically from full image(s) before page-by-page generation."""
 
     title: str = ""
+    source_game: str = ""
     genre_and_tone: str = ""
     pre_event_backstory: str = ""
     during_event_plot: str = ""
@@ -74,6 +75,8 @@ class StoryBible(BaseModel):
         lines: list[str] = []
         if self.title or self.genre_and_tone:
             lines.append(f"Tác phẩm / Thể loại: {self.title} ({self.genre_and_tone})".strip())
+        if self.source_game:
+            lines.append(f"Game / Series gốc: {self.source_game}")
         if self.pre_event_backstory:
             lines.append(f"Cốt truyện TRƯỚC sự kiện ảnh: {self.pre_event_backstory}")
         if self.during_event_plot:

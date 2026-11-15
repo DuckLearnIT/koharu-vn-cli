@@ -12,12 +12,13 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from rich.table import Table
 
 from koharu_vn_cli.config import load_config
-from koharu_vn_cli.models import ComposePreset
+from koharu_vn_cli.models import CharacterProfile, ComposePreset, StoryBible
 from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import DEFAULT_GEMINI_MODEL, VisionLLMClient
 from koharu_vn_cli.pipeline.runner import (
     ModelCache,
     PipelineHooks,
+    pack_images_to_webp,
     run_compose_pipeline,
     run_rerender_pipeline,
     run_translate_pipeline,
@@ -59,6 +60,26 @@ def _resolve_auth(api_key: str | None, base_url: str | None, model: str | None) 
     return eff_key, eff_keys, eff_url, eff_model
 
 
+def _cli_confirm_story_bible(bible: StoryBible, progress: Progress) -> StoryBible:
+    """Allow terminal user to inspect & fix detected game/character names before Pass 2."""
+    progress.stop()
+    try:
+        console.print("\n[bold magenta]=== Kiểm tra Game & Nhân vật (Pass 1) ===[/bold magenta]")
+        console.print(f"Game / Series: [cyan]{bible.source_game or '(chưa rõ)'}[/cyan]")
+        new_game = typer.prompt("Sửa tên Game / Series (Enter để giữ nguyên)", default=bible.source_game)
+        updated_chars: list[CharacterProfile] = []
+        for idx, ch in enumerate(bible.characters, start=1):
+            console.print(f"  [{idx}] [bold]{ch.name}[/bold] ({ch.appearance}) -> [green]{ch.pronoun_rules}[/green]")
+            new_name = typer.prompt(f"    Tên nhân vật #{idx}", default=ch.name)
+            new_pron = typer.prompt(f"    Xưng hô #{idx}", default=ch.pronoun_rules)
+            updated_chars.append(
+                ch.model_copy(update={"name": new_name.strip() or ch.name, "pronoun_rules": new_pron.strip()})
+            )
+        return bible.model_copy(update={"source_game": new_game.strip(), "characters": updated_chars})
+    finally:
+        progress.start()
+
+
 @app.command()
 def translate(
     input_path: Path = typer.Argument(..., help="Ảnh, thư mục truyện, hoặc file .zip/.cbz cần dịch."),
@@ -76,10 +97,16 @@ def translate(
     conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại (0.2 - 0.8)."),
     accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Dùng model detector FP32 (168MB, chuẩn cao) hoặc --fast-detector INT8 (43MB)."),
     save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz sau khi dịch xong."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
+    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
+    review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi dịch."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
 ) -> None:
     """Dịch truyện tranh (Nhật, Hàn, Trung, Anh -> Tiếng Việt) sửa triệt để lỗi cỡ chữ, viền & đè chữ."""
+    cfg = load_config()
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
+    eff_format = output_format or cfg.output_format
+    eff_seq = cfg.sequential_names if seq_names is None else seq_names
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -96,8 +123,9 @@ def translate(
             progress.update(task, completed=idx)
 
         def on_story_bible(bible) -> None:
+            game_tag = f" [{bible.source_game}]" if getattr(bible, "source_game", "") else ""
             progress.console.print(
-                f"[cyan]✓ Pass 1 Story Bible:[/cyan] {bible.title or 'Đã phân tích'} "
+                f"[cyan]✓ Pass 1 Story Bible{game_tag}:[/cyan] {bible.title or 'Đã phân tích'} "
                 f"({len(bible.characters)} nhân vật) — [dim]{bible.full_plot_summary[:140]}[/dim]"
             )
 
@@ -110,17 +138,24 @@ def translate(
                 api_keys=eff_keys,
                 base_url=eff_url,
                 model=eff_model,
-                story_model=story_model or load_config().story_model or None,
+                story_model=story_model or cfg.story_model or None,
                 prompt=prompt,
                 story=story,
-                tags=tags if tags is not None else (load_config().tags or None),
+                tags=tags if tags is not None else (cfg.tags or None),
                 story_pass=story_pass,
                 font=font,
                 conf=conf,
                 accurate_detector=accurate_detector,
                 save_cbz=save_cbz,
+                output_format=eff_format,
+                sequential_names=eff_seq,
                 resume=resume,
-                hooks=PipelineHooks(on_step=on_step, on_page_done=on_page_done, on_story_bible=on_story_bible),
+                hooks=PipelineHooks(
+                    on_step=on_step,
+                    on_page_done=on_page_done,
+                    on_story_bible=on_story_bible,
+                    on_confirm_story_bible=(lambda b: _cli_confirm_story_bible(b, progress)) if review_chars else None,
+                ),
             )
         except FileNotFoundError as exc:
             console.print(f"[red]{exc}[/red]")
@@ -153,10 +188,16 @@ def compose(
     story_model: Optional[str] = typer.Option(None, "--story-model", help="Model CHÍNH (mạnh) cho Pass 1 phân tích full cốt truyện, nhân vật & tình huống."),
     font: Optional[str] = typer.Option(None, "--font", help="Ghi đè font chữ Việt cho tất cả câu thoại."),
     save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
+    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
+    review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi sáng tác."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua ảnh đã sáng tác sẵn trong thư mục đích."),
 ) -> None:
     """Tự sáng tác lời thoại Tiếng Việt cho ảnh Artist CG không lời (hỗ trợ cả Bubble Text & Chữ thường)."""
+    cfg = load_config()
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
+    eff_format = output_format or cfg.output_format
+    eff_seq = cfg.sequential_names if seq_names is None else seq_names
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -173,8 +214,9 @@ def compose(
             progress.update(task, completed=idx)
 
         def on_story_bible(bible) -> None:
+            game_tag = f" [{bible.source_game}]" if getattr(bible, "source_game", "") else ""
             progress.console.print(
-                f"[cyan]✓ Pass 1 CG Story Bible:[/cyan] {bible.title or 'Đã phân tích'} "
+                f"[cyan]✓ Pass 1 CG Story Bible{game_tag}:[/cyan] {bible.title or 'Đã phân tích'} "
                 f"({len(bible.characters)} nhân vật) — [dim]{bible.full_plot_summary[:140]}[/dim]"
             )
 
@@ -186,17 +228,24 @@ def compose(
                 density=density,
                 prompt=prompt,
                 story=story,
-                tags=tags if tags is not None else (load_config().tags or None),
+                tags=tags if tags is not None else (cfg.tags or None),
                 story_pass=story_pass,
                 api_key=eff_key,
                 api_keys=eff_keys,
                 base_url=eff_url,
                 model=eff_model,
-                story_model=story_model or load_config().story_model or None,
+                story_model=story_model or cfg.story_model or None,
                 font=font,
                 save_cbz=save_cbz,
+                output_format=eff_format,
+                sequential_names=eff_seq,
                 resume=resume,
-                hooks=PipelineHooks(on_step=on_step, on_page_done=on_page_done, on_story_bible=on_story_bible),
+                hooks=PipelineHooks(
+                    on_step=on_step,
+                    on_page_done=on_page_done,
+                    on_story_bible=on_story_bible,
+                    on_confirm_story_bible=(lambda b: _cli_confirm_story_bible(b, progress)) if review_chars else None,
+                ),
             )
         except (FileNotFoundError, ValueError) as exc:
             console.print(f"[red]{exc}[/red]")
@@ -210,15 +259,40 @@ def rerender(
     output_dir: Path = typer.Argument(..., help="Thư mục output chứa .koharu_cache/*.koharu.json."),
     font: Optional[str] = typer.Option(None, "--font", help="Đổi font cho toàn bộ các trang."),
     font_scale: float = typer.Option(1.0, "--font-scale", help="Tỉ lệ phóng/thu cỡ chữ (vd: 1.15)."),
+    output_format: str = typer.Option("original", "--format", help="Định dạng ảnh xuất: original | webp | png | jpg."),
+    seq_names: bool = typer.Option(False, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
 ) -> None:
     """Render lại nhanh toàn bộ ảnh từ file .koharu.json mà không tốn API hay chạy lại ML."""
     try:
-        docs = run_rerender_pipeline(output_dir, font=font, font_scale=font_scale)
+        docs = run_rerender_pipeline(
+            output_dir,
+            font=font,
+            font_scale=font_scale,
+            output_format=output_format,
+            sequential_names=seq_names,
+        )
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
     console.print(f"[bold green]Đã render lại {len(docs)} trang tại {output_dir}![/bold green]")
+
+
+@app.command()
+def rename(
+    input_path: Path = typer.Argument(..., help="Thư mục ảnh hoặc .zip/.cbz có tên lộn xộn nhưng đúng thứ tự đọc."),
+    output: Optional[Path] = typer.Option(None, "-o", "--output", help="Thư mục lưu ảnh WebP mới (mặc định <tên>_webp)."),
+    in_place: bool = typer.Option(False, "--in-place", help="Đổi tên & chuyển WebP trực tiếp ngay trong thư mục gốc."),
+) -> None:
+    """Đổi tên ảnh theo số thứ tự đọc (001.webp, 002.webp...) và chuyển sang WebP max quality (100)."""
+    try:
+        out_dir, files = pack_images_to_webp(input_path, output=output, in_place=in_place)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[bold green]Đã chuyển {len(files)} ảnh sang WebP (quality=100) & đánh số 001..{len(files):03d}![/bold green] Lưu tại: {out_dir}"
+    )
 
 
 @app.command()

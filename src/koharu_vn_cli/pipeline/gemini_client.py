@@ -590,9 +590,10 @@ class VisionLLMClient:
         system_prompt = (
             "Bạn là tổng biên kịch & tổng biên tập manga/Artist CG Tiếng Việt.\n"
             f"{task_desc}\n"
-            "Phải khai thác tối đa chi tiết thị giác trong full ảnh (ánh mắt, cử chỉ, trang phục, đạo cụ, bối cảnh) "
-            "để tự suy luận toàn bộ ngữ cảnh mà không cần người dùng giải thích.\n"
-            "Ưu tiên cặp xưng hô tự nhiên theo đúng quan hệ đời thực (anh/em, cậu/tớ, tao/mày, thầy/em, cô/cháu, ta/ngươi chỉ dùng cho cổ trang/fantasy).\n"
+            "Phải khai thác tối đa chi tiết thị giác trong full ảnh (màu tóc, mắt, halo/cánh/sừng, trang phục, vũ khí, đạo cụ, bối cảnh) "
+            "để NHẬN DIỆN CHÍNH XÁC TÊN GAME / SERIES (vd: Honkai: Star Rail, Blue Archive, Genshin Impact, Zenless Zone Zero, Arknights, Nikke, Azur Lane, Fate, Wuthering Waves...) "
+            "và TÊN NHÂN VẬT GỐC TRONG GAME đó (nếu là nhân vật game/anime hãy ghi đúng tên chuẩn của nhân vật; nếu không chắc hoặc là OC hãy ghi rõ 'Chưa rõ / OC').\n"
+            "Ưu tiên cặp xưng hô tự nhiên theo đúng quan hệ đời thực & lore nhân vật (anh/em, cậu/tớ, tao/mày, thầy/em, cô/cháu, ta/ngươi chỉ dùng cho cổ trang/fantasy).\n"
             "Trả về đúng JSON hợp lệ."
         )
         user_prompt = (
@@ -600,12 +601,13 @@ class VisionLLMClient:
             "Hãy trả về JSON Story Bible đúng cấu trúc:\n"
             "{\n"
             '  "title": "Tên gợi ý hoặc chủ đề chính của cảnh/chương",\n'
+            '  "source_game": "Tên Game / Anime / Series gốc nhận diện được (hoặc \'Original / Chưa rõ\')",\n'
             '  "genre_and_tone": "Thể loại & không khí (vd: lãng mạn trêu chọc, kịch tính, học đường...)",\n'
             '  "pre_event_backstory": "Cốt truyện xảy ra TRƯỚC sự kiện trong ảnh (2-3 câu: chuyện gì đã dẫn nhân vật tới tình huống này)",\n'
             '  "during_event_plot": "Diễn biến xảy ra TRONG khi sự kiện ảnh diễn ra (2-4 câu: hành động, cảm xúc, đối đáp để làm nền cho lời thoại)",\n'
             '  "full_plot_summary": "Tóm tắt mạch truyện hoàn chỉnh từ trước -> trong -> hướng diễn biến (3-5 câu)",\n'
             '  "characters": [\n'
-            '    {"name": "Tên hoặc danh xưng tự đặt", "appearance": "ngoại hình nhận diện...", "role_and_tone": "vai trò, tính cách", "pronoun_rules": "cặp xưng hô Tiếng Việt bắt buộc (vd: anh - em / chị - em)"}\n'
+            '    {"name": "Tên chuẩn nhân vật trong game (hoặc danh xưng nếu OC)", "appearance": "đặc điểm nhận diện (tóc, mắt, halo/tai/trang phục...)", "role_and_tone": "vai trò, tính cách", "pronoun_rules": "cặp xưng hô Tiếng Việt bắt buộc (vd: anh - em / chị - em)"}\n'
             "  ],\n"
             '  "page_beats": {"1": "Tình huống cụ thể ảnh 1", "2": "Tình huống ảnh 2"}\n'
             "}"
@@ -631,6 +633,7 @@ class VisionLLMClient:
         beats = {str(k): str(v).strip() for k, v in raw_beats.items() if str(v).strip()}
         return StoryBible(
             title=str(data.get("title", "")).strip(),
+            source_game=str(data.get("source_game", "")).strip(),
             genre_and_tone=str(data.get("genre_and_tone", "")).strip(),
             pre_event_backstory=str(data.get("pre_event_backstory", "")).strip(),
             during_event_plot=str(data.get("during_event_plot", "")).strip(),
@@ -802,7 +805,8 @@ class VisionLLMClient:
             "- Hệ tọa độ chuẩn hóa [ymin, xmin, ymax, xmax] từ 0 đến 1000 (0=trên/trái, 1000=dưới/phải).\n"
             "- TUYỆT ĐỐI KHÔNG đặt hộp thoại che mất khuôn mặt, mắt, miệng hoặc chi tiết hành động chính của nhân vật.\n"
             "- Đặt các hộp thoại ở khoảng trống nền, vùng rìa, hoặc vùng ít chi tiết quanh nhân vật.\n"
-            "- Kích thước `box_2d` phải đủ rộng rãi để chứa vừa câu thoại (chiều rộng/cao hợp lý, không quá bé).\n"
+            "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG để dễ đọc trên điện thoại: "
+            "chiều rộng khoảng 120..250/1000 và chiều cao khoảng 120..250/1000 (tránh tạo bóng oval bé xíu dưới 100/1000).\n"
             "- Các hộp thoại tuyệt đối không được chồng chéo lên nhau.\n"
             "Bắt buộc trả về đúng JSON hợp lệ."
         )
@@ -891,6 +895,7 @@ class VisionLLMClient:
             "và trả về tọa độ đặt chữ riêng cho TỪNG TRANG.\n"
             "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
             "- Với mỗi trang, `box_2d: [ymin, xmin, ymax, xmax]` tính từ 0 đến 1000 TRONG PHẠM VI Ô ẢNH CỦA TRANG ĐÓ (không phải tọa độ cả sheet).\n"
+            "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG (rộng ~120..250/1000, cao ~120..250/1000) để chữ dễ đọc trên điện thoại.\n"
             "- TUYỆT ĐỐI KHÔNG che khuôn mặt, mắt, miệng hoặc hành động chính; các hộp không được chồng chéo.\n"
             "Bắt buộc trả về đúng JSON hợp lệ."
         )
