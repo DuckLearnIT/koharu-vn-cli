@@ -21,6 +21,8 @@ from koharu_vn_cli.pipeline.gemini_client import (
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
     VisionLLMClient,
+    normalize_source_key,
+    region_needs_translation,
 )
 from koharu_vn_cli.pipeline.inpaint import (
     HybridInpainter,
@@ -509,6 +511,25 @@ def run_translate_pipeline(
 
         docs: list[PageDocument] = []
         seq_pad = max(3, len(str(total)))
+        translation_memory: dict[str, str] = {}
+
+        def _remember_translations(items: list[TextRegionItem]) -> None:
+            for item in items:
+                if item.source_text and item.translated_text and not region_needs_translation(item):
+                    key = normalize_source_key(item.source_text)
+                    if key:
+                        translation_memory[key] = item.translated_text.strip()
+
+        def _apply_memory_to_untranslated(items: list[TextRegionItem], ocr_texts: dict[int, str] | None = None) -> list[TextRegionItem]:
+            fixed: list[TextRegionItem] = []
+            for item in items:
+                if region_needs_translation(item):
+                    src_key = normalize_source_key((ocr_texts or {}).get(item.id, "") or item.source_text)
+                    cached_vn = translation_memory.get(src_key, "")
+                    if cached_vn:
+                        item = item.model_copy(update={"translated_text": cached_vn})
+                fixed.append(item)
+            return fixed
 
         for sc in scenes:
             scene_summaries: list[str] = []
@@ -531,12 +552,15 @@ def run_translate_pipeline(
 
                 if resume and out_img_path.is_file() and json_path.is_file():
                     prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
-                    if prev_doc.page_summary:
-                        scene_summaries.append(prev_doc.page_summary)
-                    docs.append(prev_doc)
-                    hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
-                    hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
-                    continue
+                    if not any(region_needs_translation(r) for r in prev_doc.regions):
+                        _remember_translations(prev_doc.regions)
+                        if prev_doc.page_summary:
+                            scene_summaries.append(prev_doc.page_summary)
+                        docs.append(prev_doc)
+                        hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
+                        hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
+                        continue
+                    hooks.emit_step(idx, total, img_path.name, "retry", "Phát hiện vùng chưa dịch ở cache cũ -> dịch lại trang này...")
 
                 rgb = load_rgb(img_path)
                 h, w = rgb.shape[:2]
@@ -653,17 +677,26 @@ def run_translate_pipeline(
                                 f"⚠ Trang {idx}/{total} bị lọc ảnh -> tự động fallback OCR cục bộ + dịch text-only (0 ảnh)...",
                             )
                             ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
-                            translated_items, summary = llm.translate_page_from_ocr(
-                                regions=region_items,
-                                ocr_texts=ocr_texts,
-                                source_lang=lang,
-                                previous_summaries=scene_summaries,
-                                extra_instructions=prompt,
-                                story_bible=story_bible,
-                                page_index=idx,
-                                tags=tags,
-                            )
-                            fallback_done = True
+                            ocr_kw = {
+                                "regions": region_items,
+                                "ocr_texts": ocr_texts,
+                                "source_lang": lang,
+                                "previous_summaries": scene_summaries,
+                                "extra_instructions": prompt,
+                                "story_bible": story_bible,
+                                "page_index": idx,
+                                "tags": tags,
+                                "translation_memory": translation_memory,
+                            }
+                            try:
+                                translated_items, summary = llm.translate_page_from_ocr(**ocr_kw)
+                                fallback_done = True
+                            except ContentBlockedError as inner_exc:
+                                if story_llm is not llm:
+                                    translated_items, summary = story_llm.translate_page_from_ocr(**ocr_kw)
+                                    fallback_done = True
+                                else:
+                                    exc = inner_exc
                         except ContentBlockedError as ocr_exc:
                             exc = ocr_exc
                     if not fallback_done:
@@ -678,6 +711,45 @@ def run_translate_pipeline(
                             f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
                         )
                         continue
+                translated_items = _apply_memory_to_untranslated(translated_items)
+                if any(region_needs_translation(r) for r in translated_items):
+                    still_missing = [r for r in translated_items if region_needs_translation(r)]
+                    if hasattr(cache, "get_ocr"):
+                        try:
+                            if ocr_engine is None:
+                                ocr_engine = (
+                                    cache.get_ocr(use_gpu=use_gpu)
+                                    if isinstance(cache, ModelCache)
+                                    else cache.get_ocr()
+                                )
+                            missing_ocr = ocr_engine.recognize_regions(rgb, still_missing)
+                            for mr in still_missing:
+                                if missing_ocr.get(mr.id):
+                                    mr.source_text = missing_ocr[mr.id]
+                            still_missing = _apply_memory_to_untranslated(still_missing, missing_ocr)
+                            need_api = [r for r in still_missing if region_needs_translation(r)]
+                            if need_api:
+                                retried_items, retry_sum = llm.translate_page_from_ocr(
+                                    regions=need_api,
+                                    ocr_texts=missing_ocr,
+                                    source_lang=lang,
+                                    previous_summaries=scene_summaries,
+                                    extra_instructions=prompt,
+                                    story_bible=story_bible,
+                                    page_index=idx,
+                                    tags=tags,
+                                    translation_memory=translation_memory,
+                                )
+                                by_missing_id = {r.id: r for r in retried_items}
+                            else:
+                                by_missing_id = {r.id: r for r in still_missing}
+                                retry_sum = ""
+                            translated_items = [by_missing_id.get(r.id, r) for r in translated_items]
+                            if not summary and retry_sum:
+                                summary = retry_sum
+                        except Exception:
+                            pass
+                _remember_translations(translated_items)
                 if summary:
                     scene_summaries.append(summary)
                 translated_items = adapt_regions_for_readability(translated_items, w, h)
@@ -721,6 +793,7 @@ def run_translate_pipeline(
                             extra_instructions=prompt,
                             story_bible=story_bible,
                             tags=tags,
+                            translation_memory=translation_memory,
                             scene_id=sc.scene_id,
                         )
                     except ContentBlockedError as exc:
@@ -740,6 +813,8 @@ def run_translate_pipeline(
 
                     for idx, img_path, out_img_path, json_path, clean_path, w, h, _rgb, clean_rgb, reg_items, _ocrs in chunk:
                         translated_items, summary = batch_res.get(idx, (reg_items, ""))
+                        translated_items = _apply_memory_to_untranslated(translated_items, _ocrs)
+                        _remember_translations(translated_items)
                         if summary:
                             scene_summaries.append(summary)
                         translated_items = adapt_regions_for_readability(translated_items, w, h)

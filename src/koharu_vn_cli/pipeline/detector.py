@@ -78,10 +78,14 @@ def _create_ort_session(
     *,
     use_gpu: bool = True,
     cpu_threads: int | None = None,
+    low_mem: bool = False,
 ) -> ort.InferenceSession:
     """Create an ONNXRuntime session preferring GPU (CUDA/DirectML) with automatic CPU fallback."""
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
+    if low_mem:
+        opts.enable_cpu_mem_arena = False
+        opts.enable_mem_pattern = False
     if cpu_threads is not None:
         opts.intra_op_num_threads = max(1, cpu_threads)
     providers = _ort_providers(use_gpu=use_gpu)
@@ -89,7 +93,13 @@ def _create_ort_session(
         return ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
     except Exception:
         if providers != ["CPUExecutionProvider"]:
-            return ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
+            cpu_opts = ort.SessionOptions()
+            cpu_opts.log_severity_level = 3
+            cpu_opts.enable_cpu_mem_arena = False
+            cpu_opts.enable_mem_pattern = False
+            if cpu_threads is not None:
+                cpu_opts.intra_op_num_threads = max(1, cpu_threads)
+            return ort.InferenceSession(str(model_path), sess_options=cpu_opts, providers=["CPUExecutionProvider"])
         raise
 
 

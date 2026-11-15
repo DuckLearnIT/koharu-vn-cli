@@ -1444,3 +1444,164 @@ def test_vision_blocked_image_falls_back_to_local_ocr_translation(tmp_path: Path
     assert docs[0].regions[0].translated_text == "Dừng lại đi…"
     assert (out_dir / "p1.png").is_file()
     assert (out_dir / ".koharu_cache" / "p1.koharu.json").is_file()
+
+
+def test_ocr_translate_retries_untranslated_and_uses_translation_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from koharu_vn_cli.pipeline.gemini_client import (
+        VisionLLMClient,
+        normalize_source_key,
+        region_needs_translation,
+    )
+
+    client = VisionLLMClient(api_key="dummy", model="gemini-3.5-flash-lite")
+    responses = [
+        # First pass: alternate key + string ID on reg 1, kana echo on reg 2
+        {
+            "regions": [
+                {"id": "ID 1", "translation": "Sướng quá đi mất!"},
+                {"id": 2, "vietnamese": "あぁっ…！"},
+            ]
+        },
+        # Automatic retry asks only for reg 2 and gets Vietnamese
+        {"items": [{"id": 2, "vietnamese": "Á…!"}]},
+        # Third call: simulate LLM echoing Japanese on retryable pass, rescued by translation_memory
+        {"items": [{"id": 1, "vietnamese": "気持ちいい！"}]},
+        {"items": [{"id": 1, "vietnamese": "気持ちいい！"}]},
+    ]
+    prompts: list[str] = []
+
+    def fake_call_json(self, system_prompt, user_prompt, **kwargs):
+        prompts.append(user_prompt)
+        return responses.pop(0)
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_call_json)
+
+    regions = [
+        TextRegionItem(
+            id=1,
+            kind="bubble",
+            text_bbox=(0, 0, 50, 50),
+            source_text="気持ちいい！",
+            translated_text="",
+        ),
+        TextRegionItem(
+            id=2,
+            kind="floating",
+            text_bbox=(60, 0, 100, 40),
+            source_text="あぁっ…！",
+            translated_text="",
+        ),
+    ]
+    ocr_texts = {1: "気持ちいい！", 2: "あぁっ…！"}
+    mem: dict[str, str] = {}
+    out, _ = client.translate_page_from_ocr(regions, ocr_texts, translation_memory=mem)
+
+    assert len(prompts) == 2
+    assert out[0].translated_text == "Sướng quá đi mất!"
+    assert out[1].translated_text == "Á…!"
+    assert all(not region_needs_translation(r) for r in out)
+
+    for r in out:
+        mem[normalize_source_key(r.source_text)] = r.translated_text
+
+    # Even if LLM keeps echoing Japanese, translation_memory fills the existing Vietnamese translation
+    cached_regions = [
+        TextRegionItem(
+            id=1,
+            kind="bubble",
+            text_bbox=(0, 0, 50, 50),
+            source_text="気持ちいい！",
+            translated_text="",
+        )
+    ]
+    out_cached, _ = client.translate_page_from_ocr(
+        cached_regions, {1: "気持ちいい！"}, translation_memory=mem
+    )
+    assert out_cached[0].translated_text == "Sướng quá đi mất!"
+
+
+def test_pipeline_reuses_memory_and_resumes_untranslated_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError, VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    Image.new("RGB", (240, 320), (240, 240, 240)).save(in_dir / "p1.png")
+    Image.new("RGB", (240, 320), (240, 240, 240)).save(in_dir / "p2.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            return [DetectedRegion((30, 30, 180, 120), (20, 20, 190, 130), None, True, False, 0.9)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeOcr:
+        def recognize_regions(self, rgb, regions):
+            return {r.id: "やめて…" for r in regions}
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            return FakeOcr()
+
+    def blocked_vision(self, *args, **kwargs):
+        raise ContentBlockedError("PROHIBITED_CONTENT")
+
+    call_idx = 0
+
+    def fake_ocr_translate(self, regions, ocr_texts, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        out = []
+        for r in regions:
+            src = ocr_texts.get(r.id, r.source_text)
+            # First call succeeds; subsequent calls simulate small LLM leaving Japanese untranslated
+            vn = "Dừng lại đi…" if call_idx == 1 else "やめて…"
+            out.append(r.model_copy(update={"source_text": src, "translated_text": vn}))
+        return out, ""
+
+    monkeypatch.setattr(VisionLLMClient, "translate_page", blocked_vision)
+    monkeypatch.setattr(VisionLLMClient, "translate_page_from_ocr", fake_ocr_translate)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out",
+        api_key="dummy",
+        story_pass=False,
+        vision_translate=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    # p1 translates via OCR LLM, p2 gets untranslated echo from LLM but is rescued by p1's translation_memory
+    assert [d.regions[0].translated_text for d in docs] == ["Dừng lại đi…", "Dừng lại đi…"]
+
+    # Corrupt p1 cached JSON with untranslated kana to verify --resume re-translates it from memory/OCR
+    cache_p1 = out_dir / ".koharu_cache" / "p1.koharu.json"
+    bad_doc = docs[0].model_copy(deep=True)
+    bad_doc.regions[0].translated_text = "やめて…"
+    cache_p1.write_text(bad_doc.model_dump_json(), encoding="utf-8")
+
+    call_idx = 0
+    _, resumed_docs = run_translate_pipeline(
+        in_dir,
+        output=out_dir,
+        api_key="dummy",
+        story_pass=False,
+        vision_translate=True,
+        resume=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert [d.regions[0].translated_text for d in resumed_docs] == ["Dừng lại đi…", "Dừng lại đi…"]
+

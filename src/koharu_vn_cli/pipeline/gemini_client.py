@@ -417,6 +417,51 @@ def _format_tags_block(tags: str | None) -> str:
     )
 
 
+_CJK_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+_KANA_HANGUL_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af]")
+_VN_TEXT_KEYS = ("vietnamese", "vi", "viet", "translated", "translated_text", "translation", "text_vi", "text")
+_PLACEHOLDER_TEXTS = {"", "...", "…", "(trống)", "n/a", "none", "null", "—", "-"}
+
+
+def normalize_source_key(text: str) -> str:
+    """Normalize source dialogue for reliable translation-memory reuse across frames."""
+    return re.sub(r"[\s\u3000]+", "", (text or "")).strip()
+
+
+def region_needs_translation(reg: TextRegionItem) -> bool:
+    """Return True if a source CJK/Kana/Hangul region is still empty or untranslated."""
+    src = (reg.source_text or "").strip()
+    vn = (reg.translated_text or "").strip()
+    if not src:
+        return False
+    if not vn or vn.lower() in _PLACEHOLDER_TEXTS:
+        return True
+    if _CJK_KANA_RE.search(src):
+        if normalize_source_key(vn) == normalize_source_key(src):
+            return True
+        if _KANA_HANGUL_RE.search(vn):
+            return True
+    return False
+
+
+def _parse_int_id(val: Any) -> int | None:
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    m = re.search(r"\d+", str(val or ""))
+    return int(m.group(0)) if m else None
+
+
+def _extract_vn_from_item(item: dict[str, Any]) -> str:
+    for key in _VN_TEXT_KEYS:
+        val = item.get(key)
+        if val is None:
+            continue
+        txt = str(val).strip()
+        if txt and txt.lower() not in _PLACEHOLDER_TEXTS:
+            return txt
+    return ""
+
+
 class VisionLLMClient:
     """Unified Gemini API & OpenAI-compatible Vision client."""
 
@@ -988,23 +1033,26 @@ class VisionLLMClient:
         raw_items: list[Any],
         ocr_texts: dict[int, str] | None = None,
     ) -> list[TextRegionItem]:
+        dict_items = [it for it in (raw_items or []) if isinstance(it, dict)]
         by_id: dict[int, dict[str, Any]] = {}
-        for item in raw_items or []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                by_id[int(item["id"])] = item
-            except (KeyError, TypeError, ValueError):
-                continue
+        for item in dict_items:
+            parsed = _parse_int_id(item.get("id"))
+            if parsed is not None:
+                by_id[parsed] = item
 
+        positional_ok = len(dict_items) == len(regions)
         updated: list[TextRegionItem] = []
-        for reg in regions:
+        for idx, reg in enumerate(regions):
             copy = reg.model_copy()
             match = by_id.get(copy.id)
+            if match is None and positional_ok:
+                match = dict_items[idx]
             fallback_src = (ocr_texts or {}).get(copy.id, copy.source_text)
             if match:
                 copy.source_text = str(match.get("source_text", fallback_src)).strip() or fallback_src
-                copy.translated_text = str(match.get("vietnamese", "")).strip()
+                vn = _extract_vn_from_item(match)
+                if vn:
+                    copy.translated_text = vn
             elif fallback_src:
                 copy.source_text = fallback_src
             updated.append(copy)
@@ -1046,10 +1094,19 @@ class VisionLLMClient:
         story_bible: StoryBible | None = None,
         page_index: int | None = None,
         tags: str | None = None,
+        translation_memory: dict[str, str] | None = None,
+        *,
+        _allow_retry: bool = True,
     ) -> tuple[list[TextRegionItem], str]:
         """Text-only Pass 2 translation using local ONNX OCR output + Pass 1 StoryBible (sends zero images)."""
         if not regions:
             return regions, ""
+
+        working = [r.model_copy() for r in regions]
+        for copy in working:
+            raw_ocr = (ocr_texts.get(copy.id, "") or copy.source_text or "").strip()
+            if raw_ocr:
+                copy.source_text = raw_ocr
 
         lang_hint, ctx_block = self._build_ocr_context_blocks(
             source_lang=source_lang,
@@ -1060,8 +1117,8 @@ class VisionLLMClient:
             tags=tags,
         )
         lines = []
-        for r in regions:
-            raw_txt = ocr_texts.get(r.id, "").strip() or "(trống / tiếng thở ngắn)"
+        for r in working:
+            raw_txt = (ocr_texts.get(r.id, "") or r.source_text or "").strip() or "(trống / tiếng thở ngắn)"
             x1, y1, x2, y2 = r.text_bbox
             kind = "Dọc" if (y2 - y1) > (x2 - x1) * 1.25 else "Ngang"
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -1072,27 +1129,69 @@ class VisionLLMClient:
             "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu (Manga Nhật, Manhwa Hàn, Manhua Trung) chuyên bản địa hóa sang Tiếng Việt.\n"
             "Chế độ NO-VISION: Chữ gốc từng khung đã được OCR cục bộ trích sẵn bên dưới. "
             "Hãy tự sửa lỗi nhận dạng OCR nhỏ nếu hiển nhiên dựa vào Story Bible & tuyến cảnh hiện tại, "
-            "rồi dịch sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, đúng xưng hô đã khóa.\n"
+            "rồi dịch TẤT CẢ các ID sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, đúng xưng hô đã khóa.\n"
+            "CẤM để trống `vietnamese` hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
             + self._VI_LOCALIZATION_RULES
         )
         page_label = f" (Trang {page_index})" if page_index else ""
         user_prompt = (
             f"{lang_hint}{page_label}.{ctx_block}\n"
             f"Danh sách chữ OCR cục bộ theo khung thoại:\n{ocr_block}\n\n"
-            "Trả về JSON theo đúng cấu trúc:\n"
+            "Trả về JSON theo đúng cấu trúc (trường `vietnamese` BẮT BUỘC là Tiếng Việt):\n"
             "{\n"
             '  "detected_language": "ja | ko | zh | en | mixed",\n'
             '  "page_summary": "Tóm tắt 1-2 câu diễn biến & xưng hô của trang này bằng tiếng Việt",\n'
             '  "items": [\n'
-            '    {"id": 1, "source_text": "...", "vietnamese": "...", "is_sfx": false}\n'
+            '    {"id": 1, "source_text": "...", "vietnamese": "Lời thoại Tiếng Việt", "is_sfx": false}\n'
             "  ]\n"
             "}"
         )
         data = self._call_json(system_prompt, user_prompt, images=[], temperature=0.25)
-        return (
-            self._merge_translated_regions(regions, data.get("items", []), ocr_texts=ocr_texts),
-            str(data.get("page_summary", "")).strip(),
-        )
+        raw_items = data.get("items") or data.get("regions") or []
+        updated = self._merge_translated_regions(working, raw_items, ocr_texts=ocr_texts)
+        summary = str(data.get("page_summary", "")).strip()
+
+        # Guard against small models echoing Japanese or omitting an ID
+        missing = [r for r in updated if region_needs_translation(r)]
+        if _allow_retry and missing:
+            retry_note = (
+                (f"{extra_instructions}\n" if extra_instructions else "")
+                + "CHÚ Ý: Lần trước vẫn còn ID chưa dịch hoặc còn nguyên tiếng Nhật/Hàn/Trung. "
+                "Hãy dịch 100% các ID này sang Tiếng Việt, KHÔNG giữ nguyên tiếng gốc!"
+            )
+            retried, retry_sum = self.translate_page_from_ocr(
+                missing,
+                ocr_texts=ocr_texts,
+                source_lang=source_lang,
+                previous_summaries=previous_summaries,
+                extra_instructions=retry_note,
+                story_bible=story_bible,
+                page_index=page_index,
+                tags=tags,
+                translation_memory=translation_memory,
+                _allow_retry=False,
+            )
+            retry_map = {r.id: r for r in retried}
+            updated = [
+                retry_map[r.id]
+                if (r.id in retry_map and not region_needs_translation(retry_map[r.id]))
+                else r
+                for r in updated
+            ]
+            if not summary and retry_sum:
+                summary = retry_sum
+
+        # Last-resort fallback: if any region still lacks a valid Vietnamese translation after retry,
+        # reuse an existing verified translation from translation_memory rather than leaving Japanese!
+        if translation_memory:
+            for r in updated:
+                if region_needs_translation(r):
+                    key = normalize_source_key(ocr_texts.get(r.id, "") or r.source_text)
+                    cached_vn = translation_memory.get(key, "").strip()
+                    if cached_vn and not _KANA_HANGUL_RE.search(cached_vn):
+                        r.translated_text = cached_vn
+
+        return updated, summary
 
     def translate_scene_from_ocr(
         self,
@@ -1102,12 +1201,13 @@ class VisionLLMClient:
         extra_instructions: str | None = None,
         story_bible: StoryBible | None = None,
         tags: str | None = None,
+        translation_memory: dict[str, str] | None = None,
         *,
         scene_id: int | None = None,
     ) -> dict[int, tuple[list[TextRegionItem], str]]:
         """
         Batch text-only Pass 2 translation for all text pages in ONE clustered scene/oneshot.
-        Sends ZERO images and falls back per-page if any page is omitted in the JSON response.
+        Sends ZERO images and falls back per-page if any page or region remains untranslated.
         """
         if not scene_pages:
             return {}
@@ -1123,6 +1223,7 @@ class VisionLLMClient:
                     story_bible=story_bible,
                     page_index=pno,
                     tags=tags,
+                    translation_memory=translation_memory,
                 )
             }
 
@@ -1149,6 +1250,7 @@ class VisionLLMClient:
             "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu chuyên bản địa hóa sang Tiếng Việt.\n"
             "Chế độ NO-VISION THEO TUYẾN (Batch OCR): Dưới đây là toàn bộ lời thoại OCR của các trang thuộc CÙNG MỘT TUYẾN/ONESHOT. "
             "Hãy dịch liền mạch, nối nhịp cảm xúc & xưng hô nhất quán xuyên suốt các trang trong tuyến này.\n"
+            "CẤM để trống `vietnamese` hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
             + self._VI_LOCALIZATION_RULES
         )
         scene_hdr = f"Tuyến {scene_id}" if scene_id is not None else "Cùng 1 tuyến"
@@ -1161,7 +1263,7 @@ class VisionLLMClient:
             "    {\n"
             f'      "page": {rep_page_no},\n'
             '      "page_summary": "Tóm tắt ngắn trang này",\n'
-            '      "items": [{"id": 1, "source_text": "...", "vietnamese": "...", "is_sfx": false}]\n'
+            '      "items": [{"id": 1, "source_text": "...", "vietnamese": "Lời thoại Tiếng Việt", "is_sfx": false}]\n'
             "    }\n"
             "  ]\n"
             "}"
@@ -1172,18 +1274,42 @@ class VisionLLMClient:
         for p_entry in data.get("pages", []):
             if not isinstance(p_entry, dict):
                 continue
-            try:
-                by_page[int(p_entry["page"])] = p_entry
-            except (KeyError, TypeError, ValueError):
-                continue
+            p_raw = p_entry.get("page") or p_entry.get("page_number") or p_entry.get("page_index") or p_entry.get("id")
+            parsed_p = _parse_int_id(p_raw)
+            if parsed_p is not None:
+                by_page[parsed_p] = p_entry
 
+        mem = dict(translation_memory or {})
         out: dict[int, tuple[list[TextRegionItem], str]] = {}
         rolling_summaries = list(previous_summaries or [])
         for pno, regs, ocrs in scene_pages:
             entry = by_page.get(pno)
-            if entry and isinstance(entry.get("items"), list):
-                merged = self._merge_translated_regions(regs, entry["items"], ocr_texts=ocrs)
+            raw_page_items = (
+                (entry.get("items") or entry.get("regions")) if isinstance(entry, dict) else None
+            )
+            if entry and isinstance(raw_page_items, list):
+                merged = self._merge_translated_regions(regs, raw_page_items, ocr_texts=ocrs)
                 summary = str(entry.get("page_summary", "")).strip()
+                untranslated = [r for r in merged if region_needs_translation(r)]
+                if untranslated:
+                    fixed_missing, fix_sum = self.translate_page_from_ocr(
+                        untranslated,
+                        ocrs,
+                        source_lang=source_lang,
+                        previous_summaries=rolling_summaries,
+                        extra_instructions=extra_instructions,
+                        story_bible=story_bible,
+                        page_index=pno,
+                        tags=tags,
+                        translation_memory=mem,
+                    )
+                    fix_map = {r.id: r for r in fixed_missing}
+                    merged = [fix_map.get(r.id, r) for r in merged]
+                    if not summary and fix_sum:
+                        summary = fix_sum
+                for r in merged:
+                    if not region_needs_translation(r) and r.source_text and r.translated_text:
+                        mem[normalize_source_key(r.source_text)] = r.translated_text.strip()
                 out[pno] = (merged, summary)
                 if summary:
                     rolling_summaries.append(summary)
@@ -1197,7 +1323,11 @@ class VisionLLMClient:
                     story_bible=story_bible,
                     page_index=pno,
                     tags=tags,
+                    translation_memory=mem,
                 )
+                for r in res[0]:
+                    if not region_needs_translation(r) and r.source_text and r.translated_text:
+                        mem[normalize_source_key(r.source_text)] = r.translated_text.strip()
                 out[pno] = res
                 if res[1]:
                     rolling_summaries.append(res[1])

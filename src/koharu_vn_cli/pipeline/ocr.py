@@ -51,8 +51,8 @@ class MangaOcrONNX:
             enc, dec, voc = _ensure_manga_ocr_files()
 
         threads = max(1, min(4, os.cpu_count() or 2))
-        self.encoder = _create_ort_session(enc, use_gpu=use_gpu, cpu_threads=threads)
-        self.decoder = _create_ort_session(dec, use_gpu=use_gpu, cpu_threads=threads)
+        self.encoder = _create_ort_session(enc, use_gpu=use_gpu, cpu_threads=threads, low_mem=True)
+        self.decoder = _create_ort_session(dec, use_gpu=use_gpu, cpu_threads=threads, low_mem=True)
         self.vocab = voc.read_text(encoding="utf-8").splitlines()
         self.max_length = max(16, max_length)
 
