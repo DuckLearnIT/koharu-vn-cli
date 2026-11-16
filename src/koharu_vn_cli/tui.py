@@ -66,7 +66,9 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/font", "", "Chọn font Tiếng Việt mặc định"),
     SlashSpec("/density", "", "Chọn mật độ thoại khi sáng tác CG (low / medium / high)"),
     SlashSpec("/model", "", "Chọn Model PHỤ (dịch & sáng tác thoại nhanh từ Story Bible)"),
+    SlashSpec("/fallback", "[tên_model|off]", "Chọn Model fallback cho PHỤ khi hết quota (tự đổi sang model này)"),
     SlashSpec("/story-model", "[tên_model|off]", "Chọn Model CHÍNH (mạnh) cho Pass 1 cốt truyện & nhân vật"),
+    SlashSpec("/story-fallback", "[tên_model|off]", "Chọn Model fallback cho CHÍNH khi bị prohibit (thử 1 lượt rồi bỏ qua)"),
     SlashSpec("/key", "", "Cài đặt GEMINI_API_KEY & --base-url tùy chọn"),
     SlashSpec("/prompt", "[nội_dung]", "Đặt gợi ý xưng hô / văn phong mặc định"),
     SlashSpec("/tags", "[vanilla, NTR, ...]", "Đặt tag thể loại cho sáng tác CG & dịch (vd: vanilla, NTR)"),
@@ -864,6 +866,12 @@ class KoharuTUI(App[None]):
             self.add_class("sidebar-hidden")
 
     def _refresh_chrome(self) -> None:
+        if not self.is_running:
+            return
+        try:
+            topbar = self.query_one("#topbar", Static)
+        except Exception:
+            return
         key_ok = bool(self.cfg.effective_api_key())
         key_badge = (
             f"[green]● {self.cfg.masked_api_key()}[/green]"
@@ -875,7 +883,6 @@ class KoharuTUI(App[None]):
             if self.cfg.story_model and self.cfg.story_model != self.cfg.model
             else f"Model: [bold]{self.cfg.model}[/bold]"
         )
-        topbar = self.query_one("#topbar", Static)
         topbar.update(
             f"[bold cyan]◈ KOHARU-VN CLI[/bold cyan] [dim]v{__version__}[/dim]  │  "
             f"{model_badge}  │  "
@@ -887,7 +894,9 @@ class KoharuTUI(App[None]):
         sb_cfg = self.query_one("#sb-config", Static)
         sb_cfg.update(
             f"Model chính: [bold magenta]{self.cfg.story_model or f'chung ({self.cfg.model})'}[/bold magenta]\n"
+            f"Fallback chính: [dim]{self.cfg.story_fallback_model or 'tắt'}[/dim]\n"
             f"Model phụ: [bold white]{self.cfg.model}[/bold white]\n"
+            f"Fallback phụ: [dim]{self.cfg.fallback_model or 'tắt'}[/dim]\n"
             f"Endpoint: [dim]{self.cfg.base_url or 'Gemini Official'}[/dim]\n"
             f"Key: {key_badge}\n"
             f"Ngôn ngữ: [cyan]{self.cfg.lang}[/cyan]\n"
@@ -1306,12 +1315,24 @@ class KoharuTUI(App[None]):
                 self._set_model(rest)
             else:
                 self.action_choose_model()
+        elif cmd == "/fallback":
+            if rest:
+                cleaned = "" if rest.lower() in {"none", "off", "clear"} else rest.strip()
+                self._set_fallback_model(cleaned)
+            else:
+                self._choose_fallback_model()
         elif cmd == "/story-model":
             if rest:
                 cleaned = "" if rest.lower() in {"none", "off", "clear", "same"} else rest.strip()
                 self._set_story_model(cleaned)
             else:
                 self._choose_story_model()
+        elif cmd == "/story-fallback":
+            if rest:
+                cleaned = "" if rest.lower() in {"none", "off", "clear"} else rest.strip()
+                self._set_story_fallback_model(cleaned)
+            else:
+                self._choose_story_fallback_model()
         elif cmd == "/theme":
             if rest:
                 self._set_theme(rest)
@@ -1528,6 +1549,34 @@ class KoharuTUI(App[None]):
             self._set_story_model,
         )
 
+    def _choose_fallback_model(self) -> None:
+        if self.cfg.effective_api_key() or self.cfg.base_url:
+            self._log_ai("Đang truy vấn API lấy danh sách model fallback cho Model PHỤ...", "dim")
+            self._fetch_remote_models_and_pick("fallback_model")
+            return
+        choices = [("__off__", "Tắt fallback model phụ")] + list(MODEL_CHOICES)
+        self._open_picker(
+            "Chọn Model fallback PHỤ (chuyển khi hết quota)",
+            "Gõ /key để kết nối API và quét model mới nhất",
+            choices,
+            self.cfg.fallback_model or "__off__",
+            lambda v: self._set_fallback_model("" if v == "__off__" else v),
+        )
+
+    def _choose_story_fallback_model(self) -> None:
+        if self.cfg.effective_api_key() or self.cfg.base_url:
+            self._log_ai("Đang truy vấn API lấy danh sách model fallback cho Model CHÍNH...", "dim")
+            self._fetch_remote_models_and_pick("story_fallback_model")
+            return
+        choices = [("__off__", "Tắt fallback model chính")] + list(MODEL_CHOICES)
+        self._open_picker(
+            "Chọn Model fallback CHÍNH (thử 1 lượt khi Pass 1 bị prohibit)",
+            "Gõ /key để kết nối API và quét model mới nhất",
+            choices,
+            self.cfg.story_fallback_model or "__off__",
+            lambda v: self._set_story_fallback_model("" if v == "__off__" else v),
+        )
+
     @work(thread=True)
     def _fetch_remote_models_and_pick(self, target: str = "model") -> None:
         choices = list(MODEL_CHOICES)
@@ -1556,6 +1605,26 @@ class KoharuTUI(App[None]):
                 choices,
                 self.cfg.story_model or "__same__",
                 lambda v: self._set_story_model("" if v == "__same__" else v),
+            )
+        elif target == "fallback_model":
+            choices = [("__off__", "Tắt fallback model phụ")] + choices
+            self.call_from_thread(
+                self._open_picker,
+                "Chọn Model fallback PHỤ (tự chuyển khi hết quota)",
+                sub,
+                choices,
+                self.cfg.fallback_model or "__off__",
+                lambda v: self._set_fallback_model("" if v == "__off__" else v),
+            )
+        elif target == "story_fallback_model":
+            choices = [("__off__", "Tắt fallback model chính")] + choices
+            self.call_from_thread(
+                self._open_picker,
+                "Chọn Model fallback CHÍNH (1 lượt khi Pass 1 bị prohibit)",
+                sub,
+                choices,
+                self.cfg.story_fallback_model or "__off__",
+                lambda v: self._set_story_fallback_model("" if v == "__off__" else v),
             )
         else:
             self.call_from_thread(
@@ -1612,6 +1681,20 @@ class KoharuTUI(App[None]):
         self._refresh_chrome()
         label = self.cfg.story_model or f"dùng chung ({self.cfg.model})"
         self._log_ai(f"Đã cập nhật Model CHÍNH (Pass 1): [bold magenta]{label}[/bold magenta]")
+
+    def _set_fallback_model(self, value: str) -> None:
+        self.cfg.fallback_model = value.strip()
+        save_config(self.cfg)
+        self._refresh_chrome()
+        label = self.cfg.fallback_model or "tắt"
+        self._log_ai(f"Đã cập nhật Model fallback PHỤ (khi hết quota): [bold cyan]{label}[/bold cyan]")
+
+    def _set_story_fallback_model(self, value: str) -> None:
+        self.cfg.story_fallback_model = value.strip()
+        save_config(self.cfg)
+        self._refresh_chrome()
+        label = self.cfg.story_fallback_model or "tắt"
+        self._log_ai(f"Đã cập nhật Model fallback CHÍNH (1 lượt khi prohibit): [bold magenta]{label}[/bold magenta]")
 
     def _set_default_prompt(self, value: str) -> None:
         self.cfg.custom_prompt = value
@@ -1849,7 +1932,9 @@ class KoharuTUI(App[None]):
                 api_keys=self.cfg.effective_api_keys(),
                 base_url=self.cfg.base_url,
                 model=self.cfg.model,
+                fallback_model=self.cfg.fallback_model or None,
                 story_model=self.cfg.story_model or None,
+                story_fallback_model=self.cfg.story_fallback_model or None,
                 prompt=merged_prompt,
                 story=self.cfg.story_context or None,
                 tags=eff_tags,
@@ -1909,7 +1994,9 @@ class KoharuTUI(App[None]):
                 api_keys=self.cfg.effective_api_keys(),
                 base_url=self.cfg.base_url,
                 model=self.cfg.model,
+                fallback_model=self.cfg.fallback_model or None,
                 story_model=self.cfg.story_model or None,
+                story_fallback_model=self.cfg.story_fallback_model or None,
                 font=self.cfg.font,
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,

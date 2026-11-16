@@ -345,6 +345,7 @@ def _load_or_build_story_bible(
     enable_story_pass: bool,
     resume: bool,
     scenes: list[SceneGroup] | None = None,
+    story_fallback_llm: VisionLLMClient | None = None,
     hooks: PipelineHooks,
 ) -> StoryBible | None:
     """Shared Pass-1 global story & character analysis across translate and compose pipelines."""
@@ -368,8 +369,8 @@ def _load_or_build_story_bible(
         "story_pass",
         f"Pass 1 [Model chính: {llm.model}]: Tự động xem full {len(images)} ảnh -> phân tích cốt truyện, nhân vật & xưng hô...",
     )
+    extra_kw = {"scenes": scenes} if scenes and len(scenes) >= 2 else {}
     try:
-        extra_kw = {"scenes": scenes} if scenes and len(scenes) >= 2 else {}
         bible = llm.build_story_bible(
             images,
             mode=mode,
@@ -379,14 +380,41 @@ def _load_or_build_story_bible(
             **extra_kw,
         )
     except ContentBlockedError as exc:
-        hooks.emit_step(
-            0,
-            len(images),
-            base_name,
-            "warn",
-            f"Pass 1 bị bộ lọc nội dung chặn ({exc}) — tiếp tục dịch từng trang...",
-        )
-        return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
+        if story_fallback_llm is not None and story_fallback_llm.model != llm.model:
+            hooks.emit_step(
+                0,
+                len(images),
+                base_name,
+                "warn",
+                f"Pass 1 [Chính: {llm.model}] bị PROHIBIT ({exc}) -> thử model fallback chính [{story_fallback_llm.model}] (1 lượt)...",
+            )
+            try:
+                bible = story_fallback_llm.build_story_bible(
+                    images,
+                    mode=mode,
+                    user_story=resolved_story,
+                    extra_instructions=prompt,
+                    tags=tags,
+                    **extra_kw,
+                )
+            except Exception as fb_exc:
+                hooks.emit_step(
+                    0,
+                    len(images),
+                    base_name,
+                    "warn",
+                    f"Fallback chính [{story_fallback_llm.model}] cũng bị chặn/lỗi ({fb_exc}) — bỏ qua Pass 1, tiếp tục dịch từng trang...",
+                )
+                return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
+        else:
+            hooks.emit_step(
+                0,
+                len(images),
+                base_name,
+                "warn",
+                f"Pass 1 bị bộ lọc nội dung chặn ({exc}) — tiếp tục dịch từng trang...",
+            )
+            return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
     hooks.emit_story_bible(bible)
     confirmed = hooks.confirm_story_bible(bible)
     if confirmed is not bible:
@@ -405,7 +433,9 @@ def run_translate_pipeline(
     api_keys: list[str] | None = None,
     base_url: str | None = None,
     model: str = DEFAULT_GEMINI_MODEL,
+    fallback_model: str | None = None,
     story_model: str | None = None,
+    story_fallback_model: str | None = None,
     prompt: str | None = None,
     story: str | None = None,
     tags: str | None = None,
@@ -439,24 +469,29 @@ def run_translate_pipeline(
 
         total = len(images)
         eff_story_model = (story_model or "").strip() or model
+        eff_fallback = (fallback_model or "").strip() or None
+        eff_story_fallback = (story_fallback_model or "").strip() or None
         mode_tag = "Vision" if vision_translate else "No-Vision OCR"
+        fb_s_tag = f" [FB: {eff_story_fallback}]" if eff_story_fallback else ""
+        fb_m_tag = f" [FB quota: {eff_fallback}]" if eff_fallback else ""
         hooks.emit_step(
             0,
             total,
             base_name,
             "init",
-            f"Kiểm tra API & ONNX (Chính: {eff_story_model} -> Phụ ({mode_tag}): {model})...",
+            f"Kiểm tra API & ONNX (Chính: {eff_story_model}{fb_s_tag} -> Phụ ({mode_tag}): {model}{fb_m_tag})...",
         )
         llm = VisionLLMClient(
             api_key=api_key,
             api_keys=api_keys,
             model=model,
+            fallback_model=eff_fallback,
             base_url=base_url,
             on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
         story_llm = (
             llm
-            if eff_story_model == model
+            if eff_story_model == model and not eff_fallback
             else VisionLLMClient(
                 api_key=api_key,
                 api_keys=api_keys,
@@ -464,6 +499,17 @@ def run_translate_pipeline(
                 base_url=base_url,
                 on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
             )
+        )
+        story_fallback_llm = (
+            VisionLLMClient(
+                api_key=api_key,
+                api_keys=api_keys,
+                model=eff_story_fallback,
+                base_url=base_url,
+                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            )
+            if eff_story_fallback and eff_story_fallback != eff_story_model
+            else None
         )
         if isinstance(cache, ModelCache):
             detector = cache.get_detector(accurate=accurate_detector, use_gpu=use_gpu)
@@ -506,6 +552,7 @@ def run_translate_pipeline(
             enable_story_pass=story_pass,
             resume=resume,
             scenes=scenes,
+            story_fallback_llm=story_fallback_llm,
             hooks=hooks,
         )
 
@@ -692,7 +739,7 @@ def run_translate_pipeline(
                                 translated_items, summary = llm.translate_page_from_ocr(**ocr_kw)
                                 fallback_done = True
                             except ContentBlockedError as inner_exc:
-                                if story_llm is not llm:
+                                if story_llm.model != llm.model:
                                     translated_items, summary = story_llm.translate_page_from_ocr(**ocr_kw)
                                     fallback_done = True
                                 else:
@@ -783,7 +830,7 @@ def run_translate_pipeline(
                         total,
                         chunk[0][1].name,
                         "llm",
-                        f"Tuyến {sc.scene_id}: Gửi text OCR {len(chunk)} trang tới {model} (0 ảnh)...",
+                        f"Tuyến {sc.scene_id}: Gửi text OCR {len(chunk)} trang tới {llm.model} (0 ảnh)...",
                     )
                     try:
                         batch_res = llm.translate_scene_from_ocr(
@@ -854,7 +901,9 @@ def run_compose_pipeline(
     api_keys: list[str] | None = None,
     base_url: str | None = None,
     model: str = DEFAULT_GEMINI_MODEL,
+    fallback_model: str | None = None,
     story_model: str | None = None,
+    story_fallback_model: str | None = None,
     font: str | None = None,
     save_cbz: bool = False,
     output_format: str = "original",
@@ -878,23 +927,28 @@ def run_compose_pipeline(
 
         total = len(images)
         eff_story_model = (story_model or "").strip() or model
+        eff_fallback = (fallback_model or "").strip() or None
+        eff_story_fallback = (story_fallback_model or "").strip() or None
+        fb_s_tag = f" [FB: {eff_story_fallback}]" if eff_story_fallback else ""
+        fb_m_tag = f" [FB quota: {eff_fallback}]" if eff_fallback else ""
         hooks.emit_step(
             0,
             total,
             base_name,
             "init",
-            f"Khởi tạo sáng tác CG ({style.value} | Chính: {eff_story_model} -> Phụ: {model})...",
+            f"Khởi tạo sáng tác CG ({style.value} | Chính: {eff_story_model}{fb_s_tag} -> Phụ: {model}{fb_m_tag})...",
         )
         llm = VisionLLMClient(
             api_key=api_key,
             api_keys=api_keys,
             model=model,
+            fallback_model=eff_fallback,
             base_url=base_url,
             on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
         story_llm = (
             llm
-            if eff_story_model == model
+            if eff_story_model == model and not eff_fallback
             else VisionLLMClient(
                 api_key=api_key,
                 api_keys=api_keys,
@@ -902,6 +956,17 @@ def run_compose_pipeline(
                 base_url=base_url,
                 on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
             )
+        )
+        story_fallback_llm = (
+            VisionLLMClient(
+                api_key=api_key,
+                api_keys=api_keys,
+                model=eff_story_fallback,
+                base_url=base_url,
+                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            )
+            if eff_story_fallback and eff_story_fallback != eff_story_model
+            else None
         )
 
         scenes = cluster_story_scenes(images)
@@ -926,6 +991,7 @@ def run_compose_pipeline(
             enable_story_pass=story_pass,
             resume=resume,
             scenes=scenes,
+            story_fallback_llm=story_fallback_llm,
             hooks=hooks,
         )
 

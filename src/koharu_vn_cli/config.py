@@ -30,6 +30,20 @@ def parse_api_keys(raw: str | None) -> list[str]:
     return keys
 
 
+def parse_model_list(raw: str | None) -> list[str]:
+    """Split comma/semicolon/newline-separated model names, preserving order without duplicates."""
+    if not raw:
+        return []
+    seen: set[str] = set()
+    models: list[str] = []
+    for part in re.split(r"[\s,;]+", raw.strip()):
+        m = part.strip()
+        if m and m not in seen:
+            seen.add(m)
+            models.append(m)
+    return models
+
+
 class AppConfig(BaseModel):
     """Saved user preferences across CLI & interactive TUI sessions."""
 
@@ -37,7 +51,9 @@ class AppConfig(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
     base_url: Optional[str] = None
     model: str = DEFAULT_GEMINI_MODEL
+    fallback_model: str = ""
     story_model: str = ""
+    story_fallback_model: str = ""
     lang: str = "auto"
     compose_style: ComposePreset = ComposePreset.CG_OVAL
     density: str = "medium"

@@ -36,6 +36,24 @@ class ContentBlockedError(RuntimeError):
     """Raised when the upstream API hard-blocks content (e.g. PROHIBITED_CONTENT / SAFETY)."""
 
 
+class QuotaExhaustedError(RuntimeError):
+    """Raised when all API keys/retries hit quota or rate-limit exhaustion (e.g. HTTP 429 / RESOURCE_EXHAUSTED)."""
+
+
+_QUOTA_BODY_RE = re.compile(
+    r"RESOURCE_EXHAUSTED|insufficient_quota|exceeded.*quota|rate.?limit|too many requests|\bquota\b",
+    re.IGNORECASE,
+)
+
+
+def _is_quota_error(status_code: int, body_text: str) -> bool:
+    if status_code in (429, 402):
+        return True
+    if status_code in (400, 403) and _QUOTA_BODY_RE.search(body_text or ""):
+        return True
+    return False
+
+
 def _pil_to_jpeg_b64(img: Image.Image, max_side: int = 1600, quality: int = 90) -> str:
     w, h = img.size
     if max(w, h) > max_side:
@@ -470,6 +488,7 @@ class VisionLLMClient:
         api_key: str | None = None,
         api_keys: list[str] | None = None,
         model: str = DEFAULT_GEMINI_MODEL,
+        fallback_model: str | list[str] | None = None,
         base_url: str | None = None,
         timeout: float = 90.0,
         on_status: Callable[[str], None] | None = None,
@@ -497,6 +516,21 @@ class VisionLLMClient:
         self._key_idx = 0
         self.api_key = self.api_keys[0] if self.api_keys else ""
         self.model = model
+        self.fallback_models: list[str] = []
+        raw_fb = (
+            fallback_model
+            if isinstance(fallback_model, list)
+            else re.split(r"[\s,;]+", fallback_model.strip())
+            if isinstance(fallback_model, str) and fallback_model.strip()
+            else []
+        )
+        fb_seen: set[str] = {model}
+        for fb in raw_fb:
+            fb_clean = fb.strip()
+            if fb_clean and fb_clean not in fb_seen:
+                fb_seen.add(fb_clean)
+                self.fallback_models.append(fb_clean)
+        self._fallback_idx = 0
         self.base_url = base_url.rstrip("/") if base_url else None
         self.timeout = timeout
         self.on_status = on_status
@@ -504,6 +538,23 @@ class VisionLLMClient:
             raise ValueError(
                 "Missing Gemini API key. Set GEMINI_API_KEY env var or pass --api-key (or --base-url for a local proxy)."
             )
+
+    def _has_fallback_model(self) -> bool:
+        return self._fallback_idx < len(self.fallback_models)
+
+    def _switch_to_fallback_model(self, reason: str) -> bool:
+        """Advance to the next configured fallback model when the current model exhausts quota."""
+        if not self._has_fallback_model():
+            return False
+        old_model = self.model
+        self.model = self.fallback_models[self._fallback_idx]
+        self._fallback_idx += 1
+        self._key_idx = 0
+        self.api_key = self.api_keys[0] if self.api_keys else ""
+        self._emit_status(
+            f"⚠ Model '{old_model}' {reason} -> tự động chuyển sang model fallback '{self.model}'!"
+        )
+        return True
 
     def _rotate_key(self, reason: str) -> bool:
         """Advance to the next API key when multiple keys are configured."""
@@ -530,9 +581,10 @@ class VisionLLMClient:
         images: list[tuple[str, str]],
         temperature: float = 0.3,
     ) -> Any:
-        """Send multimodal prompt + base64 JPEGs and parse JSON response with automatic key failover & retries."""
+        """Send multimodal prompt + base64 JPEGs and parse JSON response with automatic key & quota-fallback failover."""
         img_kb = max(1, sum(len(b64) for _, b64 in images) * 3 // 4 // 1024) if images else 0
         last_err: Exception | None = None
+        last_is_quota = False
         keys_total = max(1, len(self.api_keys))
         keys_tried = 1
         transient_attempt = 0
@@ -561,16 +613,35 @@ class VisionLLMClient:
                 last_err = exc
                 code = exc.response.status_code
                 body_preview = exc.response.text.strip().replace("\n", " ")[:200]
+                is_quota = _is_quota_error(code, body_preview)
+                last_is_quota = is_quota
                 if code == 404:
+                    if self._fallback_idx > 0 and self._switch_to_fallback_model("không tồn tại (HTTP 404)"):
+                        keys_tried = 1
+                        transient_attempt = 0
+                        last_is_quota = False
+                        continue
                     hint = f" (Model '{self.model}' không tồn tại hoặc key chưa mở — bấm F3 hoặc gõ /model để chọn model hỗ trợ)"
                     raise RuntimeError(f"HTTP {code} từ {self.model}: {body_preview}{hint}") from exc
-                if code in (400, 401, 403, 429) or code >= 500:
+                if code in (400, 401, 403, 429) or code >= 500 or is_quota:
                     if keys_tried < keys_total and self._rotate_key(f"HTTP {code}"):
                         keys_tried += 1
                         continue
-                    if code in (400, 401, 403):
+                    if code in (400, 401, 403) and not is_quota:
                         hint = " (API key không hợp lệ hoặc hết quyền — kiểm tra /key)" if code in (401, 403) else ""
                         raise RuntimeError(f"HTTP {code} từ {self.model}: {body_preview}{hint}") from exc
+                if is_quota and self._has_fallback_model():
+                    if transient_attempt < 1:
+                        wait_s = 1.5
+                        transient_attempt += 1
+                        self._emit_status(f"API trả HTTP {code} (quota), thử lại nhanh {transient_attempt}/1 sau {wait_s:.1f}s...")
+                        time.sleep(wait_s)
+                        continue
+                    if self._switch_to_fallback_model(f"hết quota (HTTP {code})"):
+                        keys_tried = 1
+                        transient_attempt = 0
+                        last_is_quota = False
+                        continue
                 if transient_attempt < max_transient:
                     wait_s = 1.5 * (2**transient_attempt)
                     transient_attempt += 1
@@ -580,6 +651,7 @@ class VisionLLMClient:
                 break
             except (httpx.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
                 last_err = exc
+                last_is_quota = False
                 if isinstance(exc, httpx.HTTPError) and keys_tried < keys_total and self._rotate_key(type(exc).__name__):
                     keys_tried += 1
                     continue
@@ -593,6 +665,8 @@ class VisionLLMClient:
                     time.sleep(wait_s)
                     continue
                 break
+        if last_is_quota:
+            raise QuotaExhaustedError(f"Model {self.model} hết quota sau khi thử lại: {last_err}") from last_err
         raise RuntimeError(f"LLM vision request failed after retries: {last_err}") from last_err
 
     def _call_gemini_rest(

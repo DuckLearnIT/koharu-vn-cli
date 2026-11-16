@@ -1605,3 +1605,140 @@ def test_pipeline_reuses_memory_and_resumes_untranslated_cache(
     )
     assert [d.regions[0].translated_text for d in resumed_docs] == ["Dừng lại đi…", "Dừng lại đi…"]
 
+
+def test_story_model_prohibit_tries_story_fallback_once_then_skips_pass1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from koharu_vn_cli.models import StoryBible
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError, VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    Image.new("RGB", (200, 200), (240, 240, 240)).save(in_dir / "p1.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            return [DetectedRegion((20, 20, 120, 80), (15, 15, 125, 85), None, True, False, 0.9)], np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+    story_calls: list[str] = []
+
+    def fake_story(self, images, **kwargs):
+        story_calls.append(self.model)
+        if self.model == "story-pro":
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+        if self.model == "story-safe-ok":
+            return StoryBible(title="Safe Story", full_plot_summary="Dịch ngọt")
+        raise ContentBlockedError("PROHIBITED_CONTENT_AGAIN")
+
+    seen_story_titles: list[str] = []
+
+    def fake_translate(self, rgb, regions, **kwargs):
+        sb = kwargs.get("story_bible")
+        seen_story_titles.append(sb.title if sb else "")
+        return [r.model_copy(update={"source_text": "愛", "translated_text": "Yêu"}) for r in regions], ""
+
+    monkeypatch.setattr(VisionLLMClient, "build_story_bible", fake_story)
+    monkeypatch.setattr(VisionLLMClient, "translate_page", fake_translate)
+
+    # Case A: primary story model hits prohibit -> story_fallback succeeds in 1 turn
+    _, docs_a = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out_a",
+        api_key="dummy",
+        model="fast-worker",
+        story_model="story-pro",
+        story_fallback_model="story-safe-ok",
+        story_pass=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert story_calls == ["story-pro", "story-safe-ok"]
+    assert seen_story_titles[-1] == "Safe Story"
+    assert docs_a[0].regions[0].translated_text == "Yêu"
+
+    # Case B: both primary and fallback hit prohibit -> 1 turn on fallback, then skip Pass 1 ("kệ") and continue Pass 2
+    story_calls.clear()
+    seen_story_titles.clear()
+    _, docs_b = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out_b",
+        api_key="dummy",
+        model="fast-worker",
+        story_model="story-pro",
+        story_fallback_model="story-safe-blocked",
+        story_pass=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert story_calls == ["story-pro", "story-safe-blocked"]
+    assert seen_story_titles[-1] == ""
+    assert docs_b[0].regions[0].translated_text == "Yêu"
+
+
+def test_worker_model_quota_exhausted_switches_to_fallback_and_tui_cmds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    import pytest
+    from koharu_vn_cli.config import AppConfig
+    from koharu_vn_cli.pipeline.gemini_client import QuotaExhaustedError, VisionLLMClient
+    from koharu_vn_cli.tui import KoharuTUI
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.time.sleep", lambda _s: None)
+
+    models_called: list[str] = []
+
+    def fake_rest(self, system_prompt, user_prompt, images, temperature, json_mode=True):
+        models_called.append(self.model)
+        if self.model == "fast-primary":
+            req = httpx.Request("POST", "https://generativelanguage.googleapis.com")
+            resp = httpx.Response(429, json={"error": {"status": "RESOURCE_EXHAUSTED"}}, request=req)
+            raise httpx.HTTPStatusError("quota exceeded", request=req, response=resp)
+        return '{"ok": true}'
+
+    monkeypatch.setattr(VisionLLMClient, "_call_gemini_rest", fake_rest)
+
+    # Without fallback -> raises QuotaExhaustedError after retries
+    no_fb_client = VisionLLMClient(api_key="k1", model="fast-primary")
+    with pytest.raises(QuotaExhaustedError):
+        no_fb_client._call_json("sys", "usr", [])
+
+    # With fallback_model -> switches permanently on quota exhaustion and succeeds
+    models_called.clear()
+    fb_client = VisionLLMClient(api_key="k1", model="fast-primary", fallback_model="fast-backup")
+    out = fb_client._call_json("sys", "usr", [])
+    assert out == {"ok": True}
+    assert fb_client.model == "fast-backup"
+    assert models_called[-1] == "fast-backup"
+
+    # Next call goes straight to fallback model without hitting exhausted primary again
+    models_called.clear()
+    out2 = fb_client._call_json("sys", "usr", [])
+    assert out2 == {"ok": True}
+    assert models_called == ["fast-backup"]
+
+    # TUI slash commands `/fallback` and `/story-fallback`
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda cfg: None)
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: AppConfig())
+    app_tui = KoharuTUI()
+    app_tui._log_user = lambda _msg: None  # type: ignore[method-assign]
+    app_tui._log_ai = lambda _msg, style="": None  # type: ignore[method-assign]
+    app_tui._handle_submission("/fallback gemini-2.5-flash")
+    app_tui._handle_submission("/story-fallback gemini-2.5-pro")
+    assert app_tui.cfg.fallback_model == "gemini-2.5-flash"
+    assert app_tui.cfg.story_fallback_model == "gemini-2.5-pro"
+    app_tui._handle_submission("/fallback off")
+    assert app_tui.cfg.fallback_model == ""
+
+
