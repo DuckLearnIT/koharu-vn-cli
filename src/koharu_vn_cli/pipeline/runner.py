@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -474,6 +475,54 @@ def _cleanup_cache_dir(
             "keep_cache",
             f"Giữ lại .koharu_cache vì còn {remaining} trang chưa xong (gõ /resume để chạy tiếp).",
         )
+
+
+def _write_reader_metadata(
+    out_dir: Path,
+    story_bible: StoryBible | None,
+    tags: str | None,
+) -> None:
+    """Save `koharu.meta.json` so Koharu Reader picks up Parody, Characters, and Tags automatically from Drive."""
+    parody = (story_bible.source_game or "").strip() if story_bible else ""
+    characters: list[str] = []
+    seen_c: set[str] = set()
+    if story_bible:
+        for ch in story_bible.characters:
+            name = (ch.name or "").strip()
+            low = name.lower()
+            if name and low not in seen_c:
+                seen_c.add(low)
+                characters.append(name)
+
+    tag_list: list[str] = []
+    seen_t: set[str] = set()
+    raw_sources = [tags or ""]
+    if story_bible and story_bible.genre_and_tone:
+        raw_sources.append(story_bible.genre_and_tone)
+    for src in raw_sources:
+        for part in re.split(r"[,;/|]+", src):
+            t = part.strip()
+            low_t = t.lower()
+            if t and len(t) <= 36 and low_t not in seen_t:
+                seen_t.add(low_t)
+                tag_list.append(t)
+
+    if not parody and not characters and not tag_list:
+        return
+
+    payload = {
+        "parody": parody,
+        "characters": characters,
+        "tags": tag_list[:8],
+        "summary": (story_bible.full_plot_summary or "").strip() if story_bible else "",
+    }
+    try:
+        (out_dir / "koharu.meta.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def resolve_story_text(story: str | None) -> str | None:
@@ -1417,6 +1466,7 @@ def run_translate_pipeline(
 
         docs = [docs_by_idx[i] for i in sorted(docs_by_idx)]
 
+        _write_reader_metadata(out_dir, story_bible, tags)
         if save_cbz:
             package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
         _cleanup_cache_dir(
@@ -1664,6 +1714,7 @@ def run_compose_pipeline(
             docs.append(doc)
             hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
 
+        _write_reader_metadata(out_dir, story_bible, tags)
         if save_cbz:
             package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
         _cleanup_cache_dir(

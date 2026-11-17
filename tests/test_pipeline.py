@@ -2272,6 +2272,42 @@ def test_zip_drop_cli_nested_sorting_macos_skip_and_notifications(tmp_path: Path
     assert len(cli_notifs) == 1 and cli_notifs[0][2] is True and "Zip lỗi" in cli_notifs[0][1]
 
 
+def test_write_reader_metadata_sidecar(tmp_path: Path) -> None:
+    """Verify koharu.meta.json export from StoryBible/tags and skipping empty metadata."""
+    from koharu_vn_cli.models import CharacterProfile, StoryBible
+    from koharu_vn_cli.pipeline.runner import _write_reader_metadata
+
+    empty_dir = tmp_path / "empty_comic"
+    empty_dir.mkdir()
+    _write_reader_metadata(empty_dir, None, None)
+    assert not (empty_dir / "koharu.meta.json").exists()
+
+    _write_reader_metadata(empty_dir, StoryBible(title="No Meta"), "")
+    assert not (empty_dir / "koharu.meta.json").exists()
+
+    rich_dir = tmp_path / "rich_comic"
+    rich_dir.mkdir()
+    bible = StoryBible(
+        title="Fontaine Tea",
+        source_game="Genshin Impact",
+        full_plot_summary="Buổi trà chiều ngọt ngào tại Fontaine.",
+        characters=[
+            CharacterProfile(name="Furina", pronoun_rules="em - anh"),
+            CharacterProfile(name="Neuvillette", pronoun_rules="tôi - cô"),
+        ],
+    )
+    _write_reader_metadata(rich_dir, bible, "romance, slice of life, Furina")
+    meta_path = rich_dir / "koharu.meta.json"
+    assert meta_path.exists()
+    data = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert data["parody"] == "Genshin Impact"
+    assert "Furina" in data["characters"]
+    assert "Neuvillette" in data["characters"]
+    assert "romance" in data["tags"]
+    assert "slice of life" in data["tags"]
+    assert data["summary"] == "Buổi trà chiều ngọt ngào tại Fontaine."
+
+
 
 
 
