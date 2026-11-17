@@ -1100,6 +1100,7 @@ def test_translate_skips_blocked_page_and_resumes_cleanly(tmp_path: Path, monkey
         api_key="dummy",
         story_pass=False,
         resume=True,
+        clean_cache=False,
         model_cache=FakeCache(),  # type: ignore[arg-type]
     )
     assert calls == [2]
@@ -1436,6 +1437,7 @@ def test_vision_blocked_image_falls_back_to_local_ocr_translation(tmp_path: Path
         api_key="dummy",
         story_pass=False,
         vision_translate=True,
+        clean_cache=False,
         model_cache=FakeCache(),  # type: ignore[arg-type]
     )
     assert len(ocr_text_calls) == 1
@@ -1582,6 +1584,7 @@ def test_pipeline_reuses_memory_and_resumes_untranslated_cache(
         api_key="dummy",
         story_pass=False,
         vision_translate=True,
+        clean_cache=False,
         model_cache=FakeCache(),  # type: ignore[arg-type]
     )
     # p1 translates via OCR LLM, p2 gets untranslated echo from LLM but is rescued by p1's translation_memory
@@ -1949,6 +1952,7 @@ def test_story_timeout_180_and_ocr_fallback_inpaints_and_renders(
         story_pass=True,
         vision_translate=True,
         output_format="png",
+        clean_cache=False,
         model_cache=FakeCache(),  # type: ignore[arg-type]
     )
 
@@ -1962,6 +1966,125 @@ def test_story_timeout_180_and_ocr_fallback_inpaints_and_renders(
     assert not np.array_equal(clean_arr[55:95, 55:125], orig[55:95, 55:125])
     assert not np.array_equal(out_arr[40:110, 40:140], clean_arr[40:110, 40:140])
     assert int(np.min(out_arr[40:110, 40:140])) < 100
+
+
+def test_clean_cache_removes_cache_only_when_all_pages_complete(tmp_path: Path, monkeypatch):
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError
+    from koharu_vn_cli.pipeline.runner import run_compose_pipeline, run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    for i in (1, 2):
+        Image.new("RGB", (240, 320), (240, 240, 240)).save(in_dir / f"p{i}.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            return [DetectedRegion((40, 40, 180, 120), (30, 30, 190, 130), None, True, False, 0.9)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeCache:
+        def get_detector(self, accurate=True):
+            return FakeDet()
+
+        def get_inpainter(self):
+            return FakeInp()
+
+    block_p2 = {"flag": True}
+
+    def fake_translate_page(self, rgb, regions, **kwargs):
+        p_idx = kwargs["page_index"]
+        if p_idx == 2 and block_p2["flag"]:
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+        out = [r.model_copy(update={"source_text": "JP", "translated_text": f"Trang {p_idx}"}) for r in regions]
+        return out, f"Tóm tắt {p_idx}"
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.VisionLLMClient.translate_page", fake_translate_page)
+
+    # 1. Incomplete run (page 2 blocked) must KEEP .koharu_cache even when clean_cache=True
+    out_dir, docs_partial = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out_translate",
+        api_key="dummy",
+        story_pass=False,
+        clean_cache=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs_partial) == 1
+    assert (out_dir / ".koharu_cache" / "p1.koharu.json").is_file()
+
+    # 2. Finishing all pages with clean_cache=False keeps .koharu_cache
+    block_p2["flag"] = False
+    _, docs_kept = run_translate_pipeline(
+        in_dir,
+        output=out_dir,
+        api_key="dummy",
+        story_pass=False,
+        resume=True,
+        clean_cache=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs_kept) == 2
+    assert (out_dir / ".koharu_cache" / "p2.koharu.json").is_file()
+
+    # 3. Completing 100% with default clean_cache=True deletes .koharu_cache cleanly
+    _, docs_done = run_translate_pipeline(
+        in_dir,
+        output=out_dir,
+        api_key="dummy",
+        story_pass=False,
+        resume=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs_done) == 2
+    assert (out_dir / "p1.png").is_file()
+    assert (out_dir / "p2.png").is_file()
+    assert not (out_dir / ".koharu_cache").exists()
+
+    # 4. Compose pipeline also cleans .koharu_cache on 100% completion when clean_cache=True
+    def fake_compose_cg_sheet(self, image_paths, image_sizes, **_kwargs):
+        return {
+            i: (
+                [
+                    TextRegionItem(
+                        id=1,
+                        kind="bubble",
+                        bubble_style=BubbleStyle.WHITE_OVAL,
+                        text_bbox=(20, 20, 160, 90),
+                        bubble_bbox=(20, 20, 160, 90),
+                        translated_text=f"Thoại {i}",
+                        draw_bubble=True,
+                    )
+                ],
+                f"Cảnh {i}",
+            )
+            for i in range(1, len(image_paths) + 1)
+        }
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.VisionLLMClient.compose_cg_sheet", fake_compose_cg_sheet)
+    cg_out_kept, cg_docs_kept = run_compose_pipeline(
+        in_dir,
+        output=tmp_path / "out_cg_kept",
+        api_key="dummy",
+        story_pass=False,
+        clean_cache=False,
+    )
+    assert len(cg_docs_kept) == 2
+    assert (cg_out_kept / ".koharu_cache").is_dir()
+
+    cg_out_clean, cg_docs_clean = run_compose_pipeline(
+        in_dir,
+        output=tmp_path / "out_cg_clean",
+        api_key="dummy",
+        story_pass=False,
+    )
+    assert len(cg_docs_clean) == 2
+    assert (cg_out_clean / "p1.png").is_file()
+    assert not (cg_out_clean / ".koharu_cache").exists()
 
 
 

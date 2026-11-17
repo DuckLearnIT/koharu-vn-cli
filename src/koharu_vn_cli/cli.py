@@ -105,6 +105,7 @@ def translate(
     vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Pass 2 dùng Vision gửi ảnh (mặc định) hoặc --no-vision để OCR cục bộ + model con dịch text-only."),
     skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
+    clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi dịch xong 100% (mặc định: bật)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
 ) -> None:
     """Dịch truyện tranh (Nhật, Hàn, Trung, Anh -> Tiếng Việt) sửa triệt để lỗi cỡ chữ, viền & đè chữ."""
@@ -112,9 +113,11 @@ def translate(
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
+    eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
     eff_vision = cfg.vision_translate if vision is None else vision
     eff_skip_sfx = cfg.skip_sfx if skip_sfx is None else skip_sfx
     eff_gpu = cfg.use_gpu if gpu is None else gpu
+    eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -163,6 +166,7 @@ def translate(
                 skip_sfx=eff_skip_sfx,
                 use_gpu=eff_gpu,
                 resume=resume,
+                clean_cache=eff_clean_cache,
                 hooks=PipelineHooks(
                     on_step=on_step,
                     on_page_done=on_page_done,
@@ -178,7 +182,10 @@ def translate(
             raise typer.Exit(1)
 
     console.print(f"[bold green]Hoàn tất ({len(docs)} trang)![/bold green] Ảnh kết quả lưu tại: {out_dir}")
-    console.print(f"[dim]Mẹo: Chỉnh thoại trong {out_dir / '.koharu_cache'}/*.koharu.json rồi chạy `koharu-vn rerender {out_dir}` (0 giây API).[/dim]")
+    if (out_dir / ".koharu_cache").is_dir():
+        console.print(f"[dim]Mẹo: Chỉnh thoại trong {out_dir / '.koharu_cache'}/*.koharu.json rồi chạy `koharu-vn rerender {out_dir}` (0 giây API).[/dim]")
+    else:
+        console.print("[dim]Đã tự dọn sạch `.koharu_cache` sau khi hoàn tất 100%.[/dim]")
 
 
 @app.command()
@@ -206,6 +213,7 @@ def compose(
     output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
     seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
     review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi sáng tác."),
+    clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi sáng tác xong 100% (mặc định: bật)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua ảnh đã sáng tác sẵn trong thư mục đích."),
 ) -> None:
     """Tự sáng tác lời thoại Tiếng Việt cho ảnh Artist CG không lời (hỗ trợ cả Bubble Text & Chữ thường)."""
@@ -213,6 +221,7 @@ def compose(
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
+    eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -257,6 +266,7 @@ def compose(
                 output_format=eff_format,
                 sequential_names=eff_seq,
                 resume=resume,
+                clean_cache=eff_clean_cache,
                 hooks=PipelineHooks(
                     on_step=on_step,
                     on_page_done=on_page_done,

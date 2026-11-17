@@ -140,6 +140,15 @@ def test_tui_slash_popup_style_picker_and_rerender(tmp_path: Path, monkeypatch) 
             assert app.cfg.effective_api_keys()[:2] == ["AIzaKeyOne111", "AIzaKeyTwo222"]
             assert "2 keys" in app.cfg.masked_api_key()
 
+            # 3e. `/cache` toggles auto-cleaning `.koharu_cache`
+            assert app.cfg.clean_cache is True
+            app.dispatch_command("/cache keep")
+            await pilot.pause()
+            assert app.cfg.clean_cache is False
+            app.dispatch_command("/cache clean")
+            await pilot.pause()
+            assert app.cfg.clean_cache is True
+
             # 4. Run `/rerender` in background worker inside TUI
             app.dispatch_command(f'/rerender "{out_dir}"')
             deadline = time.monotonic() + 8.0

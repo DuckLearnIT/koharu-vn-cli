@@ -61,6 +61,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật game sau Pass 1"),
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
+    SlashSpec("/cache", "[clean|keep]", "Tự xóa .koharu_cache sau khi dịch xong 100% (mặc định: tự xóa)"),
     SlashSpec("/gpu", "[on|off]", "Bật/tắt tăng tốc GPU (CUDA) cho Detector, LaMa Inpaint & OCR"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
     SlashSpec("/lang", "", "Chọn ngôn ngữ nguồn ưu tiên (auto / ja / ko / zh / en)"),
@@ -906,6 +907,7 @@ class KoharuTUI(App[None]):
             f"Tags: [magenta]{(self.cfg.tags[:30] + '...') if len(self.cfg.tags) > 30 else (self.cfg.tags or 'chưa đặt')}[/magenta]\n"
             f"Font: [white]{self.cfg.font or 'auto (animeace3/pangolin)'}[/white]\n"
             f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
+            f"Cache: [cyan]{'Tự xóa khi xong 100%' if self.cfg.clean_cache else 'Giữ .koharu_cache'}[/cyan]\n"
             f"Prompt: [dim]{(self.cfg.custom_prompt[:46] + '...') if len(self.cfg.custom_prompt) > 46 else (self.cfg.custom_prompt or 'không')}[/dim]"
         )
 
@@ -1509,6 +1511,24 @@ class KoharuTUI(App[None]):
                 self._log_ai(
                     "SFX: [bold yellow]DỊCH & TẨY[/bold yellow] — dịch và chèn chữ Tiếng Việt cả vào vùng SFX."
                 )
+        elif cmd == "/cache":
+            val = rest.strip().lower()
+            if val in {"clean", "auto", "on", "1", "true", "delete"}:
+                self.cfg.clean_cache = True
+            elif val in {"keep", "off", "0", "false"}:
+                self.cfg.clean_cache = False
+            else:
+                self.cfg.clean_cache = not self.cfg.clean_cache
+            save_config(self.cfg)
+            self._refresh_chrome()
+            if self.cfg.clean_cache:
+                self._log_ai(
+                    "Cache: [bold cyan]TỰ XÓA[/bold cyan] — tự xóa `.koharu_cache` ngay khi dịch/sáng tác xong 100%."
+                )
+            else:
+                self._log_ai(
+                    "Cache: [bold yellow]GIỮ LẠI[/bold yellow] — giữ `.koharu_cache` để `/rerender` hoặc chỉnh sửa thoại sau."
+                )
         elif cmd == "/gpu":
             val = rest.strip().lower()
             if val in {"on", "1", "true"}:
@@ -1968,6 +1988,7 @@ class KoharuTUI(App[None]):
                 skip_sfx=self.cfg.skip_sfx,
                 use_gpu=self.cfg.use_gpu,
                 resume=resume,
+                clean_cache=self.cfg.clean_cache,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
             )
@@ -2023,6 +2044,7 @@ class KoharuTUI(App[None]):
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
                 resume=resume,
+                clean_cache=self.cfg.clean_cache,
                 hooks=self._build_hooks(),
             )
             self.cfg.last_output_dir = str(out_dir)

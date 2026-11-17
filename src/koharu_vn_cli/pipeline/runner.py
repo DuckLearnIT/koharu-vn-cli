@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
 import time
 import zipfile
@@ -331,6 +332,38 @@ def expand_composed_boxes_if_tight(
     return resolve_box_overlaps(adjusted, img_w, img_h, gap=max(10, int(min_dim * 0.012)))
 
 
+def _cleanup_cache_dir(
+    cache_dir: Path,
+    *,
+    total: int,
+    completed_count: int,
+    clean_cache: bool,
+    hooks: PipelineHooks,
+    base_name: str,
+) -> None:
+    """Remove `.koharu_cache` once all pages succeeded 100%, keeping it when blocked/incomplete for `--resume`."""
+    if not clean_cache or not cache_dir.is_dir():
+        return
+    if completed_count >= total > 0:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        hooks.emit_step(
+            total,
+            total,
+            base_name,
+            "clean_cache",
+            "Đã hoàn tất 100% -> tự động xóa .koharu_cache cho gọn thư mục.",
+        )
+    else:
+        remaining = max(0, total - completed_count)
+        hooks.emit_step(
+            completed_count,
+            total,
+            base_name,
+            "keep_cache",
+            f"Giữ lại .koharu_cache vì còn {remaining} trang chưa xong (gõ /resume để chạy tiếp).",
+        )
+
+
 def resolve_story_text(story: str | None) -> str | None:
     """Resolve user `--story` argument as a .txt/.md file content if valid path, else plain text."""
     if not story:
@@ -461,6 +494,7 @@ def run_translate_pipeline(
     sequential_names: bool = False,
     skip_blocked: bool = True,
     resume: bool = False,
+    clean_cache: bool = True,
     model_cache: ModelCache | None = None,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
@@ -988,6 +1022,14 @@ def run_translate_pipeline(
 
         if save_cbz:
             package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
+        _cleanup_cache_dir(
+            cache_dir,
+            total=total,
+            completed_count=len(docs),
+            clean_cache=clean_cache,
+            hooks=hooks,
+            base_name=base_name,
+        )
         return out_dir, docs
 
 
@@ -1014,6 +1056,7 @@ def run_compose_pipeline(
     sequential_names: bool = False,
     skip_blocked: bool = True,
     resume: bool = False,
+    clean_cache: bool = True,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
     """Run Artist CG dialogue composition pipeline end-to-end."""
@@ -1224,6 +1267,14 @@ def run_compose_pipeline(
 
         if save_cbz:
             package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
+        _cleanup_cache_dir(
+            cache_dir,
+            total=total,
+            completed_count=len(docs),
+            clean_cache=clean_cache,
+            hooks=hooks,
+            base_name=base_name,
+        )
         return out_dir, docs
 
 
