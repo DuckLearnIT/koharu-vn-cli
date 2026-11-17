@@ -53,6 +53,8 @@ class AppConfig(BaseModel):
 
     api_key: str = ""
     api_keys: list[str] = Field(default_factory=list)
+    deepseek_api_key: str = ""
+    deepseek_api_keys: list[str] = Field(default_factory=list)
     base_url: Optional[str] = None
     model: str = DEFAULT_GEMINI_MODEL
     fallback_model: str = ""
@@ -96,14 +98,12 @@ class AppConfig(BaseModel):
         seen: set[str] = set()
         saved_keys = [*self.api_keys, *parse_api_keys(self.api_key)]
         if use_deepseek:
-            env_keys = [
+            sources = [
+                *self.deepseek_api_keys,
+                *parse_api_keys(self.deepseek_api_key),
                 *parse_api_keys(os.environ.get("DEEPSEEK_API_KEYS", "")),
                 *parse_api_keys(os.environ.get("DEEPSEEK_API_KEY", "")),
-                *parse_api_keys(os.environ.get("OPENAI_API_KEY", "")),
             ]
-            # Avoid sending saved Google AIza keys to DeepSeek when switching models.
-            saved_filtered = [k for k in saved_keys if not k.startswith("AIza")] if env_keys or saved_keys else saved_keys
-            sources = [*saved_filtered, *env_keys]
         else:
             sources = [
                 *saved_keys,
@@ -126,13 +126,16 @@ class AppConfig(BaseModel):
         keys = self.effective_api_keys(model=model, base_url=base_url)
         return keys[0] if keys else ""
 
-    def masked_api_key(self) -> str:
-        keys = self.effective_api_keys()
+    def masked_api_key(self, *, model: str | None = None, base_url: str | None = None) -> str:
+        keys = self.effective_api_keys(model=model, base_url=base_url)
         if not keys:
             return "Chưa đặt"
         key = keys[0]
         masked = "*" * len(key) if len(key) <= 10 else f"{key[:4]}...{key[-4:]}"
         return f"{masked} ({len(keys)} keys)" if len(keys) > 1 else masked
+
+    def masked_deepseek_key(self) -> str:
+        return self.masked_api_key(model="deepseek-chat", base_url="https://api.deepseek.com/v1")
 
 
 def load_config(path: Path = CONFIG_FILE) -> AppConfig:

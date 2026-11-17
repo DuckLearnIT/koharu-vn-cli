@@ -328,34 +328,47 @@ class PickerModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class KeySetupModal(ModalScreen[tuple[str, str] | None]):
-    """Input dialog supporting single or multiple rotating Gemini API keys and optional base URL."""
+class KeySetupModal(ModalScreen[tuple[str, str, str] | None]):
+    """Input dialog supporting independent Gemini/Proxy keys, DeepSeek keys, and optional base URL."""
 
     BINDINGS = [Binding("escape", "cancel", "Hủy")]
 
-    def __init__(self, current_key: str, current_base_url: str | None) -> None:
+    def __init__(
+        self,
+        current_key: str,
+        current_deepseek_key: str,
+        current_base_url: str | None,
+    ) -> None:
         super().__init__()
         self.current_key = current_key
+        self.current_deepseek_key = current_deepseek_key
         self.current_base_url = current_base_url or ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-card"):
-            yield Label("Cấu hình API Key & Endpoint (Gemini / DeepSeek / Proxy)", id="modal-title")
+            yield Label("Cấu hình API Key độc lập (Gemini / DeepSeek / Proxy)", id="modal-title")
             yield Label(
-                "Có thể nhập NHIỀU API key cách nhau bởi dấu phẩy (,) hoặc chấm phẩy (;) để tự động đổi key khi hết quota/lỗi.",
+                "2 ô nhập key hoàn toàn tách biệt — thêm DeepSeek không làm mất key & setup Gemini cũ. Hỗ trợ nhiều key cách nhau bởi dấu phẩy (,).",
                 id="modal-subtitle",
             )
-            yield Label("API Key (GEMINI_API_KEY hoặc DEEPSEEK_API_KEY):")
+            yield Label("1. GEMINI_API_KEY / Proxy Key (giữ nguyên setup cũ):")
             yield Input(
                 value=self.current_key,
                 password=False,
-                placeholder="AIzaSy... (Gemini) hoặc sk-... (DeepSeek / OpenRouter)",
+                placeholder="AIzaSyKey1..., AIzaSyKey2...",
                 id="key-input",
             )
-            yield Label("Base URL tùy chọn (để trống nếu dùng Gemini hoặc chọn model deepseek-*):")
+            yield Label("2. DEEPSEEK_API_KEY (độc lập, dùng cho model deepseek-chat / deepseek-reasoner):")
+            yield Input(
+                value=self.current_deepseek_key,
+                password=False,
+                placeholder="sk-...",
+                id="deepseek-key-input",
+            )
+            yield Label("Base URL tùy chọn (chỉ áp dụng cho Proxy / OpenAI-compatible, không ảnh hưởng DeepSeek):")
             yield Input(
                 value=self.current_base_url,
-                placeholder="https://api.deepseek.com/v1 | https://openrouter.ai/api/v1 | http://127.0.0.1:11434/v1",
+                placeholder="https://openrouter.ai/api/v1 | https://api.x.ai/v1 | http://127.0.0.1:11434/v1",
                 id="url-input",
             )
             with Horizontal(id="modal-actions"):
@@ -368,8 +381,9 @@ class KeySetupModal(ModalScreen[tuple[str, str] | None]):
     @on(Button.Pressed, "#save-btn")
     def _save(self) -> None:
         k = self.query_one("#key-input", Input).value.strip()
+        ds_k = self.query_one("#deepseek-key-input", Input).value.strip()
         u = self.query_one("#url-input", Input).value.strip()
-        self.dismiss((k, u))
+        self.dismiss((k, ds_k, u))
 
     @on(Button.Pressed, "#cancel-btn")
     def _cancel(self) -> None:
@@ -985,6 +999,7 @@ class KoharuTUI(App[None]):
             if is_deepseek_endpoint(self.cfg.base_url) or (not self.cfg.base_url and is_deepseek_model(self.cfg.model))
             else (self.cfg.base_url or "Gemini Official")
         )
+        ds_key_ok = bool(self.cfg.effective_api_keys(model="deepseek-chat"))
         sb_cfg = self.query_one("#sb-config", Static)
         sb_cfg.update(
             f"Model chính: [bold magenta]{self.cfg.story_model or f'chung ({self.cfg.model})'}[/bold magenta]\n"
@@ -992,7 +1007,8 @@ class KoharuTUI(App[None]):
             f"Model phụ: [bold white]{self.cfg.model}[/bold white]\n"
             f"Fallback phụ: [dim]{self.cfg.fallback_model or 'tắt'}[/dim]\n"
             f"Endpoint: [dim]{eff_endpoint_label}[/dim]\n"
-            f"Key: {key_badge}\n"
+            f"Key Gemini: {key_badge}\n"
+            f"Key DeepSeek: {'[green]● ' + self.cfg.masked_deepseek_key() + '[/green]' if ds_key_ok else '[dim]chưa đặt[/dim]'}\n"
             f"Ngôn ngữ: [cyan]{self.cfg.lang}[/cyan]\n"
             f"CG Style: [magenta]{self.cfg.compose_style.value}[/magenta]\n"
             f"Mật độ CG: [cyan]{self.cfg.density}[/cyan]\n"
@@ -1439,15 +1455,25 @@ class KoharuTUI(App[None]):
         elif cmd == "/key":
             if rest:
                 keys = parse_api_keys(rest)
-                self.cfg.api_keys = keys
-                self.cfg.api_key = keys[0] if keys else ""
-                save_config(self.cfg)
-                self._refresh_chrome()
-                self._log_ai(f"Đã lưu {len(keys)} API key ({self.cfg.masked_api_key()}).")
+                if keys and all(k.startswith("sk-") for k in keys):
+                    self.cfg.deepseek_api_keys = keys
+                    self.cfg.deepseek_api_key = keys[0]
+                    save_config(self.cfg)
+                    self._refresh_chrome()
+                    self._log_ai(
+                        f"Đã lưu {len(keys)} DeepSeek API key ({self.cfg.masked_deepseek_key()}) — key Gemini cũ vẫn giữ nguyên."
+                    )
+                else:
+                    self.cfg.api_keys = keys
+                    self.cfg.api_key = keys[0] if keys else ""
+                    save_config(self.cfg)
+                    self._refresh_chrome()
+                    self._log_ai(f"Đã lưu {len(keys)} Gemini/Proxy API key ({self.cfg.masked_api_key()}).")
             else:
                 saved_raw = ", ".join(self.cfg.api_keys) if self.cfg.api_keys else self.cfg.api_key
+                saved_ds = ", ".join(self.cfg.deepseek_api_keys) if self.cfg.deepseek_api_keys else self.cfg.deepseek_api_key
                 self.push_screen(
-                    KeySetupModal(saved_raw, self.cfg.base_url),
+                    KeySetupModal(saved_raw, saved_ds, self.cfg.base_url),
                     self._on_key_saved,
                 )
         elif cmd == "/prompt":
@@ -1844,10 +1870,6 @@ class KoharuTUI(App[None]):
 
     def _set_model(self, value: str) -> None:
         self.cfg.model = value
-        if is_deepseek_model(value) and not self.cfg.base_url:
-            self.cfg.base_url = DEEPSEEK_BASE_URL
-        elif not is_deepseek_model(value) and is_deepseek_endpoint(self.cfg.base_url):
-            self.cfg.base_url = None
         save_config(self.cfg)
         self._refresh_chrome()
         self._log_ai(f"Đã chuyển Model PHỤ sang: [bold cyan]{value}[/bold cyan]")
@@ -1900,21 +1922,23 @@ class KoharuTUI(App[None]):
         except Exception as exc:
             self._log_ai(f"Không áp dụng được theme '{value}': {exc}", style="red")
 
-    def _on_key_saved(self, result: tuple[str, str] | None) -> None:
+    def _on_key_saved(self, result: tuple[str, str, str] | None) -> None:
         if result is None:
             return
-        raw_keys, url = result
+        raw_keys, raw_ds_keys, url = result
         keys = parse_api_keys(raw_keys)
+        ds_keys = parse_api_keys(raw_ds_keys)
         self.cfg.api_keys = keys
         self.cfg.api_key = keys[0] if keys else ""
+        self.cfg.deepseek_api_keys = ds_keys
+        self.cfg.deepseek_api_key = ds_keys[0] if ds_keys else ""
         self.cfg.base_url = url or None
-        if is_deepseek_endpoint(self.cfg.base_url) and not is_deepseek_model(self.cfg.model):
-            self.cfg.model = "deepseek-chat"
-            self._log_ai("ℹ Phát hiện endpoint DeepSeek -> tự động chọn model [bold cyan]deepseek-chat[/bold cyan] (có thể đổi qua `/model`).")
         save_config(self.cfg)
         self._refresh_chrome()
         self._log_ai(
-            f"Đã lưu {len(keys)} API key vào [dim]{CONFIG_FILE}[/dim] (Key: {self.cfg.masked_api_key()})."
+            f"Đã lưu cấu hình vào [dim]{CONFIG_FILE}[/dim] "
+            f"(Gemini/Proxy: {self.cfg.masked_api_key(model='gemini-3.8-flash', base_url=self.cfg.base_url or '')} | "
+            f"DeepSeek: {self.cfg.masked_deepseek_key()})."
         )
 
     def _open_last_output(self) -> None:
@@ -1956,7 +1980,9 @@ class KoharuTUI(App[None]):
                 "Chưa có `GEMINI_API_KEY`! Mở hộp thoại `/key` để dán API key (hoặc base URL proxy) trước nhé.",
                 style="yellow",
             )
-            self.push_screen(KeySetupModal(self.cfg.api_key, self.cfg.base_url), self._on_key_saved)
+            saved_raw = ", ".join(self.cfg.api_keys) if self.cfg.api_keys else self.cfg.api_key
+            saved_ds = ", ".join(self.cfg.deepseek_api_keys) if self.cfg.deepseek_api_keys else self.cfg.deepseek_api_key
+            self.push_screen(KeySetupModal(saved_raw, saved_ds, self.cfg.base_url), self._on_key_saved)
             return False
         return True
 
