@@ -2328,6 +2328,8 @@ def test_deepseek_api_routing_payload_and_ocr_auto_mode(monkeypatch, tmp_path: P
     )
     assert cfg.effective_api_keys() == ["sk-saved-deepseek", "sk-fake-deepseek-1"]
     assert cfg.effective_api_keys(model="gemini-3.8-flash") == ["AIza-saved-gemini", "AIza-fake-gemini"]
+    assert cfg.masked_gemini_key().startswith("AIza")
+    assert cfg.masked_deepseek_key().startswith("sk-s")
     assert cfg.api_key == "AIza-saved-gemini"
     assert cfg.base_url == "https://my-proxy.example/v1"
 

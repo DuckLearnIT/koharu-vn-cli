@@ -585,9 +585,26 @@ class VisionLLMClient:
         self.api_keys: list[str] = []
         for k in raw_sources:
             k = k.strip()
-            if k and k not in seen:
-                seen.add(k)
-                self.api_keys.append(k)
+            if not k or k in seen:
+                continue
+            if use_deepseek_keys and k.startswith("AIza"):
+                continue
+            if not eff_base_url and k.startswith("sk-"):
+                continue
+            seen.add(k)
+            self.api_keys.append(k)
+
+        if not self.api_keys:
+            try:
+                from koharu_vn_cli.config import load_config
+
+                cfg_keys = load_config().effective_api_keys(model=model, base_url=eff_base_url)
+                for k in cfg_keys:
+                    if k and k not in seen:
+                        seen.add(k)
+                        self.api_keys.append(k)
+            except Exception:
+                pass
 
         self._key_idx = 0
         self.api_key = self.api_keys[0] if self.api_keys else ""

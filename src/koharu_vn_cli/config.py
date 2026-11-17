@@ -105,11 +105,12 @@ class AppConfig(BaseModel):
                 *parse_api_keys(os.environ.get("DEEPSEEK_API_KEY", "")),
             ]
         else:
+            gem_saved = [k for k in saved_keys if eff_url or not k.startswith("sk-")]
             sources = [
-                *saved_keys,
+                *gem_saved,
                 *parse_api_keys(os.environ.get("GEMINI_API_KEYS", "")),
                 *parse_api_keys(os.environ.get("GEMINI_API_KEY", "")),
-                *parse_api_keys(os.environ.get("OPENAI_API_KEY", "")),
+                *(parse_api_keys(os.environ.get("OPENAI_API_KEY", "")) if eff_url else []),
             ]
         for k in sources:
             if k and k not in seen:
@@ -134,6 +135,9 @@ class AppConfig(BaseModel):
         masked = "*" * len(key) if len(key) <= 10 else f"{key[:4]}...{key[-4:]}"
         return f"{masked} ({len(keys)} keys)" if len(keys) > 1 else masked
 
+    def masked_gemini_key(self) -> str:
+        return self.masked_api_key(model="gemini-3.8-flash", base_url=self.base_url or "")
+
     def masked_deepseek_key(self) -> str:
         return self.masked_api_key(model="deepseek-chat", base_url="https://api.deepseek.com/v1")
 
@@ -142,7 +146,18 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
     """Load saved config JSON from disk, falling back cleanly to defaults."""
     if path.is_file():
         try:
-            return AppConfig.model_validate_json(path.read_text(encoding="utf-8"))
+            cfg = AppConfig.model_validate_json(path.read_text(encoding="utf-8"))
+            if not cfg.base_url:
+                all_saved = [*cfg.api_keys, *parse_api_keys(cfg.api_key)]
+                sk_keys = [k for k in all_saved if k.startswith("sk-")]
+                non_sk = [k for k in all_saved if not k.startswith("sk-")]
+                if sk_keys:
+                    merged_ds = list(dict.fromkeys([*cfg.deepseek_api_keys, *parse_api_keys(cfg.deepseek_api_key), *sk_keys]))
+                    cfg.deepseek_api_keys = merged_ds
+                    cfg.deepseek_api_key = merged_ds[0] if merged_ds else ""
+                    cfg.api_keys = non_sk
+                    cfg.api_key = non_sk[0] if non_sk else ""
+            return cfg
         except Exception:
             pass
     return AppConfig()

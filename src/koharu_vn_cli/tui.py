@@ -999,7 +999,14 @@ class KoharuTUI(App[None]):
             if is_deepseek_endpoint(self.cfg.base_url) or (not self.cfg.base_url and is_deepseek_model(self.cfg.model))
             else (self.cfg.base_url or "Gemini Official")
         )
+        gem_keys = self.cfg.effective_api_keys(model="gemini-3.8-flash", base_url=self.cfg.base_url or "")
+        gem_badge = (
+            f"[green]● {self.cfg.masked_gemini_key()}[/green]"
+            if gem_keys
+            else ("[cyan]● Proxy[/cyan]" if self.cfg.base_url else "[dim]chưa đặt[/dim]")
+        )
         ds_key_ok = bool(self.cfg.effective_api_keys(model="deepseek-chat"))
+        ds_badge = f"[green]● {self.cfg.masked_deepseek_key()}[/green]" if ds_key_ok else "[dim]chưa đặt[/dim]"
         sb_cfg = self.query_one("#sb-config", Static)
         sb_cfg.update(
             f"Model chính: [bold magenta]{self.cfg.story_model or f'chung ({self.cfg.model})'}[/bold magenta]\n"
@@ -1007,8 +1014,8 @@ class KoharuTUI(App[None]):
             f"Model phụ: [bold white]{self.cfg.model}[/bold white]\n"
             f"Fallback phụ: [dim]{self.cfg.fallback_model or 'tắt'}[/dim]\n"
             f"Endpoint: [dim]{eff_endpoint_label}[/dim]\n"
-            f"Key Gemini: {key_badge}\n"
-            f"Key DeepSeek: {'[green]● ' + self.cfg.masked_deepseek_key() + '[/green]' if ds_key_ok else '[dim]chưa đặt[/dim]'}\n"
+            f"Key Gemini: {gem_badge}\n"
+            f"Key DeepSeek: {ds_badge}\n"
             f"Ngôn ngữ: [cyan]{self.cfg.lang}[/cyan]\n"
             f"CG Style: [magenta]{self.cfg.compose_style.value}[/magenta]\n"
             f"Mật độ CG: [cyan]{self.cfg.density}[/cyan]\n"
