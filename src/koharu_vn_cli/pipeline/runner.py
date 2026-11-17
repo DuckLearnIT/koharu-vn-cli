@@ -492,6 +492,7 @@ def run_translate_pipeline(
             "init",
             f"Kiểm tra API & ONNX (Chính: {eff_story_model}{fb_s_tag} -> Phụ ({mode_tag}): {model}{fb_m_tag})...",
         )
+        STORY_MODEL_TIMEOUT = 180.0
         llm = VisionLLMClient(
             api_key=api_key,
             api_keys=api_keys,
@@ -500,16 +501,13 @@ def run_translate_pipeline(
             base_url=base_url,
             on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
-        story_llm = (
-            llm
-            if eff_story_model == model and not eff_fallback
-            else VisionLLMClient(
-                api_key=api_key,
-                api_keys=api_keys,
-                model=eff_story_model,
-                base_url=base_url,
-                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
-            )
+        story_llm = VisionLLMClient(
+            api_key=api_key,
+            api_keys=api_keys,
+            model=eff_story_model,
+            base_url=base_url,
+            timeout=STORY_MODEL_TIMEOUT,
+            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
         story_fallback_llm = (
             VisionLLMClient(
@@ -517,6 +515,7 @@ def run_translate_pipeline(
                 api_keys=api_keys,
                 model=eff_story_fallback,
                 base_url=base_url,
+                timeout=STORY_MODEL_TIMEOUT,
                 on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
             )
             if eff_story_fallback and eff_story_fallback != eff_story_model
@@ -810,11 +809,16 @@ def run_translate_pipeline(
                                 translated_items, summary = llm.translate_page_from_ocr(**ocr_kw)
                                 fallback_done = True
                             except ContentBlockedError as inner_exc:
+                                exc = inner_exc
                                 if story_llm.model != llm.model:
-                                    translated_items, summary = story_llm.translate_page_from_ocr(**ocr_kw)
+                                    try:
+                                        translated_items, summary = story_llm.translate_page_from_ocr(**ocr_kw)
+                                        fallback_done = True
+                                    except ContentBlockedError as s_exc:
+                                        exc = s_exc
+                                if not fallback_done and story_fallback_llm is not None:
+                                    translated_items, summary = story_fallback_llm.translate_page_from_ocr(**ocr_kw)
                                     fallback_done = True
-                                else:
-                                    exc = inner_exc
                         except ContentBlockedError as ocr_exc:
                             exc = ocr_exc
                     if not fallback_done:
@@ -1038,6 +1042,7 @@ def run_compose_pipeline(
             "init",
             f"Khởi tạo sáng tác CG ({style.value} | Chính: {eff_story_model}{fb_s_tag} -> Phụ: {model}{fb_m_tag})...",
         )
+        STORY_MODEL_TIMEOUT = 180.0
         llm = VisionLLMClient(
             api_key=api_key,
             api_keys=api_keys,
@@ -1046,16 +1051,13 @@ def run_compose_pipeline(
             base_url=base_url,
             on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
-        story_llm = (
-            llm
-            if eff_story_model == model and not eff_fallback
-            else VisionLLMClient(
-                api_key=api_key,
-                api_keys=api_keys,
-                model=eff_story_model,
-                base_url=base_url,
-                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
-            )
+        story_llm = VisionLLMClient(
+            api_key=api_key,
+            api_keys=api_keys,
+            model=eff_story_model,
+            base_url=base_url,
+            timeout=STORY_MODEL_TIMEOUT,
+            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
         story_fallback_llm = (
             VisionLLMClient(
@@ -1063,6 +1065,7 @@ def run_compose_pipeline(
                 api_keys=api_keys,
                 model=eff_story_fallback,
                 base_url=base_url,
+                timeout=STORY_MODEL_TIMEOUT,
                 on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
             )
             if eff_story_fallback and eff_story_fallback != eff_story_model

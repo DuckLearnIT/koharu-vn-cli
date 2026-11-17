@@ -1174,8 +1174,14 @@ class VisionLLMClient:
             if match:
                 copy.source_text = str(match.get("source_text", fallback_src)).strip() or fallback_src
                 raw_is_sfx = _parse_bool_flag(match.get("is_sfx"))
-                # Protect long spoken dialogue inside speech bubbles from accidental SFX mis-tagging
-                if raw_is_sfx and (copy.kind != "bubble" or len(normalize_source_key(copy.source_text)) <= 8):
+                norm_src = normalize_source_key(copy.source_text)
+                bubble_has_spoken = bool(re.search(r"[\u3040-\u309f\uac00-\ud7af]", norm_src))
+                # Protect spoken dialogue inside speech bubbles from accidental SFX mis-tagging
+                if raw_is_sfx and (
+                    copy.kind != "bubble"
+                    or (not bubble_has_spoken and len(norm_src) <= 8)
+                    or looks_like_floating_sfx(copy.source_text)
+                ):
                     copy.is_sfx = True
                 elif copy.kind == "floating" and looks_like_floating_sfx(copy.source_text):
                     copy.is_sfx = True

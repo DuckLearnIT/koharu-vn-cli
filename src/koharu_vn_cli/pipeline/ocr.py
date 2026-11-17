@@ -51,10 +51,27 @@ class MangaOcrONNX:
             enc, dec, voc = _ensure_manga_ocr_files()
 
         threads = max(1, min(4, os.cpu_count() or 2))
+        self._enc_path = enc
+        self._dec_path = dec
+        self._cpu_threads = threads
         self.encoder = _create_ort_session(enc, use_gpu=use_gpu, cpu_threads=threads, low_mem=True)
         self.decoder = _create_ort_session(dec, use_gpu=use_gpu, cpu_threads=threads, low_mem=True)
         self.vocab = voc.read_text(encoding="utf-8").splitlines()
         self.max_length = max(16, max_length)
+
+    def _downgrade_to_cpu(self) -> bool:
+        if (
+            self.encoder.get_providers() == ["CPUExecutionProvider"]
+            and self.decoder.get_providers() == ["CPUExecutionProvider"]
+        ):
+            return False
+        self.encoder = _create_ort_session(
+            self._enc_path, use_gpu=False, cpu_threads=self._cpu_threads, low_mem=True
+        )
+        self.decoder = _create_ort_session(
+            self._dec_path, use_gpu=False, cpu_threads=self._cpu_threads, low_mem=True
+        )
+        return True
 
     @staticmethod
     def _preprocess(img: Image.Image) -> np.ndarray:
@@ -78,20 +95,36 @@ class MangaOcrONNX:
         """Run ViT-BERT autoregressive decoding on a single cropped text box."""
         pil = Image.fromarray(img) if isinstance(img, np.ndarray) else img
         pixel_values = self._preprocess(pil)
-        enc_hidden = self.encoder.run(None, {"pixel_values": pixel_values})[0]
-
-        ids: list[int] = [_CLS_ID]
-        for _ in range(self.max_length):
-            inp = np.asarray([ids], dtype=np.int64)
-            logits = self.decoder.run(
-                None,
-                {"input_ids": inp, "encoder_hidden_states": enc_hidden},
-            )[0]
-            next_id = int(np.argmax(logits[0, -1]))
-            ids.append(next_id)
-            if next_id == _SEP_ID:
-                break
-        return self._decode_ids(ids)
+        try:
+            enc_hidden = self.encoder.run(None, {"pixel_values": pixel_values})[0]
+            ids: list[int] = [_CLS_ID]
+            for _ in range(self.max_length):
+                inp = np.asarray([ids], dtype=np.int64)
+                logits = self.decoder.run(
+                    None,
+                    {"input_ids": inp, "encoder_hidden_states": enc_hidden},
+                )[0]
+                next_id = int(np.argmax(logits[0, -1]))
+                ids.append(next_id)
+                if next_id == _SEP_ID:
+                    break
+            return self._decode_ids(ids)
+        except Exception:
+            if not self._downgrade_to_cpu():
+                raise
+            enc_hidden = self.encoder.run(None, {"pixel_values": pixel_values})[0]
+            ids = [_CLS_ID]
+            for _ in range(self.max_length):
+                inp = np.asarray([ids], dtype=np.int64)
+                logits = self.decoder.run(
+                    None,
+                    {"input_ids": inp, "encoder_hidden_states": enc_hidden},
+                )[0]
+                next_id = int(np.argmax(logits[0, -1]))
+                ids.append(next_id)
+                if next_id == _SEP_ID:
+                    break
+            return self._decode_ids(ids)
 
     def recognize_regions(self, rgb: np.ndarray, regions: list[TextRegionItem]) -> dict[int, str]:
         """Crop each detected text region from `rgb` and return `{region_id: source_text}`."""

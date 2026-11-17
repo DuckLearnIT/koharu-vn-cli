@@ -1876,4 +1876,93 @@ def test_skip_sfx_prevents_translation_and_inpainting(
     assert app_tui.cfg.skip_sfx is True
 
 
+def test_story_timeout_180_and_ocr_fallback_inpaints_and_renders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from koharu_vn_cli.models import StoryBible
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError, VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    orig = np.full((240, 240, 3), 255, dtype=np.uint8)
+    # Paint dark Japanese glyph strokes inside the speech bubble (40:110, 40:140)
+    orig[55:95, 55:125] = (15, 15, 15)
+    Image.fromarray(orig).save(in_dir / "p1.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            mask[55:95, 55:125] = 255
+            return [DetectedRegion((40, 40, 140, 110), (30, 30, 150, 120), None, True, False, 0.95)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            out = rgb.copy()
+            out[mask > 127] = (255, 255, 255)
+            return out
+
+    class FakeOcr:
+        def recognize_regions(self, rgb, regions):
+            return {r.id: "やめて…" for r in regions}
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            return FakeOcr()
+
+    seen_timeouts: dict[str, float] = {}
+
+    def fake_story(self, images, **kwargs):
+        seen_timeouts[self.model] = self.timeout
+        return StoryBible(title="Test", full_plot_summary="OK")
+
+    def blocked_vision(self, *args, **kwargs):
+        raise ContentBlockedError("PROHIBITED_CONTENT")
+
+    def fake_ocr_call(self, system_prompt, user_prompt, **kwargs):
+        if self.model != "story-fb-ok":
+            raise ContentBlockedError("TEXT_BLOCKED")
+        # Even if OCR LLM mis-flags a spoken hiragana bubble as is_sfx=True, safeguard keeps it
+        return {
+            "page_summary": "Cảnh fallback",
+            "items": [{"id": 1, "source_text": "やめて…", "vietnamese": "Dừng lại đi…", "is_sfx": True}],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "build_story_bible", fake_story)
+    monkeypatch.setattr(VisionLLMClient, "translate_page", blocked_vision)
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_ocr_call)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out",
+        api_key="dummy",
+        model="fast-worker",
+        story_model="main-story",
+        story_fallback_model="story-fb-ok",
+        story_pass=True,
+        vision_translate=True,
+        output_format="png",
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+
+    assert seen_timeouts["main-story"] == 180.0
+    assert docs[0].regions[0].translated_text == "Dừng lại đi…"
+    assert docs[0].regions[0].is_sfx is False
+
+    clean_arr = np.array(Image.open(docs[0].cleaned_image_path).convert("RGB"))
+    out_arr = np.array(Image.open(out_dir / "p1.png").convert("RGB"))
+    # Verify actual pixel inpainting erased original black strokes AND typesetter rendered Vietnamese pixels
+    assert not np.array_equal(clean_arr[55:95, 55:125], orig[55:95, 55:125])
+    assert not np.array_equal(out_arr[40:110, 40:140], clean_arr[40:110, 40:140])
+    assert int(np.min(out_arr[40:110, 40:140])) < 100
+
+
+
 
