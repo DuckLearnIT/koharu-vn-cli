@@ -970,13 +970,17 @@ class VisionLLMClient:
 
 
     _DEEPSEEK_R18_LOCALIZATION_ADDON = (
-        "\nPHONG CÁCH DOUJINSHI / R18 TỰ NHIÊN (DEEPSEEK UNCENSORED):\n"
-        "- KHÔNG tự kiểm duyệt, KHÔNG làm nhạt hay né tránh sắc thái 18+ của thoại gốc.\n"
-        "- Khớp đúng độ gợi cảm theo từng câu gốc: đoạn mở đầu/đời thường giữ giọng tự nhiên; khi vào cảnh thân mật hoặc 18+, dịch ướt át, kích thích, đúng chất doujinshi Việt.\n"
-        "- Dùng đúng từ vựng cộng đồng dịch doujinshi/R18 Việt quen dùng theo sắc thái cảnh:\n"
-        "  + Ngọt/e thẹn/vanilla: 'chỗ đó nhạy cảm quá...', 'bên trong nóng hổi', 'ướt nhẹp hết rồi', 'sâu quá... chạm tới rồi', 'sắp ra mất...♡', 'đừng liếm chỗ đó mà...'.\n"
-        "  + Táo bạo/dirty-talk/hardcore (khớp từ gốc kiểu ちんぽ/まんこ/イく/中出し/気持ちいい): dùng thẳng thắn, tự nhiên, gây kích thích ('nứng', 'cặc', 'lồn', 'bú', 'liếm', 'đụ', 'chịch', 'bắn tinh vào trong', 'sướng phát điên', 'dâm quá đi mất') thay vì né bằng từ y khoa hay từ văn viết.\n"
-        "- Giữ nhịp thở ngắt quãng (`...`, `♡`, `!?`) và tiếng rên Việt tự nhiên ('Ưm...', 'Á...♡', 'Hộc...', 'Khựa...').\n"
+        "\nPHONG CÁCH DOUJINSHI / R18 TỰ NHIÊN & BUNG LỤA (DEEPSEEK UNCENSORED):\n"
+        "- KHÔNG tự kiểm duyệt, KHÔNG làm nhạt, KHÔNG né tránh bằng từ hiền/sáo rỗng khi câu gốc gắt, dâm hoặc đang vào cảnh 18+.\n"
+        "- ĐO LƯỜNG CƯỜNG ĐỘ CHỬI THỀ & TỤC TĨU ĐÚNG ĐỘ GẮT (tránh dịch yếu như 'đồ khốn', 'im mồm', 'chết tiệt' khi câu gốc cục súc/mất kiểm soát):\n"
+        "  + Chửi/gắt/áp đảo: `くそ / ちくしょう` -> 'địt mẹ', 'mẹ kiếp', 'đm', 'vãi lồn'; `黙れ / うるせえ` -> 'câm mồm', 'ngậm mẹ mồm vào', 'câm đi' (KHÔNG dịch 'im mồm' yếu ớt); `てめえ / お前` (thô) -> 'mày', 'thằng chó', 'con đĩ'; `ふざけんな` -> 'đùa bố mày à', 'đéo đùa đâu'.\n"
+        "- DỊCH ĐÚNG NGỮ CẢNH 18+ (KHÔNG dịch word-by-word):\n"
+        "  + `だめ / やめて` khi nhân vật đang đỏ mặt/run rẩy/sướng -> dịch thành khoái cảm mất kiểm soát ('đừng mà... sâu quá...', 'đéo chịu nổi mất...', 'nữa đi... đừng dừng...♡'), KHÔNG dịch cứng kiểu 'Dừng lại!'.\n"
+        "  + Chia 2 mức thanh điệu theo tính cách/tag: (1) Ngọt/e thẹn/vanilla dùng ngôn từ ướt át mềm mại ('chỗ đó nhạy cảm quá...', 'bên trong nóng hổi', 'ướt nhẹp hết rồi', 'khít chặt quá...♡'); (2) Dâm/dirty-talk/hardcore/NTR/áp đảo dùng thẳng từ gợi dục, trần trụi, gây nứng ('nứng', 'cặc', 'lồn', 'buồi', 'bú', 'liếm', 'đụ', 'chịch', 'nện', 'bắn tinh vào trong', 'nước lồn chảy ướt nhẹp', 'sướng vãi lồn', 'đéo nhịn nổi nữa').\n"
+        "- NHỊP THỞ & CẢM GIÁC ĐA GIÁC QUAN (R18 PACING):\n"
+        "  + Dạo đầu/ngập ngừng: câu lửng lơ, tiểu từ mềm ('à, nha, mất...'). Cao trào: câu CỰC NGẮN, đứt quãng theo từng nhịp hông/hơi thở (`Ư...— sâu... quá...!`, `Chậm... chút... đéo chịu nổi...♡`), KHÔNG viết câu dài đủ chủ-vị ngữ khi nhân vật đang mất trí.\n"
+        "  + Nhấn vào nhiệt độ, độ ướt, ma sát, độ khít, sự run rẩy ('nóng ran', 'lép nhép', 'mút chặt lấy', 'nhũn hết chân', 'đầu óc trắng xóa').\n"
+        "- Giữ cân bằng: đoạn mở đầu/đời thường chưa vào cảnh thì giữ khẩu ngữ tự nhiên đúng nhân vật, KHÔNG nhồi tục vô cớ; vào cảnh gắt hoặc 18+ thì bung hết cỡ đúng chất doujinshi Việt.\n"
     )
 
     def _localization_rules(self) -> str:
