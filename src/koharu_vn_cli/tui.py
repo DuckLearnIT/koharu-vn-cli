@@ -1721,21 +1721,26 @@ class KoharuTUI(App[None]):
             self._set_style,
         )
 
+    def _has_any_api_for_models(self) -> bool:
+        gem_keys = self.cfg.effective_api_keys(model="gemini-3.8-flash", base_url=self.cfg.base_url or "")
+        ds_keys = self.cfg.effective_api_keys(model="deepseek-chat", base_url=DEEPSEEK_BASE_URL)
+        return bool(gem_keys or ds_keys or self.cfg.base_url)
+
     def action_choose_model(self) -> None:
-        if self.cfg.effective_api_key() or self.cfg.base_url:
-            self._log_ai("Đang truy vấn API lấy danh sách model mới nhất...", "dim")
+        if self._has_any_api_for_models():
+            self._log_ai("Đang truy vấn API lấy danh sách model mới nhất (Gemini / DeepSeek)...", "dim")
             self._fetch_remote_models_and_pick("model")
             return
         self._open_picker(
             "Chọn Model PHỤ (dịch & sáng tác thoại nhanh)",
-            "Gõ /key để kết nối API và tự động cập nhật model mới từ Google",
+            "Gõ /key để kết nối API và tự động cập nhật model mới từ Google / DeepSeek",
             MODEL_CHOICES,
             self.cfg.model,
             self._set_model,
         )
 
     def _choose_story_model(self) -> None:
-        if self.cfg.effective_api_key() or self.cfg.base_url:
+        if self._has_any_api_for_models():
             self._log_ai("Đang truy vấn API lấy danh sách model cho Model CHÍNH (Pass 1)...", "dim")
             self._fetch_remote_models_and_pick("story_model")
             return
@@ -1749,7 +1754,7 @@ class KoharuTUI(App[None]):
         )
 
     def _choose_fallback_model(self) -> None:
-        if self.cfg.effective_api_key() or self.cfg.base_url:
+        if self._has_any_api_for_models():
             self._log_ai("Đang truy vấn API lấy danh sách model fallback cho Model PHỤ...", "dim")
             self._fetch_remote_models_and_pick("fallback_model")
             return
@@ -1763,7 +1768,7 @@ class KoharuTUI(App[None]):
         )
 
     def _choose_story_fallback_model(self) -> None:
-        if self.cfg.effective_api_key() or self.cfg.base_url:
+        if self._has_any_api_for_models():
             self._log_ai("Đang truy vấn API lấy danh sách model fallback cho Model CHÍNH...", "dim")
             self._fetch_remote_models_and_pick("story_fallback_model")
             return
@@ -1779,21 +1784,56 @@ class KoharuTUI(App[None]):
     @work(thread=True)
     def _fetch_remote_models_and_pick(self, target: str = "model") -> None:
         choices = list(MODEL_CHOICES)
-        sub = "Danh sách mặc định (không lấy được danh sách online)"
-        try:
-            client = VisionLLMClient(
-                api_key=self.cfg.effective_api_key() or None,
-                api_keys=self.cfg.effective_api_keys(),
-                model=self.cfg.model,
-                base_url=self.cfg.base_url,
-            )
-            remote = client.list_available_models(limit=25)
-            if remote:
-                seen = {m[0] for m in remote}
-                choices = remote + [c for c in MODEL_CHOICES if c[0] not in seen]
-                sub = f"Đã đồng bộ trực tiếp {len(remote)} model mới nhất từ API"
-        except Exception as exc:
-            sub = f"Fallback mặc định (lỗi truy vấn API: {str(exc)[:60]})"
+        remote_all: list[tuple[str, str]] = []
+        sources_ok: list[str] = []
+        errors: list[str] = []
+
+        gem_keys = self.cfg.effective_api_keys(model="gemini-3.8-flash", base_url=self.cfg.base_url or "")
+        if gem_keys or self.cfg.base_url:
+            try:
+                gem_client = VisionLLMClient(
+                    api_key=gem_keys[0] if gem_keys else None,
+                    api_keys=gem_keys,
+                    model="gemini-3.8-flash",
+                    base_url=self.cfg.base_url,
+                )
+                gem_remote = gem_client.list_available_models(limit=25)
+                if gem_remote:
+                    remote_all.extend(gem_remote)
+                    sources_ok.append(f"{len(gem_remote)} Gemini/Proxy")
+            except Exception as exc:
+                errors.append(f"Gemini: {str(exc)[:45]}")
+
+        ds_keys = self.cfg.effective_api_keys(model="deepseek-chat", base_url=DEEPSEEK_BASE_URL)
+        if ds_keys:
+            try:
+                ds_client = VisionLLMClient(
+                    api_key=ds_keys[0],
+                    api_keys=ds_keys,
+                    model="deepseek-chat",
+                    base_url=DEEPSEEK_BASE_URL,
+                )
+                ds_remote = ds_client.list_available_models(limit=25)
+                if ds_remote:
+                    remote_all.extend(ds_remote)
+                    sources_ok.append(f"{len(ds_remote)} DeepSeek")
+            except Exception as exc:
+                errors.append(f"DeepSeek: {str(exc)[:45]}")
+
+        if remote_all:
+            deduped: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for mid, desc in remote_all:
+                if mid not in seen:
+                    seen.add(mid)
+                    deduped.append((mid, desc))
+            choices = deduped + [c for c in MODEL_CHOICES if c[0] not in seen]
+            err_note = f" (lỗi {', '.join(errors)})" if errors else ""
+            sub = f"Đã đồng bộ trực tiếp {' + '.join(sources_ok)} model mới nhất từ API{err_note}"
+        elif errors:
+            sub = f"Fallback mặc định (lỗi truy vấn API: {'; '.join(errors)[:65]})"
+        else:
+            sub = "Danh sách mặc định (không lấy được danh sách online)"
 
         if target == "story_model":
             choices = [("__same__", "Dùng chung với Model phụ (1 model)")] + choices

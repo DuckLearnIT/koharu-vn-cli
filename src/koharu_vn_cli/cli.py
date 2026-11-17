@@ -486,7 +486,9 @@ def models(
     ModelCache().warmup_all(accurate=accurate)
 
     cfg = load_config()
-    eff_key = api_key or cfg.effective_api_key() or None
+    gem_keys = ([api_key] if api_key else []) or cfg.effective_api_keys(model="gemini-3.8-flash", base_url=base_url or cfg.base_url or "")
+    ds_keys = cfg.effective_api_keys(model="deepseek-chat", base_url=DEEPSEEK_BASE_URL)
+    eff_key = gem_keys[0] if gem_keys else None
     eff_url = base_url or cfg.base_url
 
     table = Table(title="Tài nguyên Koharu-VN CLI đã sẵn sàng")
@@ -498,27 +500,42 @@ def models(
     table.add_row("Font Tiếng Việt", ", ".join(available_fonts()))
     table.add_row(
         "GEMINI_API_KEY",
-        f"Đã thiết lập ({cfg.masked_api_key()})"
+        f"Đã thiết lập ({cfg.masked_api_key(model='gemini-3.8-flash', base_url=eff_url or '')})"
         if eff_key
         else "Chưa đặt (chạy `koharu-vn` -> `/key` hoặc đặt env GEMINI_API_KEY)",
+    )
+    table.add_row(
+        "DEEPSEEK_API_KEY",
+        f"Đã thiết lập ({cfg.masked_deepseek_key()})"
+        if ds_keys
+        else "Chưa đặt (chạy `koharu-vn` -> `/key` hoặc đặt env DEEPSEEK_API_KEY)",
     )
     console.print(table)
 
     if remote:
-        if not eff_key and not eff_url:
-            console.print("[yellow]Cần có GEMINI_API_KEY hoặc --base-url để lấy danh sách model từ API.[/yellow]")
+        if not eff_key and not ds_keys and not eff_url:
+            console.print("[yellow]Cần có GEMINI_API_KEY, DEEPSEEK_API_KEY hoặc --base-url để lấy danh sách model từ API.[/yellow]")
             return
-        try:
-            client = VisionLLMClient(api_key=eff_key, base_url=eff_url)
-            remote_models = client.list_available_models(limit=20)
-            mt = Table(title="Model Gemini / Vision mới nhất từ API")
+        remote_models: list[tuple[str, str]] = []
+        if eff_key or eff_url:
+            try:
+                client = VisionLLMClient(api_key=eff_key, model="gemini-3.8-flash", base_url=eff_url)
+                remote_models.extend(client.list_available_models(limit=20))
+            except Exception as exc:
+                console.print(f"[yellow]Không lấy được model Gemini/Proxy: {exc}[/yellow]")
+        if ds_keys:
+            try:
+                ds_client = VisionLLMClient(api_key=ds_keys[0], model="deepseek-chat", base_url=DEEPSEEK_BASE_URL)
+                remote_models.extend(ds_client.list_available_models(limit=20))
+            except Exception as exc:
+                console.print(f"[yellow]Không lấy được model DeepSeek: {exc}[/yellow]")
+        if remote_models:
+            mt = Table(title="Model Gemini / DeepSeek mới nhất từ API")
             mt.add_column("Model ID", style="bold cyan")
             mt.add_column("Mô tả", style="white")
             for mid, desc in remote_models:
                 mt.add_row(mid, desc)
             console.print(mt)
-        except Exception as exc:
-            console.print(f"[red]Không lấy được danh sách model từ API: {exc}[/red]")
 
 
 _SUBCOMMANDS = {"translate", "compose", "rerender", "rename", "models", "ui"}
