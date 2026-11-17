@@ -103,6 +103,7 @@ def translate(
     seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
     review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi dịch."),
     vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Pass 2 dùng Vision gửi ảnh (mặc định) hoặc --no-vision để OCR cục bộ + model con dịch text-only."),
+    skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
 ) -> None:
@@ -112,6 +113,7 @@ def translate(
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
     eff_vision = cfg.vision_translate if vision is None else vision
+    eff_skip_sfx = cfg.skip_sfx if skip_sfx is None else skip_sfx
     eff_gpu = cfg.use_gpu if gpu is None else gpu
     with Progress(
         SpinnerColumn(),
@@ -158,6 +160,7 @@ def translate(
                 output_format=eff_format,
                 sequential_names=eff_seq,
                 vision_translate=eff_vision,
+                skip_sfx=eff_skip_sfx,
                 use_gpu=eff_gpu,
                 resume=resume,
                 hooks=PipelineHooks(

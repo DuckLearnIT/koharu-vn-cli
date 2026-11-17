@@ -1742,3 +1742,138 @@ def test_worker_model_quota_exhausted_switches_to_fallback_and_tui_cmds(
     assert app_tui.cfg.fallback_model == ""
 
 
+def test_skip_sfx_prevents_translation_and_inpainting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from koharu_vn_cli.config import AppConfig
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import (
+        VisionLLMClient,
+        looks_like_floating_sfx,
+        region_needs_translation,
+    )
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+    from koharu_vn_cli.tui import KoharuTUI
+
+    # Floating spoken moans must NOT be mistaken for SFX; pure SFX glyphs should
+    assert looks_like_floating_sfx("あっ…ぐっ！！") is False
+    assert looks_like_floating_sfx("ドキッ") is True
+    assert looks_like_floating_sfx("ズチュッ") is True
+
+    in_dir = tmp_path / "sfx_manga"
+    in_dir.mkdir()
+    img = np.full((320, 300, 3), 245, dtype=np.uint8)
+    # Paint distinctive magenta SFX artwork inside (180, 180, 260, 250)
+    img[195:235, 195:245] = (230, 30, 150)
+    Image.fromarray(img).save(in_dir / "p1.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            mask[40:80, 40:110] = 255  # bubble text glyphs
+            mask[195:235, 195:245] = 255  # SFX glyphs
+            regs = [
+                DetectedRegion((35, 35, 115, 95), (25, 25, 125, 110), None, True, False, 0.95),
+                DetectedRegion((180, 180, 260, 250), None, None, False, False, 0.92),
+            ]
+            return regs, mask
+
+    seen_masks: list[np.ndarray] = []
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            seen_masks.append(mask.copy())
+            out = rgb.copy()
+            out[mask > 0] = (255, 255, 255)
+            return out
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            class FakeOcr:
+                def recognize_regions(self, rgb, regions):
+                    return {1: "気持ちいい", 2: "ドキッ"}
+
+            return FakeOcr()
+
+    def fake_vision_call(self, system_prompt, user_prompt, **kwargs):
+        return {
+            "detected_language": "ja",
+            "page_summary": "Cảnh thử nghiệm",
+            "items": [
+                {"id": 1, "source_text": "気持ちいい", "vietnamese": "Sướng quá!", "is_sfx": False},
+                {"id": 2, "source_text": "ドキッ", "vietnamese": "THỊCH", "is_sfx": True},
+            ],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_vision_call)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out_vision",
+        api_key="dummy",
+        story_pass=False,
+        vision_translate=True,
+        skip_sfx=True,
+        output_format="png",
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(seen_masks) == 1
+    # Region 1 (bubble) WAS masked for inpainting; Region 2 (SFX) had ZERO inpaint pixels
+    assert np.count_nonzero(seen_masks[0][35:95, 35:115]) > 0
+    assert np.count_nonzero(seen_masks[0][180:250, 180:260]) == 0
+    assert docs[0].regions[0].translated_text == "Sướng quá!"
+    assert docs[0].regions[1].is_sfx is True
+    assert docs[0].regions[1].translated_text == ""
+    assert not region_needs_translation(docs[0].regions[1])
+
+    # Rendered output keeps the exact original SFX artwork pixels untouched!
+    rendered = np.array(Image.open(out_dir / "p1.png").convert("RGB"))
+    assert np.array_equal(rendered[195:235, 195:245], img[195:235, 195:245])
+
+    # No-Vision OCR mode also skips SFX & preserves SFX artwork
+    seen_masks.clear()
+
+    def fake_ocr_call(self, system_prompt, user_prompt, **kwargs):
+        return {
+            "detected_language": "ja",
+            "page_summary": "Cảnh OCR",
+            "items": [{"id": 1, "source_text": "気持ちいい", "vietnamese": "Sướng quá!", "is_sfx": False}],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_ocr_call)
+    out_novis, docs_novis = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out_novision",
+        api_key="dummy",
+        story_pass=False,
+        vision_translate=False,
+        skip_sfx=True,
+        output_format="png",
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(seen_masks) == 1
+    assert np.count_nonzero(seen_masks[0][180:250, 180:260]) == 0
+    assert docs_novis[0].regions[1].is_sfx is True
+    assert docs_novis[0].regions[1].translated_text == ""
+    rendered_nv = np.array(Image.open(out_novis / "p1.png").convert("RGB"))
+    assert np.array_equal(rendered_nv[195:235, 195:245], img[195:235, 195:245])
+
+    # TUI `/sfx` command
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda cfg: None)
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: AppConfig(skip_sfx=True))
+    app_tui = KoharuTUI()
+    app_tui._log_user = lambda _msg: None  # type: ignore[method-assign]
+    app_tui._log_ai = lambda _msg, style="": None  # type: ignore[method-assign]
+    app_tui._handle_submission("/sfx translate")
+    assert app_tui.cfg.skip_sfx is False
+    app_tui._handle_submission("/sfx skip")
+    assert app_tui.cfg.skip_sfx is True
+
+
+

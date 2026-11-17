@@ -11,16 +11,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+import cv2
 import numpy as np
 from PIL import Image
 
 from koharu_vn_cli.models import ComposePreset, PageDocument, StoryBible, TextRegionItem
 from koharu_vn_cli.pipeline.bubble_renderer import render_bubbles, resolve_box_overlaps
-from koharu_vn_cli.pipeline.detector import ComicDetector, _ensure_ctd_model, active_ort_provider_label
+from koharu_vn_cli.pipeline.detector import (
+    ComicDetector,
+    DetectedRegion,
+    _ensure_ctd_model,
+    active_ort_provider_label,
+)
 from koharu_vn_cli.pipeline.gemini_client import (
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
     VisionLLMClient,
+    looks_like_floating_sfx,
     normalize_source_key,
     region_needs_translation,
 )
@@ -244,8 +251,11 @@ def save_image(pil_img: Image.Image, out_path: Path) -> None:
 
 def render_document(base_rgb: np.ndarray, doc: PageDocument) -> Image.Image:
     canvas = Image.fromarray(base_rgb).convert("RGBA")
-    canvas = render_bubbles(canvas, doc.regions)
-    canvas = render_text_regions(canvas, doc.regions)
+    active_regions = [
+        r for r in doc.regions if not (r.is_sfx and not (r.translated_text or "").strip())
+    ]
+    canvas = render_bubbles(canvas, active_regions)
+    canvas = render_text_regions(canvas, active_regions)
     return canvas
 
 
@@ -441,6 +451,7 @@ def run_translate_pipeline(
     tags: str | None = None,
     story_pass: bool = True,
     vision_translate: bool = True,
+    skip_sfx: bool = True,
     use_gpu: bool = True,
     font: str | None = None,
     conf: float = 0.34,
@@ -562,7 +573,12 @@ def run_translate_pipeline(
 
         def _remember_translations(items: list[TextRegionItem]) -> None:
             for item in items:
-                if item.source_text and item.translated_text and not region_needs_translation(item):
+                if (
+                    not item.is_sfx
+                    and item.source_text
+                    and item.translated_text
+                    and not region_needs_translation(item)
+                ):
                     key = normalize_source_key(item.source_text)
                     if key:
                         translation_memory[key] = item.translated_text.strip()
@@ -570,6 +586,11 @@ def run_translate_pipeline(
         def _apply_memory_to_untranslated(items: list[TextRegionItem], ocr_texts: dict[int, str] | None = None) -> list[TextRegionItem]:
             fixed: list[TextRegionItem] = []
             for item in items:
+                if skip_sfx and item.kind == "floating" and looks_like_floating_sfx(item.source_text):
+                    item = item.model_copy(update={"is_sfx": True, "translated_text": ""})
+                if skip_sfx and item.is_sfx:
+                    fixed.append(item.model_copy(update={"translated_text": ""}))
+                    continue
                 if region_needs_translation(item):
                     src_key = normalize_source_key((ocr_texts or {}).get(item.id, "") or item.source_text)
                     cached_vn = translation_memory.get(src_key, "")
@@ -578,11 +599,68 @@ def run_translate_pipeline(
                 fixed.append(item)
             return fixed
 
+        def _finalize_inpaint_and_colors(
+            idx: int,
+            img_name: str,
+            rgb: np.ndarray,
+            seg_mask: np.ndarray,
+            detected: list[DetectedRegion],
+            items: list[TextRegionItem],
+        ) -> tuple[np.ndarray, list[TextRegionItem]]:
+            """Build erasure mask and run LaMa inpainting only on non-SFX regions so artwork SFX stays intact."""
+            by_id_det = {reg_idx: det for reg_idx, det in enumerate(detected, start=1)}
+            active_pairs = [
+                (by_id_det[r.id], r)
+                for r in items
+                if r.id in by_id_det and not (skip_sfx and r.is_sfx)
+            ]
+            sfx_count = sum(1 for r in items if skip_sfx and r.is_sfx)
+            active_detected = [det for det, _ in active_pairs]
+            if not active_detected:
+                hooks.emit_step(
+                    idx,
+                    total,
+                    img_name,
+                    "inpaint",
+                    f"Chỉ có {sfx_count} SFX — giữ nguyên tranh gốc không tẩy/dịch!",
+                )
+                return rgb, items
+
+            hooks.emit_step(
+                idx,
+                total,
+                img_name,
+                "inpaint",
+                (
+                    f"Bỏ qua {sfx_count} SFX · đang tạo mask & tẩy {len(active_detected)} vùng thoại..."
+                    if sfx_count
+                    else f"Phát hiện {len(active_detected)} vùng thoại — đang tạo mask & tẩy chữ gốc..."
+                ),
+            )
+            erasure_mask = build_erasure_mask(rgb, seg_mask, active_detected)
+            clean_rgb = inpainter.inpaint(rgb, erasure_mask)
+            updated_by_id: dict[int, TextRegionItem] = {}
+            for det, reg in active_pairs:
+                t_col, s_col, s_factor, is_dark = classify_region_colors(
+                    rgb, clean_rgb, erasure_mask, det
+                )
+                updated_by_id[reg.id] = reg.model_copy(
+                    update={
+                        "text_color": t_col,
+                        "stroke_color": s_col,
+                        "stroke_width": None if s_factor > 0 else 0.0,
+                        "is_dark_bubble": is_dark,
+                        "font_name": reg.font_name or font or ("animeace3" if det.is_bubble else "pangolin"),
+                    }
+                )
+            merged = [updated_by_id.get(r.id, r) for r in items]
+            return clean_rgb, merged
+
         for sc in scenes:
             scene_summaries: list[str] = []
-            # Tuple: (idx, img_path, out_img_path, json_path, clean_path, w, h, rgb, clean_rgb, region_items, ocr_texts)
+            # Tuple: (idx, img_path, out_img_path, json_path, clean_path, w, h, seg_png_bytes, detected, region_items, ocr_texts)
             pending_ocr_pages: list[
-                tuple[int, Path, Path, Path, Path, int, int, np.ndarray, np.ndarray, list[TextRegionItem], dict[int, str]]
+                tuple[int, Path, Path, Path, Path, int, int, bytes, list[DetectedRegion], list[TextRegionItem], dict[int, str]]
             ] = []
 
             for p_idx in sc.page_indices:
@@ -632,41 +710,23 @@ def run_translate_pipeline(
 
                 hooks.check_cancelled()
                 t0 = time.perf_counter()
-                hooks.emit_step(
-                    idx,
-                    total,
-                    img_path.name,
-                    "inpaint",
-                    f"Phát hiện {len(detected)} vùng chữ — đang tạo mask & tẩy chữ gốc...",
-                )
-                erasure_mask = build_erasure_mask(rgb, seg_mask, detected)
-                clean_rgb = inpainter.inpaint(rgb, erasure_mask)
-
                 clean_path = cache_dir / f"{img_path.stem}.clean.png"
-                save_image(Image.fromarray(clean_rgb), clean_path)
 
-                region_items: list[TextRegionItem] = []
-                for reg_idx, reg in enumerate(detected, start=1):
-                    t_col, s_col, s_factor, is_dark = classify_region_colors(
-                        rgb, clean_rgb, erasure_mask, reg
+                region_items: list[TextRegionItem] = [
+                    TextRegionItem(
+                        id=reg_idx,
+                        kind="bubble" if reg.is_bubble else "floating",
+                        text_bbox=reg.text_bbox,
+                        bubble_bbox=reg.bubble_bbox,
+                        bubble_contour=reg.bubble_contour,
+                        font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
+                        angle=reg.angle,
+                        is_dark_bubble=reg.is_dark_bubble,
+                        draw_bubble=False,
+                        confidence=reg.confidence,
                     )
-                    region_items.append(
-                        TextRegionItem(
-                            id=reg_idx,
-                            kind="bubble" if reg.is_bubble else "floating",
-                            text_bbox=reg.text_bbox,
-                            bubble_bbox=reg.bubble_bbox,
-                            bubble_contour=reg.bubble_contour,
-                            text_color=t_col,
-                            stroke_color=s_col,
-                            stroke_width=None if s_factor > 0 else 0.0,
-                            font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
-                            angle=reg.angle,
-                            is_dark_bubble=is_dark,
-                            draw_bubble=False,
-                            confidence=reg.confidence,
-                        )
-                    )
+                    for reg_idx, reg in enumerate(detected, start=1)
+                ]
 
                 if not vision_translate and ocr_engine is not None:
                     hooks.check_cancelled()
@@ -678,8 +738,17 @@ def run_translate_pipeline(
                         f"Đang OCR cục bộ {len(region_items)} vùng chữ (No-Vision)...",
                     )
                     ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
+                    if skip_sfx:
+                        for reg_it in region_items:
+                            raw_ocr = (ocr_texts.get(reg_it.id, "") or "").strip()
+                            if raw_ocr:
+                                reg_it.source_text = raw_ocr
+                            if reg_it.kind == "floating" and looks_like_floating_sfx(raw_ocr):
+                                reg_it.is_sfx = True
+                    ok_enc, seg_buf = cv2.imencode(".png", seg_mask)
+                    seg_bytes = seg_buf.tobytes() if ok_enc else b""
                     pending_ocr_pages.append(
-                        (idx, img_path, out_img_path, json_path, clean_path, w, h, rgb, clean_rgb, region_items, ocr_texts)
+                        (idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, detected, region_items, ocr_texts)
                     )
                     continue
 
@@ -689,7 +758,7 @@ def run_translate_pipeline(
                     total,
                     img_path.name,
                     "llm",
-                    f"Đang gửi {len(region_items)} vùng chữ lên {model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
+                    f"Đang gửi {len(region_items)} vùng chữ lên {llm.model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
                 )
                 prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
                 next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
@@ -705,6 +774,7 @@ def run_translate_pipeline(
                         prev_rgb=prev_rgb,
                         next_rgb=next_rgb,
                         tags=tags,
+                        skip_sfx=skip_sfx,
                     )
                 except ContentBlockedError as exc:
                     fallback_done = False
@@ -734,6 +804,7 @@ def run_translate_pipeline(
                                 "page_index": idx,
                                 "tags": tags,
                                 "translation_memory": translation_memory,
+                                "skip_sfx": skip_sfx,
                             }
                             try:
                                 translated_items, summary = llm.translate_page_from_ocr(**ocr_kw)
@@ -786,6 +857,7 @@ def run_translate_pipeline(
                                     page_index=idx,
                                     tags=tags,
                                     translation_memory=translation_memory,
+                                    skip_sfx=skip_sfx,
                                 )
                                 by_missing_id = {r.id: r for r in retried_items}
                             else:
@@ -799,6 +871,12 @@ def run_translate_pipeline(
                 _remember_translations(translated_items)
                 if summary:
                     scene_summaries.append(summary)
+
+                hooks.check_cancelled()
+                clean_rgb, translated_items = _finalize_inpaint_and_colors(
+                    idx, img_path.name, rgb, seg_mask, detected, translated_items
+                )
+                save_image(Image.fromarray(clean_rgb), clean_path)
                 translated_items = adapt_regions_for_readability(translated_items, w, h)
 
                 hooks.check_cancelled()
@@ -824,46 +902,68 @@ def run_translate_pipeline(
                 for start_i in range(0, len(pending_ocr_pages), 10):
                     chunk = pending_ocr_pages[start_i : start_i + 10]
                     hooks.check_cancelled()
-                    batch_input = [(item[0], item[9], item[10]) for item in chunk]
-                    hooks.emit_step(
-                        chunk[0][0],
-                        total,
-                        chunk[0][1].name,
-                        "llm",
-                        f"Tuyến {sc.scene_id}: Gửi text OCR {len(chunk)} trang tới {llm.model} (0 ảnh)...",
-                    )
-                    try:
-                        batch_res = llm.translate_scene_from_ocr(
-                            batch_input,
-                            source_lang=lang,
-                            previous_summaries=scene_summaries,
-                            extra_instructions=prompt,
-                            story_bible=story_bible,
-                            tags=tags,
-                            translation_memory=translation_memory,
-                            scene_id=sc.scene_id,
+                    batch_input = [
+                        (item[0], [r for r in item[9] if not (skip_sfx and r.is_sfx)], item[10])
+                        for item in chunk
+                        if any(not (skip_sfx and r.is_sfx) for r in item[9])
+                    ]
+                    batch_res: dict[int, tuple[list[TextRegionItem], str]] = {}
+                    if batch_input:
+                        hooks.emit_step(
+                            chunk[0][0],
+                            total,
+                            chunk[0][1].name,
+                            "llm",
+                            f"Tuyến {sc.scene_id}: Gửi text OCR {len(batch_input)} trang tới {llm.model} (0 ảnh)...",
                         )
-                    except ContentBlockedError as exc:
-                        if not skip_blocked:
-                            raise
-                        for idx, img_path, out_img_path, *_ in chunk:
-                            rgb_orig = load_rgb(img_path)
-                            save_image(Image.fromarray(rgb_orig), out_img_path)
-                            hooks.emit_step(
-                                idx,
-                                total,
-                                img_path.name,
-                                "blocked",
-                                f"⚠ Tuyến {sc.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
+                        try:
+                            batch_res = llm.translate_scene_from_ocr(
+                                batch_input,
+                                source_lang=lang,
+                                previous_summaries=scene_summaries,
+                                extra_instructions=prompt,
+                                story_bible=story_bible,
+                                tags=tags,
+                                translation_memory=translation_memory,
+                                skip_sfx=skip_sfx,
+                                scene_id=sc.scene_id,
                             )
-                        continue
+                        except ContentBlockedError as exc:
+                            if not skip_blocked:
+                                raise
+                            for idx, img_path, out_img_path, *_ in chunk:
+                                rgb_orig = load_rgb(img_path)
+                                save_image(Image.fromarray(rgb_orig), out_img_path)
+                                hooks.emit_step(
+                                    idx,
+                                    total,
+                                    img_path.name,
+                                    "blocked",
+                                    f"⚠ Tuyến {sc.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
+                                )
+                            continue
 
-                    for idx, img_path, out_img_path, json_path, clean_path, w, h, _rgb, clean_rgb, reg_items, _ocrs in chunk:
-                        translated_items, summary = batch_res.get(idx, (reg_items, ""))
+                    for idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, det_list, reg_items, _ocrs in chunk:
+                        sub_items, summary = batch_res.get(idx, (reg_items, ""))
+                        sub_map = {r.id: r for r in sub_items}
+                        translated_items = [sub_map.get(r.id, r) for r in reg_items]
                         translated_items = _apply_memory_to_untranslated(translated_items, _ocrs)
                         _remember_translations(translated_items)
                         if summary:
                             scene_summaries.append(summary)
+
+                        rgb_page = load_rgb(img_path)
+                        seg_arr = (
+                            cv2.imdecode(np.frombuffer(seg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+                            if seg_bytes
+                            else None
+                        )
+                        if seg_arr is None:
+                            seg_arr = np.zeros((h, w), dtype=np.uint8)
+                        clean_rgb, translated_items = _finalize_inpaint_and_colors(
+                            idx, img_path.name, rgb_page, seg_arr, det_list, translated_items
+                        )
+                        save_image(Image.fromarray(clean_rgb), clean_path)
                         translated_items = adapt_regions_for_readability(translated_items, w, h)
                         hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
                         doc = PageDocument(

@@ -437,8 +437,48 @@ def _format_tags_block(tags: str | None) -> str:
 
 _CJK_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 _KANA_HANGUL_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af]")
+_PURE_KATAKANA_RE = re.compile(r"^[\u30a0-\u30ffーッンヴ]+$")
+_SFX_STEMS_RE = re.compile(
+    r"^(?:"
+    r"ドキ|ドク|ビク|ピタ|ツル|ニュル|ヌル|ヌチ|グチュ|グチョ|ズチュ|ズボ|ジュポ|ピチャ|"
+    r"ドピュ|ビュル|ペチ|パチ|パキ|バキ|ガタ|カチ|ギシ|ゴゴ|ザワ|ゾク|シク|キラ|"
+    r"ド[ンー]|バ[ンー]|パ[ンー]|ポ[ンヨ]|ギ[ュヤ]|ズ[ンボ]"
+    r")",
+)
 _VN_TEXT_KEYS = ("vietnamese", "vi", "viet", "translated", "translated_text", "translation", "text_vi", "text")
 _PLACEHOLDER_TEXTS = {"", "...", "…", "(trống)", "n/a", "none", "null", "—", "-"}
+
+
+def _parse_bool_flag(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return str(val or "").strip().lower() in {"true", "1", "yes"}
+
+
+def looks_like_floating_sfx(text: str) -> bool:
+    """Return True only when non-bubble OCR text is unambiguously a sound-effect glyph."""
+    cleaned = re.sub(r"[\s\u3000!！?？…・〜~\-ー]+", "", (text or "").strip())
+    if not cleaned or len(cleaned) > 10:
+        return False
+    if not _PURE_KATAKANA_RE.match(cleaned):
+        return False
+    return bool(_SFX_STEMS_RE.search(cleaned))
+
+
+def _sfx_rule_block(skip_sfx: bool) -> str:
+    if not skip_sfx:
+        return ""
+    return (
+        "\nQUY TẮC BỎ QUA SFX (BẮT BUỘC):\n"
+        "- Nếu khung [ID] là **SFX / từ tượng thanh / tiếng động hiệu ứng vẽ trực tiếp trên tranh** "
+        "(vd: ドン, ドキッ, ビクン, グチュ, ズチュ, バキッ, ゴゴゴ, カチッ, パンッ, ぽよん, ピチャ, ゾクッ... "
+        "dạng chữ hiệu ứng mô phỏng âm thanh hành động/cơ thể/môi trường): "
+        "BẮT BUỘC đặt `\"is_sfx\": true` và `\"vietnamese\": \"\"` (để TRỐNG hoàn toàn, KHÔNG dịch và KHÔNG chèn chữ đè tranh).\n"
+        "- NGƯỢC LẠI, với MỌI lời thoại trong bubble, suy nghĩ, lời dẫn, chữ chú thích hay tiếng rên/thở phát ra từ miệng nhân vật "
+        "(vd: 'あっ…ぐっ！！', 'んっ…', 'はぁ…', 'やめて…'): đặt `\"is_sfx\": false` và dịch sang Tiếng Việt tự nhiên.\n"
+    )
 
 
 def normalize_source_key(text: str) -> str:
@@ -447,7 +487,9 @@ def normalize_source_key(text: str) -> str:
 
 
 def region_needs_translation(reg: TextRegionItem) -> bool:
-    """Return True if a source CJK/Kana/Hangul region is still empty or untranslated."""
+    """Return True if a source CJK/Kana/Hangul non-SFX region is still empty or untranslated."""
+    if reg.is_sfx:
+        return False
     src = (reg.source_text or "").strip()
     vn = (reg.translated_text or "").strip()
     if not src:
@@ -870,7 +912,7 @@ class VisionLLMClient:
         "- Thay bằng khẩu ngữ ngắn gọn, có nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...): vd 'Cứ tưởng cô không thích cơ đấy', 'Ủa sao tự dưng...', 'Đừng có mà...', 'Nhói quá...'.\n"
         "- Câu ngắn gọn vừa khung thoại, giữ đúng sắc thái ngại ngùng / trêu chọc / đê mê / hoảng hốt / áp đảo của tuyến cảnh.\n"
         "- Không giải thích dài dòng, không thêm chú thích ngoài lời thoại.\n"
-        "- Tiếng động / SFX & tiếng thở dịch tự nhiên đúng chất doujinshi (vd: 'Ư...', 'Á...', 'Hộc...', 'CHỤT', 'NHÓP NHÉP', 'PHỤT', 'HẢ?!').\n"
+        "- Tiếng thở/rên thoại của nhân vật (khi là lời nói/suy nghĩ, không phải SFX nền) dịch tự nhiên đúng chất doujinshi (vd: 'Ư...', 'Ưm...', 'Á...', 'Hộc...', 'Hả?!').\n"
         "Bắt buộc trả về đúng JSON hợp lệ."
     )
 
@@ -1032,6 +1074,7 @@ class VisionLLMClient:
         prev_rgb: np.ndarray | None = None,
         next_rgb: np.ndarray | None = None,
         tags: str | None = None,
+        skip_sfx: bool = True,
     ) -> tuple[list[TextRegionItem], str]:
         """OCR and translate all numbered regions on a comic page into natural Vietnamese."""
         if not regions:
@@ -1053,12 +1096,14 @@ class VisionLLMClient:
             context_block = f"\nDiễn biến chi tiết vừa diễn ra:\n{joined}\n"
 
         tags_block = _format_tags_block(tags)
+        sfx_block = _sfx_rule_block(skip_sfx)
         extra_block = f"\nYêu cầu thêm từ người dùng: {extra_instructions}\n" if extra_instructions else ""
 
         system_prompt = (
             "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu (Manga Nhật, Manhwa Hàn, Manhua Trung) chuyên bản địa hóa sang Tiếng Việt.\n"
             "Nhiệm vụ: Đọc chính xác chữ gốc trong từng khung [ID] từ Bảng Crop chi tiết kết hợp Ảnh toàn trang, "
             "rồi dịch thoát ý sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, gợi cảm/gợi tình đúng mức theo đúng sắc thái cảnh truyện và xưng hô đã khóa.\n"
+            + sfx_block
             + self._VI_LOCALIZATION_RULES
         )
 
@@ -1069,7 +1114,7 @@ class VisionLLMClient:
         page_label = f" (Trang {page_index})" if page_index else ""
         user_prompt = (
             f"{lang_hint}{page_label}.{bible_block}{context_block}{tags_block}{extra_block}\n"
-            f"Hãy đọc và dịch toàn bộ các ID sau: {ids_list}.\n"
+            f"Hãy đọc và phân loại/dịch toàn bộ các ID sau: {ids_list}.\n"
             "Trả về JSON theo đúng cấu trúc:\n"
             "{\n"
             '  "detected_language": "ja | ko | zh | en | mixed",\n'
@@ -1099,13 +1144,17 @@ class VisionLLMClient:
             images=images_payload,
             temperature=0.25,
         )
-        return self._merge_translated_regions(regions, data.get("items", [])), str(data.get("page_summary", "")).strip()
+        return (
+            self._merge_translated_regions(regions, data.get("items", []), skip_sfx=skip_sfx),
+            str(data.get("page_summary", "")).strip(),
+        )
 
     @staticmethod
     def _merge_translated_regions(
         regions: list[TextRegionItem],
         raw_items: list[Any],
         ocr_texts: dict[int, str] | None = None,
+        skip_sfx: bool = True,
     ) -> list[TextRegionItem]:
         dict_items = [it for it in (raw_items or []) if isinstance(it, dict)]
         by_id: dict[int, dict[str, Any]] = {}
@@ -1124,11 +1173,26 @@ class VisionLLMClient:
             fallback_src = (ocr_texts or {}).get(copy.id, copy.source_text)
             if match:
                 copy.source_text = str(match.get("source_text", fallback_src)).strip() or fallback_src
-                vn = _extract_vn_from_item(match)
-                if vn:
-                    copy.translated_text = vn
-            elif fallback_src:
-                copy.source_text = fallback_src
+                raw_is_sfx = _parse_bool_flag(match.get("is_sfx"))
+                # Protect long spoken dialogue inside speech bubbles from accidental SFX mis-tagging
+                if raw_is_sfx and (copy.kind != "bubble" or len(normalize_source_key(copy.source_text)) <= 8):
+                    copy.is_sfx = True
+                elif copy.kind == "floating" and looks_like_floating_sfx(copy.source_text):
+                    copy.is_sfx = True
+
+                if skip_sfx and copy.is_sfx:
+                    copy.translated_text = ""
+                else:
+                    vn = _extract_vn_from_item(match)
+                    if vn:
+                        copy.translated_text = vn
+            else:
+                if fallback_src:
+                    copy.source_text = fallback_src
+                if copy.kind == "floating" and looks_like_floating_sfx(copy.source_text):
+                    copy.is_sfx = True
+                    if skip_sfx:
+                        copy.translated_text = ""
             updated.append(copy)
         return updated
 
@@ -1169,6 +1233,7 @@ class VisionLLMClient:
         page_index: int | None = None,
         tags: str | None = None,
         translation_memory: dict[str, str] | None = None,
+        skip_sfx: bool = True,
         *,
         _allow_retry: bool = True,
     ) -> tuple[list[TextRegionItem], str]:
@@ -1181,6 +1246,13 @@ class VisionLLMClient:
             raw_ocr = (ocr_texts.get(copy.id, "") or copy.source_text or "").strip()
             if raw_ocr:
                 copy.source_text = raw_ocr
+            if skip_sfx and copy.kind == "floating" and looks_like_floating_sfx(copy.source_text):
+                copy.is_sfx = True
+                copy.translated_text = ""
+
+        to_translate = [r for r in working if not (skip_sfx and r.is_sfx)]
+        if not to_translate:
+            return working, ""
 
         lang_hint, ctx_block = self._build_ocr_context_blocks(
             source_lang=source_lang,
@@ -1191,27 +1263,30 @@ class VisionLLMClient:
             tags=tags,
         )
         lines = []
-        for r in working:
+        for r in to_translate:
             raw_txt = (ocr_texts.get(r.id, "") or r.source_text or "").strip() or "(trống / tiếng thở ngắn)"
             x1, y1, x2, y2 = r.text_bbox
             kind = "Dọc" if (y2 - y1) > (x2 - x1) * 1.25 else "Ngang"
+            area_tag = "Trong bóng" if r.kind == "bubble" else "Ngoài khung"
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            lines.append(f"- ID {r.id} ({kind}, tâm=({cx},{cy})): {raw_txt}")
+            lines.append(f"- ID {r.id} ({area_tag}, {kind}, tâm=({cx},{cy})): {raw_txt}")
         ocr_block = "\n".join(lines)
 
+        sfx_block = _sfx_rule_block(skip_sfx)
         system_prompt = (
             "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu (Manga Nhật, Manhwa Hàn, Manhua Trung) chuyên bản địa hóa sang Tiếng Việt.\n"
             "Chế độ NO-VISION: Chữ gốc từng khung đã được OCR cục bộ trích sẵn bên dưới. "
             "Hãy tự sửa lỗi nhận dạng OCR nhỏ nếu hiển nhiên dựa vào Story Bible & tuyến cảnh hiện tại, "
-            "rồi dịch TẤT CẢ các ID sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, đúng xưng hô đã khóa.\n"
-            "CẤM để trống `vietnamese` hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
+            "rồi dịch TẤT CẢ các ID lời thoại sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, đúng xưng hô đã khóa.\n"
+            "CẤM để trống `vietnamese` đối với lời thoại (trừ khi `is_sfx: true`) hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
+            + sfx_block
             + self._VI_LOCALIZATION_RULES
         )
         page_label = f" (Trang {page_index})" if page_index else ""
         user_prompt = (
             f"{lang_hint}{page_label}.{ctx_block}\n"
             f"Danh sách chữ OCR cục bộ theo khung thoại:\n{ocr_block}\n\n"
-            "Trả về JSON theo đúng cấu trúc (trường `vietnamese` BẮT BUỘC là Tiếng Việt):\n"
+            "Trả về JSON theo đúng cấu trúc:\n"
             "{\n"
             '  "detected_language": "ja | ko | zh | en | mixed",\n'
             '  "page_summary": "Tóm tắt 1-2 câu diễn biến & xưng hô của trang này bằng tiếng Việt",\n'
@@ -1222,7 +1297,9 @@ class VisionLLMClient:
         )
         data = self._call_json(system_prompt, user_prompt, images=[], temperature=0.25)
         raw_items = data.get("items") or data.get("regions") or []
-        updated = self._merge_translated_regions(working, raw_items, ocr_texts=ocr_texts)
+        merged_sub = self._merge_translated_regions(to_translate, raw_items, ocr_texts=ocr_texts, skip_sfx=skip_sfx)
+        by_sub_id = {r.id: r for r in merged_sub}
+        updated = [by_sub_id.get(r.id, r) for r in working]
         summary = str(data.get("page_summary", "")).strip()
 
         # Guard against small models echoing Japanese or omitting an ID
@@ -1231,7 +1308,7 @@ class VisionLLMClient:
             retry_note = (
                 (f"{extra_instructions}\n" if extra_instructions else "")
                 + "CHÚ Ý: Lần trước vẫn còn ID chưa dịch hoặc còn nguyên tiếng Nhật/Hàn/Trung. "
-                "Hãy dịch 100% các ID này sang Tiếng Việt, KHÔNG giữ nguyên tiếng gốc!"
+                "Hãy dịch 100% các ID thoại này sang Tiếng Việt (hoặc đặt is_sfx=true nếu là SFX thuần túy), KHÔNG giữ nguyên tiếng gốc!"
             )
             retried, retry_sum = self.translate_page_from_ocr(
                 missing,
@@ -1243,6 +1320,7 @@ class VisionLLMClient:
                 page_index=page_index,
                 tags=tags,
                 translation_memory=translation_memory,
+                skip_sfx=skip_sfx,
                 _allow_retry=False,
             )
             retry_map = {r.id: r for r in retried}
@@ -1276,6 +1354,7 @@ class VisionLLMClient:
         story_bible: StoryBible | None = None,
         tags: str | None = None,
         translation_memory: dict[str, str] | None = None,
+        skip_sfx: bool = True,
         *,
         scene_id: int | None = None,
     ) -> dict[int, tuple[list[TextRegionItem], str]]:
@@ -1298,6 +1377,7 @@ class VisionLLMClient:
                     page_index=pno,
                     tags=tags,
                     translation_memory=translation_memory,
+                    skip_sfx=skip_sfx,
                 )
             }
 
@@ -1314,17 +1394,19 @@ class VisionLLMClient:
         page_blocks: list[str] = []
         for pno, regs, ocrs in scene_pages:
             r_lines = [
-                f"  - ID {r.id}: {ocrs.get(r.id, '').strip() or '(trống / tiếng thở ngắn)'}"
+                f"  - ID {r.id} ({'Trong bóng' if r.kind == 'bubble' else 'Ngoài khung'}): {ocrs.get(r.id, '').strip() or '(trống / tiếng thở ngắn)'}"
                 for r in regs
             ]
             page_blocks.append(f"[Trang {pno}]\n" + "\n".join(r_lines))
         joined_pages = "\n\n".join(page_blocks)
 
+        sfx_block = _sfx_rule_block(skip_sfx)
         system_prompt = (
             "Bạn là biên dịch viên truyện tranh & doujinshi kỳ cựu chuyên bản địa hóa sang Tiếng Việt.\n"
             "Chế độ NO-VISION THEO TUYẾN (Batch OCR): Dưới đây là toàn bộ lời thoại OCR của các trang thuộc CÙNG MỘT TUYẾN/ONESHOT. "
             "Hãy dịch liền mạch, nối nhịp cảm xúc & xưng hô nhất quán xuyên suốt các trang trong tuyến này.\n"
-            "CẤM để trống `vietnamese` hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
+            "CẤM để trống `vietnamese` (trừ khi `is_sfx: true`) hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
+            + sfx_block
             + self._VI_LOCALIZATION_RULES
         )
         scene_hdr = f"Tuyến {scene_id}" if scene_id is not None else "Cùng 1 tuyến"
@@ -1362,7 +1444,7 @@ class VisionLLMClient:
                 (entry.get("items") or entry.get("regions")) if isinstance(entry, dict) else None
             )
             if entry and isinstance(raw_page_items, list):
-                merged = self._merge_translated_regions(regs, raw_page_items, ocr_texts=ocrs)
+                merged = self._merge_translated_regions(regs, raw_page_items, ocr_texts=ocrs, skip_sfx=skip_sfx)
                 summary = str(entry.get("page_summary", "")).strip()
                 untranslated = [r for r in merged if region_needs_translation(r)]
                 if untranslated:
@@ -1376,13 +1458,14 @@ class VisionLLMClient:
                         page_index=pno,
                         tags=tags,
                         translation_memory=mem,
+                        skip_sfx=skip_sfx,
                     )
                     fix_map = {r.id: r for r in fixed_missing}
                     merged = [fix_map.get(r.id, r) for r in merged]
                     if not summary and fix_sum:
                         summary = fix_sum
                 for r in merged:
-                    if not region_needs_translation(r) and r.source_text and r.translated_text:
+                    if not r.is_sfx and not region_needs_translation(r) and r.source_text and r.translated_text:
                         mem[normalize_source_key(r.source_text)] = r.translated_text.strip()
                 out[pno] = (merged, summary)
                 if summary:
@@ -1398,9 +1481,10 @@ class VisionLLMClient:
                     page_index=pno,
                     tags=tags,
                     translation_memory=mem,
+                    skip_sfx=skip_sfx,
                 )
                 for r in res[0]:
-                    if not region_needs_translation(r) and r.source_text and r.translated_text:
+                    if not r.is_sfx and not region_needs_translation(r) and r.source_text and r.translated_text:
                         mem[normalize_source_key(r.source_text)] = r.translated_text.strip()
                 out[pno] = res
                 if res[1]:

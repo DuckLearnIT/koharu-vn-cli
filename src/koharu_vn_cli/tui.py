@@ -60,6 +60,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
     SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật game sau Pass 1"),
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
+    SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
     SlashSpec("/gpu", "[on|off]", "Bật/tắt tăng tốc GPU (CUDA) cho Detector, LaMa Inpaint & OCR"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
     SlashSpec("/lang", "", "Chọn ngôn ngữ nguồn ưu tiên (auto / ja / ko / zh / en)"),
@@ -904,6 +905,7 @@ class KoharuTUI(App[None]):
             f"Mật độ CG: [cyan]{self.cfg.density}[/cyan]\n"
             f"Tags: [magenta]{(self.cfg.tags[:30] + '...') if len(self.cfg.tags) > 30 else (self.cfg.tags or 'chưa đặt')}[/magenta]\n"
             f"Font: [white]{self.cfg.font or 'auto (animeace3/pangolin)'}[/white]\n"
+            f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
             f"Prompt: [dim]{(self.cfg.custom_prompt[:46] + '...') if len(self.cfg.custom_prompt) > 46 else (self.cfg.custom_prompt or 'không')}[/dim]"
         )
 
@@ -1489,6 +1491,24 @@ class KoharuTUI(App[None]):
                 self._log_ai(
                     "Đã [bold yellow]TẮT Vision[/bold yellow] cho Pass 2: Model lớn xem ảnh dựng Story Bible theo tuyến -> OCR cục bộ CPU (manga-ocr-onnx) -> Model con chỉ dịch text theo tuyến (siêu nhanh, né lọc ảnh)."
                 )
+        elif cmd == "/sfx":
+            val = rest.strip().lower()
+            if val in {"skip", "on", "1", "true", "off-translate"}:
+                self.cfg.skip_sfx = True
+            elif val in {"translate", "keep", "off", "0", "false"}:
+                self.cfg.skip_sfx = False
+            else:
+                self.cfg.skip_sfx = not self.cfg.skip_sfx
+            save_config(self.cfg)
+            self._refresh_chrome()
+            if self.cfg.skip_sfx:
+                self._log_ai(
+                    "SFX: [bold cyan]BỎ QUA[/bold cyan] — không dịch và không inpaint/tẩy SFX vẽ trên tranh."
+                )
+            else:
+                self._log_ai(
+                    "SFX: [bold yellow]DỊCH & TẨY[/bold yellow] — dịch và chèn chữ Tiếng Việt cả vào vùng SFX."
+                )
         elif cmd == "/gpu":
             val = rest.strip().lower()
             if val in {"on", "1", "true"}:
@@ -1945,6 +1965,7 @@ class KoharuTUI(App[None]):
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
                 vision_translate=self.cfg.vision_translate,
+                skip_sfx=self.cfg.skip_sfx,
                 use_gpu=self.cfg.use_gpu,
                 resume=resume,
                 model_cache=self.model_cache,

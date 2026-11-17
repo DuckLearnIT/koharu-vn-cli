@@ -318,8 +318,10 @@ def solve_layout(
     Find the LARGEST crisp font size and balanced line layout that fills the bubble/frame
     without overflowing or squeezing Vietnamese diacritics.
     """
-    text = (region.translated_text or region.source_text or "").strip()
     font_path = str(resolve_font_path(region.font_name, kind=region.kind))
+    if region.is_sfx and not (region.translated_text or "").strip():
+        return SolvedLayout(font_path=font_path, font_size=14, line_height=17.0, lines=[])
+    text = (region.translated_text or region.source_text or "").strip()
 
     box = region.bubble_bbox if (region.kind == "bubble" and region.bubble_bbox) else region.text_bbox
     x1, y1, x2, y2 = box
@@ -467,6 +469,9 @@ def adapt_regions_for_readability(
 
     for reg in regions:
         copy = reg.model_copy()
+        if copy.is_sfx and not (copy.translated_text or "").strip():
+            adapted.append(copy)
+            continue
         text = (copy.translated_text or copy.source_text or "").strip()
         if not text:
             adapted.append(copy)
@@ -515,6 +520,8 @@ def render_text_regions(canvas_rgba: Image.Image, regions: Sequence[TextRegionIt
     scale = 2
 
     for reg in regions:
+        if reg.is_sfx and not (reg.translated_text or "").strip():
+            continue
         layout = solve_layout(reg, canvas_size=(w, h))
         if not layout.lines:
             continue

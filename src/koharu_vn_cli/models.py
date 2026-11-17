@@ -46,6 +46,7 @@ class TextRegionItem(BaseModel):
     angle: float = 0.0
     alignment: Literal["center", "left", "right"] = "center"
     is_dark_bubble: bool = False
+    is_sfx: bool = False
     draw_bubble: bool = False
     confidence: float = 1.0
 
