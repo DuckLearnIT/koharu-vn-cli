@@ -33,7 +33,12 @@ from koharu_vn_cli.models import CharacterProfile, ComposePreset, PageDocument, 
 from koharu_vn_cli.notify import send_desktop_notification
 from koharu_vn_cli.pipeline.detector import active_ort_provider_label
 from koharu_vn_cli.pipeline.fonts import available_fonts
-from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
+from koharu_vn_cli.pipeline.gemini_client import (
+    DEEPSEEK_BASE_URL,
+    VisionLLMClient,
+    is_deepseek_endpoint,
+    is_deepseek_model,
+)
 from koharu_vn_cli.pipeline.runner import (
     IMAGE_EXTS,
     ModelCache,
@@ -116,6 +121,8 @@ MODEL_CHOICES: list[tuple[str, str]] = [
     ("gemini-4-hydrogen", "Gemini 4 Hydrogen (Frontier reasoning đa phương thức)"),
     ("gemini-4-argon", "Gemini 4 Argon (Frontier hiệu năng cao)"),
     ("gemini-4-carbon", "Gemini 4 Carbon (Frontier flagship)"),
+    ("deepseek-chat", "DeepSeek V3 Chat (api.deepseek.com — OCR cục bộ + dịch text)"),
+    ("deepseek-reasoner", "DeepSeek R1 Reasoner (api.deepseek.com — suy luận sâu, OCR cục bộ)"),
 ]
 
 THEME_CHOICES: list[tuple[str, str]] = [
@@ -333,22 +340,22 @@ class KeySetupModal(ModalScreen[tuple[str, str] | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-card"):
-            yield Label("Cấu hình Gemini API & Endpoint", id="modal-title")
+            yield Label("Cấu hình API Key & Endpoint (Gemini / DeepSeek / Proxy)", id="modal-title")
             yield Label(
                 "Có thể nhập NHIỀU API key cách nhau bởi dấu phẩy (,) hoặc chấm phẩy (;) để tự động đổi key khi hết quota/lỗi.",
                 id="modal-subtitle",
             )
-            yield Label("GEMINI_API_KEY (1 hoặc nhiều key):")
+            yield Label("API Key (GEMINI_API_KEY hoặc DEEPSEEK_API_KEY):")
             yield Input(
                 value=self.current_key,
                 password=False,
-                placeholder="AIzaSyKey1..., AIzaSyKey2..., AIzaSyKey3...",
+                placeholder="AIzaSy... (Gemini) hoặc sk-... (DeepSeek / OpenRouter)",
                 id="key-input",
             )
-            yield Label("Base URL tùy chọn (OpenAI-compatible — không bị bộ lọc Google khi dịch R18):")
+            yield Label("Base URL tùy chọn (để trống nếu dùng Gemini hoặc chọn model deepseek-*):")
             yield Input(
                 value=self.current_base_url,
-                placeholder="https://openrouter.ai/api/v1 | https://api.x.ai/v1 | http://127.0.0.1:11434/v1",
+                placeholder="https://api.deepseek.com/v1 | https://openrouter.ai/api/v1 | http://127.0.0.1:11434/v1",
                 id="url-input",
             )
             with Horizontal(id="modal-actions"):
@@ -973,13 +980,18 @@ class KoharuTUI(App[None]):
             if self.cfg.workers <= 0
             else f"{self.cfg.workers} luồng"
         )
+        eff_endpoint_label = (
+            "DeepSeek Official"
+            if is_deepseek_endpoint(self.cfg.base_url) or (not self.cfg.base_url and is_deepseek_model(self.cfg.model))
+            else (self.cfg.base_url or "Gemini Official")
+        )
         sb_cfg = self.query_one("#sb-config", Static)
         sb_cfg.update(
             f"Model chính: [bold magenta]{self.cfg.story_model or f'chung ({self.cfg.model})'}[/bold magenta]\n"
             f"Fallback chính: [dim]{self.cfg.story_fallback_model or 'tắt'}[/dim]\n"
             f"Model phụ: [bold white]{self.cfg.model}[/bold white]\n"
             f"Fallback phụ: [dim]{self.cfg.fallback_model or 'tắt'}[/dim]\n"
-            f"Endpoint: [dim]{self.cfg.base_url or 'Gemini Official'}[/dim]\n"
+            f"Endpoint: [dim]{eff_endpoint_label}[/dim]\n"
             f"Key: {key_badge}\n"
             f"Ngôn ngữ: [cyan]{self.cfg.lang}[/cyan]\n"
             f"CG Style: [magenta]{self.cfg.compose_style.value}[/magenta]\n"
@@ -1832,6 +1844,10 @@ class KoharuTUI(App[None]):
 
     def _set_model(self, value: str) -> None:
         self.cfg.model = value
+        if is_deepseek_model(value) and not self.cfg.base_url:
+            self.cfg.base_url = DEEPSEEK_BASE_URL
+        elif not is_deepseek_model(value) and is_deepseek_endpoint(self.cfg.base_url):
+            self.cfg.base_url = None
         save_config(self.cfg)
         self._refresh_chrome()
         self._log_ai(f"Đã chuyển Model PHỤ sang: [bold cyan]{value}[/bold cyan]")
@@ -1892,6 +1908,9 @@ class KoharuTUI(App[None]):
         self.cfg.api_keys = keys
         self.cfg.api_key = keys[0] if keys else ""
         self.cfg.base_url = url or None
+        if is_deepseek_endpoint(self.cfg.base_url) and not is_deepseek_model(self.cfg.model):
+            self.cfg.model = "deepseek-chat"
+            self._log_ai("ℹ Phát hiện endpoint DeepSeek -> tự động chọn model [bold cyan]deepseek-chat[/bold cyan] (có thể đổi qua `/model`).")
         save_config(self.cfg)
         self._refresh_chrome()
         self._log_ai(

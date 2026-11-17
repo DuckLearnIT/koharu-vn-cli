@@ -32,6 +32,7 @@ from koharu_vn_cli.pipeline.gemini_client import (
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
     VisionLLMClient,
+    is_text_only_model,
     looks_like_floating_sfx,
     normalize_source_key,
     region_needs_translation,
@@ -688,6 +689,23 @@ def run_translate_pipeline(
         eff_story_model = (story_model or "").strip() or model
         eff_fallback = (fallback_model or "").strip() or None
         eff_story_fallback = (story_fallback_model or "").strip() or None
+        if is_text_only_model(model, base_url) and vision_translate:
+            vision_translate = False
+            _emit_step(
+                0,
+                base_name,
+                "api",
+                f"ℹ Model text-only ({model}) không đọc ảnh trực tiếp -> tự động bật OCR cục bộ (No-Vision).",
+            )
+        eff_story_pass = story_pass
+        if eff_story_pass and is_text_only_model(eff_story_model, base_url):
+            eff_story_pass = False
+            _emit_step(
+                0,
+                base_name,
+                "api",
+                f"ℹ Model chính ({eff_story_model}) chỉ hỗ trợ text -> bỏ qua Pass 1 xem ảnh (vẫn dùng --story nếu có).",
+            )
         mode_tag = "Vision" if vision_translate else "No-Vision OCR"
         fb_s_tag = f" [FB: {eff_story_fallback}]" if eff_story_fallback else ""
         fb_m_tag = f" [FB quota: {eff_fallback}]" if eff_fallback else ""
@@ -774,7 +792,7 @@ def run_translate_pipeline(
             user_story=story,
             prompt=prompt,
             tags=tags,
-            enable_story_pass=story_pass,
+            enable_story_pass=eff_story_pass,
             resume=resume,
             scenes=scenes,
             story_fallback_llm=story_fallback_llm,
@@ -1520,6 +1538,11 @@ def run_compose_pipeline(
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         total = len(images)
+        if is_text_only_model(model, base_url):
+            raise ValueError(
+                f"Chế độ /compose (sáng tác thoại cho CG không lời) cần model Vision nhìn được ảnh. "
+                f"Model/endpoint '{model}' chỉ hỗ trợ text — hãy dùng Gemini hoặc OpenAI-Vision proxy."
+            )
         eff_story_model = (story_model or "").strip() or model
         eff_fallback = (fallback_model or "").strip() or None
         eff_story_fallback = (story_fallback_model or "").strip() or None

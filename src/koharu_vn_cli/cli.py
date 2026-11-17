@@ -18,7 +18,12 @@ from koharu_vn_cli.config import load_config
 from koharu_vn_cli.models import CharacterProfile, ComposePreset, StoryBible
 from koharu_vn_cli.notify import send_desktop_notification
 from koharu_vn_cli.pipeline.fonts import available_fonts
-from koharu_vn_cli.pipeline.gemini_client import DEFAULT_GEMINI_MODEL, VisionLLMClient
+from koharu_vn_cli.pipeline.gemini_client import (
+    DEFAULT_GEMINI_MODEL,
+    DEEPSEEK_BASE_URL,
+    VisionLLMClient,
+    is_deepseek_model,
+)
 from koharu_vn_cli.pipeline.runner import (
     ModelCache,
     PipelineHooks,
@@ -56,11 +61,13 @@ def ui(
 
 def _resolve_auth(api_key: str | None, base_url: str | None, model: str | None) -> tuple[str | None, list[str], str | None, str]:
     cfg = load_config()
-    cli_keys = [k.strip() for k in (api_key or "").replace(";", ",").split(",") if k.strip()] if api_key else []
-    eff_keys = cli_keys or cfg.effective_api_keys()
-    eff_key = eff_keys[0] if eff_keys else None
-    eff_url = base_url or cfg.base_url
     eff_model = model or cfg.model or DEFAULT_GEMINI_MODEL
+    eff_url = base_url or cfg.base_url
+    if not eff_url and is_deepseek_model(eff_model):
+        eff_url = DEEPSEEK_BASE_URL
+    cli_keys = [k.strip() for k in (api_key or "").replace(";", ",").split(",") if k.strip()] if api_key else []
+    eff_keys = cli_keys or cfg.effective_api_keys(model=eff_model, base_url=eff_url)
+    eff_key = eff_keys[0] if eff_keys else None
     return eff_key, eff_keys, eff_url, eff_model
 
 

@@ -30,6 +30,25 @@ from koharu_vn_cli.pipeline.fonts import resolve_font_path
 from koharu_vn_cli.pipeline.scene_cluster import SceneGroup
 
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_MODELS = ("deepseek-chat", "deepseek-reasoner")
+
+
+def is_deepseek_model(model: str | None) -> bool:
+    """Return True when the model ID targets DeepSeek's API."""
+    return (model or "").strip().lower().startswith("deepseek-")
+
+
+def is_deepseek_endpoint(base_url: str | None) -> bool:
+    """Return True when base_url points to official DeepSeek API."""
+    return "api.deepseek.com" in (base_url or "").lower()
+
+
+def is_text_only_model(model: str | None, base_url: str | None = None) -> bool:
+    """Return True when the target model/endpoint cannot accept image_url vision inputs."""
+    if is_deepseek_endpoint(base_url):
+        return True
+    return is_deepseek_model(model) and not base_url
 
 
 class ContentBlockedError(RuntimeError):
@@ -535,15 +554,30 @@ class VisionLLMClient:
         timeout: float = 90.0,
         on_status: Callable[[str], None] | None = None,
     ) -> None:
+        eff_base_url = base_url.rstrip("/") if base_url else None
+        if not eff_base_url and is_deepseek_model(model):
+            eff_base_url = DEEPSEEK_BASE_URL
+        use_deepseek_keys = is_deepseek_model(model) or is_deepseek_endpoint(eff_base_url)
+
         raw_sources: list[str] = []
         if api_keys:
             raw_sources.extend(api_keys)
-        for src in (
-            api_key,
-            os.environ.get("GEMINI_API_KEYS"),
-            os.environ.get("GEMINI_API_KEY"),
-            os.environ.get("OPENAI_API_KEY"),
-        ):
+        env_sources = (
+            (
+                api_key,
+                os.environ.get("DEEPSEEK_API_KEYS"),
+                os.environ.get("DEEPSEEK_API_KEY"),
+                os.environ.get("OPENAI_API_KEY"),
+            )
+            if use_deepseek_keys
+            else (
+                api_key,
+                os.environ.get("GEMINI_API_KEYS"),
+                os.environ.get("GEMINI_API_KEY"),
+                os.environ.get("OPENAI_API_KEY"),
+            )
+        )
+        for src in env_sources:
             if src:
                 raw_sources.extend(re.split(r"[\s,;]+", src.strip()))
 
@@ -573,12 +607,16 @@ class VisionLLMClient:
                 fb_seen.add(fb_clean)
                 self.fallback_models.append(fb_clean)
         self._fallback_idx = 0
-        self.base_url = base_url.rstrip("/") if base_url else None
+        self.base_url = eff_base_url
         self.timeout = timeout
         self.on_status = on_status
         if not self.api_key and not self.base_url:
             raise ValueError(
-                "Missing Gemini API key. Set GEMINI_API_KEY env var or pass --api-key (or --base-url for a local proxy)."
+                "Missing API key. Set GEMINI_API_KEY or DEEPSEEK_API_KEY env var, or pass --api-key (or --base-url for a local proxy)."
+            )
+        if is_deepseek_endpoint(self.base_url) and not self.api_key:
+            raise ValueError(
+                "Missing DeepSeek API key. Set DEEPSEEK_API_KEY env var or pass --api-key."
             )
 
     def _has_fallback_model(self) -> bool:
@@ -797,11 +835,19 @@ class VisionLLMClient:
     ) -> str:
         assert self.base_url is not None
         endpoint = self.base_url if self.base_url.endswith("/chat/completions") else f"{self.base_url}/chat/completions"
-        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-        for label, b64 in images:
-            if label:
-                content.append({"type": "text", "text": label})
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        if images and is_deepseek_endpoint(self.base_url):
+            raise ValueError(
+                "DeepSeek API chính thức chỉ hỗ trợ text (không nhận ảnh trực tiếp). "
+                "Hãy bật OCR cục bộ (--no-vision) khi dịch, hoặc dùng Gemini / OpenAI-Vision proxy."
+            )
+        if images:
+            user_content: str | list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+            for label, b64 in images:
+                if label:
+                    user_content.append({"type": "text", "text": label})
+                user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        else:
+            user_content = user_prompt
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -809,12 +855,13 @@ class VisionLLMClient:
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
+                {"role": "user", "content": user_content},
             ],
         }
+        if self.model.strip().lower() != "deepseek-reasoner":
+            payload["temperature"] = temperature
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         with httpx.Client(timeout=self.timeout) as client:
@@ -866,12 +913,17 @@ class VisionLLMClient:
                 resp.raise_for_status()
                 raw_items = resp.json().get("data", [])
             models: list[tuple[str, str]] = []
+            ds_desc = {
+                "deepseek-chat": "DeepSeek V3 Chat (text/JSON, OCR cục bộ)",
+                "deepseek-reasoner": "DeepSeek R1 Reasoner (suy luận sâu, OCR cục bộ)",
+            }
             for m in raw_items:
                 mid = str(m.get("id", "")).strip()
                 if not mid:
                     continue
                 owner = str(m.get("owned_by", "")).strip()
-                models.append((mid, f"Proxy model ({owner})" if owner else "Proxy model"))
+                label = ds_desc.get(mid) or (f"Proxy model ({owner})" if owner else "Proxy model")
+                models.append((mid, label))
             models.sort(key=lambda x: _model_sort_key(x[0]), reverse=True)
             return models[:limit]
 

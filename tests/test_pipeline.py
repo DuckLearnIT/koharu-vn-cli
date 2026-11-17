@@ -2308,6 +2308,72 @@ def test_write_reader_metadata_sidecar(tmp_path: Path) -> None:
     assert data["summary"] == "Buổi trà chiều ngọt ngào tại Fontaine."
 
 
+def test_deepseek_api_routing_payload_and_ocr_auto_mode(monkeypatch, tmp_path: Path) -> None:
+    """Verify DeepSeek auto-routing, key isolation, string message payload, and compose guard."""
+    import httpx
+    import pytest
+
+    from koharu_vn_cli.config import AppConfig
+    from koharu_vn_cli.pipeline import gemini_client as gc
+    from koharu_vn_cli.pipeline.runner import run_compose_pipeline
+
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-gemini")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-fake-deepseek-1")
+
+    cfg = AppConfig(api_key="AIza-saved-gemini", model="deepseek-chat")
+    assert cfg.effective_api_keys() == ["sk-fake-deepseek-1"]
+    assert cfg.effective_api_keys(model="gemini-3.8-flash") == ["AIza-saved-gemini", "AIza-fake-gemini"]
+
+    client = VisionLLMClient(model="deepseek-chat")
+    assert client.base_url == gc.DEEPSEEK_BASE_URL
+    assert client.api_keys == ["sk-fake-deepseek-1"]
+    assert gc.is_text_only_model("deepseek-chat", client.base_url) is True
+
+    captured_payloads: list[dict] = []
+
+    class FakeResp:
+        status_code = 200
+        text = '{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            captured_payloads.append({"url": url, "headers": headers, "json": json})
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "Client", FakeHttpClient)
+
+    out = client._call_openai_compatible("sys", "dịch dòng này", [], temperature=0.3)
+    assert out == '{"ok": true}'
+    assert captured_payloads[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert isinstance(captured_payloads[0]["json"]["messages"][1]["content"], str)
+    assert "temperature" in captured_payloads[0]["json"]
+
+    r1 = VisionLLMClient(model="deepseek-reasoner")
+    r1._call_openai_compatible("sys", "dịch dòng này", [], temperature=0.3)
+    assert "temperature" not in captured_payloads[1]["json"]
+
+    with pytest.raises(ValueError, match="DeepSeek API"):
+        client._call_openai_compatible("sys", "xem ảnh", [("p1", "AAA")], temperature=0.3)
+
+    img_dir = tmp_path / "cg"
+    img_dir.mkdir()
+    Image.new("RGB", (64, 64), (255, 255, 255)).save(img_dir / "01.png")
+    with pytest.raises(ValueError, match="Vision"):
+        run_compose_pipeline(img_dir, model="deepseek-chat", api_key="sk-fake-deepseek-1")
+
+
 
 
 

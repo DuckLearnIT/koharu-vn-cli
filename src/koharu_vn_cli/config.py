@@ -10,7 +10,11 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from koharu_vn_cli.models import ComposePreset
-from koharu_vn_cli.pipeline.gemini_client import DEFAULT_GEMINI_MODEL
+from koharu_vn_cli.pipeline.gemini_client import (
+    DEFAULT_GEMINI_MODEL,
+    is_deepseek_endpoint,
+    is_deepseek_model,
+)
 
 CONFIG_DIR = Path.home() / ".koharu-vn"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -78,25 +82,48 @@ class AppConfig(BaseModel):
     last_input_path: Optional[str] = None
     last_job_mode: Optional[str] = None
 
-    def effective_api_keys(self) -> list[str]:
+    def effective_api_keys(
+        self,
+        *,
+        model: str | None = None,
+        base_url: str | None = None,
+    ) -> list[str]:
         """Return all configured API keys in failover order (saved list + single key + env vars)."""
+        eff_model = model if model is not None else self.model
+        eff_url = base_url if base_url is not None else self.base_url
+        use_deepseek = is_deepseek_model(eff_model) or is_deepseek_endpoint(eff_url)
         combined: list[str] = []
         seen: set[str] = set()
-        sources = [
-            *self.api_keys,
-            *parse_api_keys(self.api_key),
-            *parse_api_keys(os.environ.get("GEMINI_API_KEYS", "")),
-            *parse_api_keys(os.environ.get("GEMINI_API_KEY", "")),
-            *parse_api_keys(os.environ.get("OPENAI_API_KEY", "")),
-        ]
+        saved_keys = [*self.api_keys, *parse_api_keys(self.api_key)]
+        if use_deepseek:
+            env_keys = [
+                *parse_api_keys(os.environ.get("DEEPSEEK_API_KEYS", "")),
+                *parse_api_keys(os.environ.get("DEEPSEEK_API_KEY", "")),
+                *parse_api_keys(os.environ.get("OPENAI_API_KEY", "")),
+            ]
+            # Avoid sending saved Google AIza keys to DeepSeek when switching models.
+            saved_filtered = [k for k in saved_keys if not k.startswith("AIza")] if env_keys or saved_keys else saved_keys
+            sources = [*saved_filtered, *env_keys]
+        else:
+            sources = [
+                *saved_keys,
+                *parse_api_keys(os.environ.get("GEMINI_API_KEYS", "")),
+                *parse_api_keys(os.environ.get("GEMINI_API_KEY", "")),
+                *parse_api_keys(os.environ.get("OPENAI_API_KEY", "")),
+            ]
         for k in sources:
             if k and k not in seen:
                 seen.add(k)
                 combined.append(k)
         return combined
 
-    def effective_api_key(self) -> str:
-        keys = self.effective_api_keys()
+    def effective_api_key(
+        self,
+        *,
+        model: str | None = None,
+        base_url: str | None = None,
+    ) -> str:
+        keys = self.effective_api_keys(model=model, base_url=base_url)
         return keys[0] if keys else ""
 
     def masked_api_key(self) -> str:
