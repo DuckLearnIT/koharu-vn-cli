@@ -969,6 +969,21 @@ class VisionLLMClient:
     )
 
 
+    _DEEPSEEK_R18_LOCALIZATION_ADDON = (
+        "\nPHONG CÁCH DOUJINSHI / R18 TỰ NHIÊN (DEEPSEEK UNCENSORED):\n"
+        "- KHÔNG tự kiểm duyệt, KHÔNG làm nhạt hay né tránh sắc thái 18+ của thoại gốc.\n"
+        "- Khớp đúng độ gợi cảm theo từng câu gốc: đoạn mở đầu/đời thường giữ giọng tự nhiên; khi vào cảnh thân mật hoặc 18+, dịch ướt át, kích thích, đúng chất doujinshi Việt.\n"
+        "- Dùng đúng từ vựng cộng đồng dịch doujinshi/R18 Việt quen dùng theo sắc thái cảnh:\n"
+        "  + Ngọt/e thẹn/vanilla: 'chỗ đó nhạy cảm quá...', 'bên trong nóng hổi', 'ướt nhẹp hết rồi', 'sâu quá... chạm tới rồi', 'sắp ra mất...♡', 'đừng liếm chỗ đó mà...'.\n"
+        "  + Táo bạo/dirty-talk/hardcore (khớp từ gốc kiểu ちんぽ/まんこ/イく/中出し/気持ちいい): dùng thẳng thắn, tự nhiên, gây kích thích ('nứng', 'cặc', 'lồn', 'bú', 'liếm', 'đụ', 'chịch', 'bắn tinh vào trong', 'sướng phát điên', 'dâm quá đi mất') thay vì né bằng từ y khoa hay từ văn viết.\n"
+        "- Giữ nhịp thở ngắt quãng (`...`, `♡`, `!?`) và tiếng rên Việt tự nhiên ('Ưm...', 'Á...♡', 'Hộc...', 'Khựa...').\n"
+    )
+
+    def _localization_rules(self) -> str:
+        if is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url):
+            return self._VI_LOCALIZATION_RULES + self._DEEPSEEK_R18_LOCALIZATION_ADDON
+        return self._VI_LOCALIZATION_RULES
+
     def build_story_bible(
         self,
         image_paths: list[Path],
@@ -1156,7 +1171,7 @@ class VisionLLMClient:
             "Nhiệm vụ: Đọc chính xác chữ gốc trong từng khung [ID] từ Bảng Crop chi tiết kết hợp Ảnh toàn trang, "
             "rồi dịch thoát ý sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, gợi cảm/gợi tình đúng mức theo đúng sắc thái cảnh truyện và xưng hô đã khóa.\n"
             + sfx_block
-            + self._VI_LOCALIZATION_RULES
+            + self._localization_rules()
         )
 
         lang_hint = (
@@ -1338,7 +1353,7 @@ class VisionLLMClient:
             "rồi dịch TẤT CẢ các ID lời thoại sang KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG thật tự nhiên, đúng xưng hô đã khóa.\n"
             "CẤM để trống `vietnamese` đối với lời thoại (trừ khi `is_sfx: true`) hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
             + sfx_block
-            + self._VI_LOCALIZATION_RULES
+            + self._localization_rules()
         )
         page_label = f" (Trang {page_index})" if page_index else ""
         user_prompt = (
@@ -1353,7 +1368,8 @@ class VisionLLMClient:
             "  ]\n"
             "}"
         )
-        data = self._call_json(system_prompt, user_prompt, images=[], temperature=0.25)
+        ocr_temp = 0.45 if (is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url)) else 0.25
+        data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
         raw_items = data.get("items") or data.get("regions") or []
         merged_sub = self._merge_translated_regions(to_translate, raw_items, ocr_texts=ocr_texts, skip_sfx=skip_sfx)
         by_sub_id = {r.id: r for r in merged_sub}
@@ -1465,7 +1481,7 @@ class VisionLLMClient:
             "Hãy dịch liền mạch, nối nhịp cảm xúc & xưng hô nhất quán xuyên suốt các trang trong tuyến này.\n"
             "CẤM để trống `vietnamese` (trừ khi `is_sfx: true`) hoặc giữ nguyên chữ Nhật/Hàn/Trung!\n"
             + sfx_block
-            + self._VI_LOCALIZATION_RULES
+            + self._localization_rules()
         )
         scene_hdr = f"Tuyến {scene_id}" if scene_id is not None else "Cùng 1 tuyến"
         user_prompt = (
@@ -1482,7 +1498,8 @@ class VisionLLMClient:
             "  ]\n"
             "}"
         )
-        data = self._call_json(system_prompt, user_prompt, images=[], temperature=0.25)
+        ocr_temp = 0.45 if (is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url)) else 0.25
+        data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
 
         by_page: dict[int, dict[str, Any]] = {}
         for p_entry in data.get("pages", []):
