@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import sys
+import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote
 
 import typer
 from rich.console import Console
@@ -13,6 +16,7 @@ from rich.table import Table
 
 from koharu_vn_cli.config import load_config
 from koharu_vn_cli.models import CharacterProfile, ComposePreset, StoryBible
+from koharu_vn_cli.notify import send_desktop_notification
 from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import DEFAULT_GEMINI_MODEL, VisionLLMClient
 from koharu_vn_cli.pipeline.runner import (
@@ -60,18 +64,106 @@ def _resolve_auth(api_key: str | None, base_url: str | None, model: str | None) 
     return eff_key, eff_keys, eff_url, eff_model
 
 
-def _cli_confirm_story_bible(bible: StoryBible, progress: Progress) -> StoryBible:
-    """Allow terminal user to inspect & fix detected game/character names before Pass 2."""
+def _cli_prompt_with_timeout(
+    prompt_text: str,
+    default: str = "",
+    *,
+    timeout_seconds: float = 60.0,
+) -> tuple[str, bool]:
+    """Read interactive CLI input with inactivity timeout; returns `(value, timed_out)`."""
+    if timeout_seconds <= 0 or not sys.stdin or not sys.stdin.isatty():
+        return str(typer.prompt(prompt_text, default=default)), False
+
+    sys.stdout.write(f"{prompt_text} [{default}]: ")
+    sys.stdout.flush()
+
+    if sys.platform.startswith("win"):
+        import msvcrt
+
+        buf: list[str] = []
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                deadline = time.monotonic() + timeout_seconds
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    val = "".join(buf).strip()
+                    return (val if val else default), False
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch in ("\x08", "\x7f"):
+                    if buf:
+                        buf.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                    continue
+                if ch in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                buf.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            else:
+                time.sleep(0.05)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return default, True
+
+    import select
+
+    ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+    if not ready:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return default, True
+    line = sys.stdin.readline().strip()
+    return (line if line else default), False
+
+
+def _cli_confirm_story_bible(
+    bible: StoryBible,
+    progress: Progress,
+    *,
+    timeout_seconds: float = 60.0,
+) -> StoryBible:
+    """Allow terminal user to inspect & fix detected game/character names (auto-confirms after 60s idle)."""
     progress.stop()
     try:
         console.print("\n[bold magenta]=== Kiểm tra Game & Nhân vật (Pass 1) ===[/bold magenta]")
+        console.print(
+            f"[dim](Tự động xác nhận giữ nguyên nếu bạn không phản hồi trong {int(timeout_seconds)} giây)[/dim]"
+        )
         console.print(f"Game / Series: [cyan]{bible.source_game or '(chưa rõ)'}[/cyan]")
-        new_game = typer.prompt("Sửa tên Game / Series (Enter để giữ nguyên)", default=bible.source_game)
+        new_game, timed_out = _cli_prompt_with_timeout(
+            "Sửa tên Game / Series (Enter để giữ nguyên)",
+            default=bible.source_game,
+            timeout_seconds=timeout_seconds,
+        )
+        if timed_out:
+            console.print("[yellow]⏱ Hết 60s không phản hồi -> tự động xác nhận & tiếp tục![/yellow]")
+            return bible
+
         updated_chars: list[CharacterProfile] = []
         for idx, ch in enumerate(bible.characters, start=1):
             console.print(f"  [{idx}] [bold]{ch.name}[/bold] ({ch.appearance}) -> [green]{ch.pronoun_rules}[/green]")
-            new_name = typer.prompt(f"    Tên nhân vật #{idx}", default=ch.name)
-            new_pron = typer.prompt(f"    Xưng hô #{idx}", default=ch.pronoun_rules)
+            new_name, t1 = _cli_prompt_with_timeout(
+                f"    Tên nhân vật #{idx}", default=ch.name, timeout_seconds=timeout_seconds
+            )
+            if t1:
+                console.print("[yellow]⏱ Hết 60s không phản hồi -> tự động xác nhận các mục còn lại![/yellow]")
+                updated_chars.extend(bible.characters[idx - 1 :])
+                return bible.model_copy(update={"source_game": new_game.strip(), "characters": updated_chars})
+            new_pron, t2 = _cli_prompt_with_timeout(
+                f"    Xưng hô #{idx}", default=ch.pronoun_rules, timeout_seconds=timeout_seconds
+            )
+            if t2:
+                updated_chars.append(ch.model_copy(update={"name": new_name.strip() or ch.name}))
+                updated_chars.extend(bible.characters[idx:])
+                console.print("[yellow]⏱ Hết 60s không phản hồi -> tự động xác nhận các mục còn lại![/yellow]")
+                return bible.model_copy(update={"source_game": new_game.strip(), "characters": updated_chars})
             updated_chars.append(
                 ch.model_copy(update={"name": new_name.strip() or ch.name, "pronoun_rules": new_pron.strip()})
             )
@@ -106,6 +198,7 @@ def translate(
     skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi dịch xong 100% (mặc định: bật)."),
+    notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi dịch xong hoặc gặp lỗi (mặc định: bật)."),
     workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song (0 = tự động theo số API key)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
 ) -> None:
@@ -118,6 +211,7 @@ def translate(
     eff_skip_sfx = cfg.skip_sfx if skip_sfx is None else skip_sfx
     eff_gpu = cfg.use_gpu if gpu is None else gpu
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
+    eff_notify = cfg.notify if notify is None else notify
     eff_workers = cfg.workers if workers is None else max(0, min(workers, 16))
     with Progress(
         SpinnerColumn(),
@@ -179,13 +273,32 @@ def translate(
                     on_confirm_story_bible=(lambda b: _cli_confirm_story_bible(b, progress)) if review_chars else None,
                 ),
             )
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
+            console.bell()
+            send_desktop_notification(
+                "Koharu-VN · Lỗi dịch truyện",
+                str(exc),
+                is_error=True,
+                enabled=eff_notify,
+            )
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(1)
+        except Exception as exc:
+            console.bell()
+            send_desktop_notification(
+                "Koharu-VN · Lỗi dịch truyện",
+                str(exc),
+                is_error=True,
+                enabled=eff_notify,
+            )
+            raise
 
+    console.bell()
+    send_desktop_notification(
+        "Koharu-VN · Dịch xong!",
+        f"Đã hoàn tất {len(docs)} trang -> {out_dir.name}",
+        enabled=eff_notify,
+    )
     console.print(f"[bold green]Hoàn tất ({len(docs)} trang)![/bold green] Ảnh kết quả lưu tại: {out_dir}")
     if (out_dir / ".koharu_cache").is_dir():
         console.print(f"[dim]Mẹo: Chỉnh thoại trong {out_dir / '.koharu_cache'}/*.koharu.json rồi chạy `koharu-vn rerender {out_dir}` (0 giây API).[/dim]")
@@ -219,6 +332,7 @@ def compose(
     seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
     review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi sáng tác."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi sáng tác xong 100% (mặc định: bật)."),
+    notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi sáng tác xong hoặc gặp lỗi (mặc định: bật)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua ảnh đã sáng tác sẵn trong thư mục đích."),
 ) -> None:
     """Tự sáng tác lời thoại Tiếng Việt cho ảnh Artist CG không lời (hỗ trợ cả Bubble Text & Chữ thường)."""
@@ -227,6 +341,7 @@ def compose(
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
+    eff_notify = cfg.notify if notify is None else notify
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -235,12 +350,15 @@ def compose(
         console=console,
     ) as progress:
         task = progress.add_task("AI đang sáng tác thoại CG...", total=None)
+        completed_pages = 0
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
             progress.update(task, total=max(1, total), description=f"[{idx}/{total}] {name}: {detail}")
 
         def on_page_done(idx: int, total: int, name: str, doc, out_path: Path) -> None:
-            progress.update(task, completed=idx)
+            nonlocal completed_pages
+            completed_pages += 1
+            progress.update(task, total=max(1, total), completed=completed_pages)
 
         def on_story_bible(bible) -> None:
             game_tag = f" [{bible.source_game}]" if getattr(bible, "source_game", "") else ""
@@ -280,9 +398,31 @@ def compose(
                 ),
             )
         except (FileNotFoundError, ValueError) as exc:
+            console.bell()
+            send_desktop_notification(
+                "Koharu-VN · Lỗi sáng tác CG",
+                str(exc),
+                is_error=True,
+                enabled=eff_notify,
+            )
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
+        except Exception as exc:
+            console.bell()
+            send_desktop_notification(
+                "Koharu-VN · Lỗi sáng tác CG",
+                str(exc),
+                is_error=True,
+                enabled=eff_notify,
+            )
+            raise
 
+    console.bell()
+    send_desktop_notification(
+        "Koharu-VN · Sáng tác CG xong!",
+        f"Đã hoàn tất {len(docs)} ảnh CG -> {out_dir.name}",
+        enabled=eff_notify,
+    )
     console.print(f"[bold green]Hoàn tất sáng tác ({len(docs)} ảnh)![/bold green] Lưu tại: {out_dir}")
 
 
@@ -374,7 +514,30 @@ def models(
             console.print(f"[red]Không lấy được danh sách model từ API: {exc}[/red]")
 
 
+_SUBCOMMANDS = {"translate", "compose", "rerender", "rename", "models", "ui"}
+
+
+def _clean_cli_drop_arg(raw: str) -> str:
+    s = raw.strip()
+    if s.startswith("& "):
+        s = s[2:].strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in {'"', "'"}:
+        s = s[1:-1].strip()
+    if s.lower().startswith("file:///"):
+        s = unquote(s[8:])
+    return s
+
+
 def main() -> None:
+    if len(sys.argv) >= 2:
+        cand = _clean_cli_drop_arg(sys.argv[1])
+        if (
+            cand
+            and not cand.startswith("-")
+            and cand.lower() not in _SUBCOMMANDS
+            and (Path(cand).exists() or cand.lower().endswith((".zip", ".cbz")))
+        ):
+            sys.argv = [sys.argv[0], "translate", cand, *sys.argv[2:]]
     app()
 
 

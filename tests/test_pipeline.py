@@ -2207,6 +2207,72 @@ def test_parallel_3stage_sliding_workers_and_pipelined_detect_inpaint(tmp_path: 
         )
 
 
+def test_zip_drop_cli_nested_sorting_macos_skip_and_notifications(tmp_path: Path, monkeypatch):
+    import io
+    import sys
+    import zipfile
+    import pytest
+    from koharu_vn_cli import cli
+    from koharu_vn_cli.pipeline.runner import collect_inputs
+
+    # 1. Nested multi-chapter .zip with __MACOSX metadata & duplicate stems (001.png in chap1 and chap2)
+    zip_path = tmp_path / "Series Pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("__MACOSX/chap1/._001.png", b"\x00\x05\x16\x07AppleDouble")
+        buf1 = io.BytesIO()
+        Image.new("RGB", (80, 100), (200, 10, 10)).save(buf1, format="PNG")
+        buf2 = io.BytesIO()
+        Image.new("RGB", (80, 100), (10, 200, 10)).save(buf2, format="PNG")
+        buf10 = io.BytesIO()
+        Image.new("RGB", (80, 100), (10, 10, 200)).save(buf10, format="PNG")
+        zf.writestr("chap10/001.png", buf10.getvalue())
+        zf.writestr("chap2/001.png", buf2.getvalue())
+        zf.writestr("chap1/001.png", buf1.getvalue())
+
+    ext_dir = tmp_path / "ext"
+    imgs, name = collect_inputs(zip_path, ext_dir)
+    assert name == "Series Pack"
+    assert [p.parent.name for p in imgs] == ["chap1", "chap2", "chap10"]
+
+    # Corrupt zip raises user-friendly ValueError
+    bad_zip = tmp_path / "broken.zip"
+    bad_zip.write_bytes(b"not a zip")
+    with pytest.raises(ValueError, match="File nén không hợp lệ"):
+        collect_inputs(bad_zip, tmp_path / "ext_bad")
+
+    # 2. Dropping .zip straight onto `koharu-vn <file.zip>` routes `main()` to `translate` & fires notifications
+    routed_args: list[Path] = []
+    cli_notifs: list[tuple[str, str, bool, bool]] = []
+
+    def fake_translate(input_path: Path, **_kw):
+        routed_args.append(input_path)
+        out = tmp_path / "Series Pack_vn"
+        out.mkdir(exist_ok=True)
+        return out, []
+
+    monkeypatch.setattr(cli, "run_translate_pipeline", fake_translate)
+    monkeypatch.setattr(
+        cli,
+        "send_desktop_notification",
+        lambda title, msg, is_error=False, enabled=True: (cli_notifs.append((title, msg, is_error, enabled)), True)[1],
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: __import__("koharu_vn_cli.config", fromlist=["AppConfig"]).AppConfig(api_key="dummy"))
+    monkeypatch.setattr(sys, "argv", ["koharu-vn", f'"{zip_path}"'])
+    with pytest.raises(SystemExit) as exit_exc:
+        cli.main()
+    assert exit_exc.value.code in (0, None)
+    assert routed_args == [zip_path]
+    assert len(cli_notifs) == 1 and cli_notifs[0][2] is False
+
+    # Error path in CLI also sends error notification
+    cli_notifs.clear()
+    monkeypatch.setattr(cli, "run_translate_pipeline", lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("Zip lỗi")))
+    res_err = CliRunner().invoke(cli.app, ["translate", str(zip_path), "--api-key", "dummy"])
+    assert res_err.exit_code == 1
+    assert len(cli_notifs) == 1 and cli_notifs[0][2] is True and "Zip lỗi" in cli_notifs[0][1]
+
+
+
 
 
 

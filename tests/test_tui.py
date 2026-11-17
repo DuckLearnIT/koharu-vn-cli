@@ -157,6 +157,15 @@ def test_tui_slash_popup_style_picker_and_rerender(tmp_path: Path, monkeypatch) 
             await pilot.pause()
             assert app.cfg.workers == 0
 
+            # 3g. `/notify` toggles desktop notification setting
+            assert app.cfg.notify is True
+            app.dispatch_command("/notify off")
+            await pilot.pause()
+            assert app.cfg.notify is False
+            app.dispatch_command("/notify on")
+            await pilot.pause()
+            assert app.cfg.notify is True
+
             # 4. Run `/rerender` in background worker inside TUI
             app.dispatch_command(f'/rerender "{out_dir}"')
             deadline = time.monotonic() + 8.0
@@ -165,3 +174,87 @@ def test_tui_slash_popup_style_picker_and_rerender(tmp_path: Path, monkeypatch) 
             assert (out_dir / "cg.png").is_file()
 
     asyncio.run(scenario())
+
+
+def test_tui_zip_drop_intent_and_review_timeout_and_notify(tmp_path: Path, monkeypatch) -> None:
+    from koharu_vn_cli.models import CharacterProfile, StoryBible
+    from koharu_vn_cli.notify import _build_windows_toast_script
+    from koharu_vn_cli.tui import StoryBibleReviewModal
+
+    cfg_file = tmp_path / "cfg.json"
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: load_config(cfg_file))
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda c: save_config(c, cfg_file))
+
+    zip_file = tmp_path / "Manga Chap 1.zip"
+    zip_file.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+    # 1. Dropping a .zip path directly (quoted, PowerShell &drop, or file:// URI) triggers translate directly
+    for dropped in (
+        f'"{zip_file}"',
+        f"& '{zip_file}'",
+        zip_file.as_uri(),
+    ):
+        act, parsed_p, opts = parse_natural_intent(dropped)
+        assert act == "translate"
+        assert parsed_p is not None and Path(parsed_p) == zip_file
+        assert opts["prompt"] == ""
+
+    # Dropping .zip with explicit compose keyword still picks compose
+    act_c, _, _ = parse_natural_intent(f'sáng tác "{zip_file}"')
+    assert act_c == "compose"
+
+    # 2. Toast XML escapes special characters cleanly
+    ps_src = _build_windows_toast_script("Koharu <Test>", "Lỗi & timeout > 60s", is_error=True)
+    assert "Koharu &lt;Test&gt;" in ps_src
+    assert "Lỗi &amp; timeout &gt; 60s" in ps_src
+
+    # 3. StoryBibleReviewModal defaults to 60s idle timeout & auto-confirms when idle
+    bible = StoryBible(
+        source_game="Blue Archive",
+        characters=[CharacterProfile(name="Hoshino", appearance="tóc hồng", pronoun_rules="tớ - cậu")],
+    )
+    default_modal = StoryBibleReviewModal(bible)
+    assert default_modal._timeout_seconds == 60
+
+    results: list[StoryBible | None] = []
+    timed_out_flag: list[bool] = []
+
+    async def review_timeout_scenario() -> None:
+        app = KoharuTUI()
+        async with app.run_test(size=(120, 36)) as pilot:
+            modal = StoryBibleReviewModal(bible, timeout_seconds=1)
+            app.push_screen(modal, lambda res: (results.append(res), timed_out_flag.append(modal.timed_out)))
+            await pilot.pause(1.35)
+            assert timed_out_flag == [True]
+            assert len(results) == 1 and results[0] is not None
+            assert results[0].source_game == "Blue Archive"
+            assert results[0].characters[0].name == "Hoshino"
+
+    asyncio.run(review_timeout_scenario())
+
+    # 4. `_start_translate` sends notification on success and on error
+    notifs: list[tuple[str, str, bool, bool]] = []
+    monkeypatch.setattr(
+        "koharu_vn_cli.tui.send_desktop_notification",
+        lambda title, msg, is_error=False, enabled=True: (notifs.append((title, msg, is_error, enabled)), True)[1],
+    )
+    monkeypatch.setattr(
+        "koharu_vn_cli.tui.run_translate_pipeline",
+        lambda p, **_kw: (tmp_path / "out_ok", []),
+    )
+    app_ok = KoharuTUI()
+    app_ok.call_from_thread = lambda fn, *a, **kw: None  # type: ignore[method-assign]
+    app_ok._start_translate.__wrapped__(app_ok, zip_file)
+    assert len(notifs) == 1
+    assert notifs[0][2] is False and "Dịch xong" in notifs[0][0]
+
+    notifs.clear()
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("API broken")
+
+    monkeypatch.setattr("koharu_vn_cli.tui.run_translate_pipeline", boom)
+    app_ok._start_translate.__wrapped__(app_ok, zip_file)
+    assert len(notifs) == 1
+    assert notifs[0][2] is True and "API broken" in notifs[0][1]
+

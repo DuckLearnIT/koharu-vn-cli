@@ -71,6 +71,7 @@ class AppConfig(BaseModel):
     skip_sfx: bool = True
     clean_cache: bool = True
     use_gpu: bool = True
+    notify: bool = True
     workers: int = Field(default=0, ge=0, le=16)
     theme: str = "tokyo-night"
     last_output_dir: Optional[str] = None

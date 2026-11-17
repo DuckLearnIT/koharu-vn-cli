@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from rich import box
 from rich.panel import Panel
@@ -29,6 +30,7 @@ from textual.widgets.option_list import Option
 from koharu_vn_cli import __version__
 from koharu_vn_cli.config import CONFIG_FILE, AppConfig, load_config, parse_api_keys, save_config
 from koharu_vn_cli.models import CharacterProfile, ComposePreset, PageDocument, StoryBible
+from koharu_vn_cli.notify import send_desktop_notification
 from koharu_vn_cli.pipeline.detector import active_ort_provider_label
 from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
@@ -52,16 +54,17 @@ class SlashSpec:
 
 
 SLASH_COMMANDS: tuple[SlashSpec, ...] = (
-    SlashSpec("/translate", "<đường_dẫn> [--resume]", "Dịch truyện tranh (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
+    SlashSpec("/translate", "<đường_dẫn|.zip> [--resume]", "Dịch truyện tranh / file .zip / .cbz (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
     SlashSpec("/compose", "<đường_dẫn> [--resume]", "Tự sáng tác thoại cho Artist CG không lời"),
     SlashSpec("/resume", "[đường_dẫn]", "Chạy tiếp tác vụ bị dừng/lỗi từ trang chưa xong (bỏ qua trang đã dịch)"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
     SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
-    SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật game sau Pass 1"),
+    SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật sau Pass 1 (tự xác nhận sau 60s)"),
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
     SlashSpec("/cache", "[clean|keep]", "Tự xóa .koharu_cache sau khi dịch xong 100% (mặc định: tự xóa)"),
+    SlashSpec("/notify", "[on|off]", "Gửi thông báo Windows khi dịch xong hoặc gặp lỗi (mặc định: bật)"),
     SlashSpec("/workers", "[số|auto]", "Số luồng API dịch song song N, N+1... (auto = theo số API key)"),
     SlashSpec("/gpu", "[on|off]", "Bật/tắt tăng tốc GPU (CUDA) cho Detector, LaMa Inpaint & OCR"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
@@ -125,25 +128,34 @@ THEME_CHOICES: list[tuple[str, str]] = [
 
 
 def strip_path_quotes(raw: str) -> str:
-    """Clean dragged-and-dropped Windows Terminal / Explorer path syntax."""
+    """Clean dragged-and-dropped Windows Terminal / Explorer / file:// path syntax."""
     s = raw.strip()
     if s.startswith("& "):
         s = s[2:].strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in {'"', "'"}:
-        s = s[1:-1]
+        s = s[1:-1].strip()
+    if s.lower().startswith("file:///"):
+        s = unquote(s[8:])
+    elif s.lower().startswith("file://"):
+        s = unquote(s[7:])
     return s.strip()
 
 
 def extract_path_and_remainder(text: str) -> tuple[str | None, str]:
     """
-    Find a Windows/Unix file or folder path (quoted, `@prefixed`, or drive-letter) inside user text
-    and return `(clean_path, remaining_instructions)`.
+    Find a Windows/Unix file or folder path (quoted, `file://`, `@prefixed`, or drive-letter)
+    inside user text and return `(clean_path, remaining_instructions)`.
     """
-    cleaned = text.strip()
+    cleaned = re.sub(
+        r"file:///([^\s\"']+)",
+        lambda m: unquote(m.group(1)),
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
     # 1. Explicit quoted path "..." or '...' or & '...'
     m_quoted = re.search(r'(?:&\s*)?(["\'])([^"\']+)\1', cleaned)
     if m_quoted:
-        cand = m_quoted.group(2).strip().lstrip("@")
+        cand = strip_path_quotes(m_quoted.group(2)).lstrip("@")
         if cand:
             rem = (cleaned[: m_quoted.start()] + " " + cleaned[m_quoted.end() :]).strip()
             return cand, rem
@@ -171,7 +183,7 @@ def extract_path_and_remainder(text: str) -> tuple[str | None, str]:
 
     # 3. @path or relative token containing / or image/archive suffix
     for tok in cleaned.split():
-        cand = tok.lstrip("@")
+        cand = strip_path_quotes(tok).lstrip("@")
         if (
             cand.startswith((".", "~", "/", "\\"))
             or any(cand.lower().endswith(ext) for ext in (*IMAGE_EXTS, ".zip", ".cbz"))
@@ -189,7 +201,7 @@ def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
     `action` is one of: 'translate', 'compose', 'rerender', 'pick_action', 'chat'.
     """
     path_str, rem = extract_path_and_remainder(text)
-    low = rem.lower() + " " + text.lower()
+    low = rem.lower() if path_str else text.lower()
 
     if any(k in low for k in ("rerender", "render lại", "vẽ lại")):
         return "rerender", path_str, {"prompt": rem}
@@ -232,6 +244,8 @@ def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
             return "translate", path_str, {"prompt": hint}
         if style_override is not None:
             return "compose", path_str, {"prompt": hint, "style": style_override}
+        if Path(path_str).suffix.lower() in {".zip", ".cbz"}:
+            return "translate", path_str, {"prompt": hint}
         return "pick_action", path_str, {"prompt": hint}
 
     return "chat", None, {"text": text}
@@ -545,13 +559,22 @@ class TagEditModal(ModalScreen[str | None]):
 
 
 class StoryBibleReviewModal(ModalScreen[StoryBible | None]):
-    """Interactive modal after Pass 1 so the user can fix detected game & character names/pronouns."""
+    """Interactive modal after Pass 1 with auto-confirm countdown when user does not respond."""
 
     BINDINGS = [Binding("escape", "cancel", "Giữ nguyên")]
 
-    def __init__(self, bible: StoryBible) -> None:
+    def __init__(self, bible: StoryBible, *, timeout_seconds: float = 60.0) -> None:
         super().__init__()
         self.bible = bible
+        self._timeout_seconds = max(0, int(round(timeout_seconds)))
+        self._remaining = self._timeout_seconds
+        self._timer = None
+        self.timed_out = False
+
+    def _countdown_text(self) -> str:
+        if self._timeout_seconds <= 0:
+            return ""
+        return f"⏳ Tự động xác nhận sau {self._remaining}s nếu không thao tác"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-card"):
@@ -577,12 +600,51 @@ class StoryBibleReviewModal(ModalScreen[StoryBible | None]):
                 with Horizontal(classes="char-row"):
                     yield Input(value="", placeholder="Tên nhân vật thêm (bỏ trống nếu không)", id=f"rev-name-{add_idx}")
                     yield Input(value="", placeholder="Xưng hô (vd: tôi - cô ấy)", id=f"rev-pron-{add_idx}")
+            yield Label(self._countdown_text(), id="review-countdown")
             with Horizontal(id="modal-actions"):
                 yield Button("Giữ nguyên AI", id="skip-review-btn")
                 yield Button("Xác nhận & Tiếp tục", variant="primary", id="save-review-btn")
 
+    def on_mount(self) -> None:
+        if self._timeout_seconds > 0:
+            self._timer = self.set_interval(1.0, self._tick_countdown)
+
+    def _reset_countdown(self) -> None:
+        if self._timeout_seconds <= 0:
+            return
+        self._remaining = self._timeout_seconds
+        try:
+            self.query_one("#review-countdown", Label).update(self._countdown_text())
+        except Exception:
+            pass
+
+    @on(Input.Changed)
+    def _on_any_input_changed(self) -> None:
+        self._reset_countdown()
+
+    def on_key(self, event: events.Key) -> None:
+        self._reset_countdown()
+
+    def _tick_countdown(self) -> None:
+        if self._remaining <= 1:
+            self._remaining = 0
+            if self._timer is not None:
+                self._timer.stop()
+                self._timer = None
+            self.timed_out = True
+            self._save()
+            return
+        self._remaining -= 1
+        try:
+            self.query_one("#review-countdown", Label).update(self._countdown_text())
+        except Exception:
+            pass
+
     @on(Button.Pressed, "#save-review-btn")
     def _save(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
         new_game = self.query_one("#rev-game-input", Input).value.strip()
         updated_chars: list[CharacterProfile] = []
         for idx, ch in enumerate(self.bible.characters):
@@ -599,9 +661,15 @@ class StoryBibleReviewModal(ModalScreen[StoryBible | None]):
 
     @on(Button.Pressed, "#skip-review-btn")
     def _skip(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
         self.dismiss(None)
 
     def action_cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
         self.dismiss(None)
 
 
@@ -739,8 +807,13 @@ class KoharuTUI(App[None]):
     }
 
     /* Modals */
-    PickerModal, KeySetupModal, RunJobModal, PromptEditModal, TagEditModal {
+    PickerModal, KeySetupModal, RunJobModal, PromptEditModal, TagEditModal, StoryBibleReviewModal {
         align: center middle;
+    }
+
+    #review-countdown {
+        color: $warning;
+        margin-top: 1;
     }
 
     #modal-card {
@@ -825,6 +898,7 @@ class KoharuTUI(App[None]):
         self._popup_mode: str = ""  # "slash" | "path" | ""
         self._popup_items: list[tuple[str, str]] = []  # (insert_text, kind)
         self._popup_navigated = False
+        self._review_timeout_seconds: float = 60.0
 
     def compose(self) -> ComposeResult:
         yield Static("", id="topbar", markup=True)
@@ -843,7 +917,7 @@ class KoharuTUI(App[None]):
         with Horizontal(id="composer-box"):
             yield Label("❯ ", id="prompt-caret")
             yield Input(
-                placeholder="Gõ / lệnh, @đường_dẫn, kéo thả thư mục truyện/CG, hoặc yêu cầu tự nhiên...",
+                placeholder="Thả file .zip / .cbz / thư mục truyện vào đây rồi Enter để dịch ngay · hoặc gõ / để xem lệnh...",
                 id="prompt-input",
             )
         yield Static("", id="status-strip", markup=True)
@@ -914,6 +988,7 @@ class KoharuTUI(App[None]):
             f"Font: [white]{self.cfg.font or 'auto (animeace3/pangolin)'}[/white]\n"
             f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
             f"Cache: [cyan]{'Tự xóa khi xong 100%' if self.cfg.clean_cache else 'Giữ .koharu_cache'}[/cyan]\n"
+            f"Thông báo: [cyan]{'Bật (xong/lỗi)' if self.cfg.notify else 'Tắt'}[/cyan]\n"
             f"Luồng dịch: [cyan]{workers_lbl}[/cyan]\n"
             f"Prompt: [dim]{(self.cfg.custom_prompt[:46] + '...') if len(self.cfg.custom_prompt) > 46 else (self.cfg.custom_prompt or 'không')}[/dim]"
         )
@@ -959,7 +1034,7 @@ class KoharuTUI(App[None]):
                 border_style="cyan",
                 box=box.ROUNDED,
                 title=f"[bold white]Chào mừng đến Koharu-VN CLI v{__version__}[/bold white]",
-                subtitle="[dim]Kéo thả ảnh/thư mục vào khung dưới hoặc gõ / để bắt đầu[/dim]",
+                subtitle="[dim]Kéo thả file .zip / thư mục truyện vào khung dưới rồi nhấn Enter để dịch ngay, hoặc gõ /[/dim]",
             )
         )
 
@@ -1098,7 +1173,7 @@ class KoharuTUI(App[None]):
             return
 
         for p in entries:
-            kind_tag = "[DIR]" if p.is_dir() else "[IMG/CBZ]"
+            kind_tag = "[DIR]" if p.is_dir() else ("[ZIP]" if p.suffix.lower() in {".zip", ".cbz"} else "[IMG]")
             p_str = str(p)
             if " " in p_str:
                 p_str = f'"{p_str}"'
@@ -1536,6 +1611,22 @@ class KoharuTUI(App[None]):
                 self._log_ai(
                     "Cache: [bold yellow]GIỮ LẠI[/bold yellow] — giữ `.koharu_cache` để `/rerender` hoặc chỉnh sửa thoại sau."
                 )
+        elif cmd == "/notify":
+            val = rest.strip().lower()
+            if val in {"on", "1", "true", "yes"}:
+                self.cfg.notify = True
+            elif val in {"off", "0", "false", "no"}:
+                self.cfg.notify = False
+            else:
+                self.cfg.notify = not self.cfg.notify
+            save_config(self.cfg)
+            self._refresh_chrome()
+            if self.cfg.notify:
+                self._log_ai(
+                    "Thông báo: [bold cyan]BẬT[/bold cyan] — sẽ gửi thông báo Windows kèm chuông báo khi dịch xong hoặc gặp lỗi."
+                )
+            else:
+                self._log_ai("Thông báo: [bold yellow]TẮT[/bold yellow] — không bật popup thông báo Windows.")
         elif cmd == "/workers":
             val = rest.strip().lower()
             if not val:
@@ -1914,11 +2005,26 @@ class KoharuTUI(App[None]):
         done_evt: threading.Event,
         result_holder: list[StoryBible | None],
     ) -> None:
+        modal = StoryBibleReviewModal(bible, timeout_seconds=self._review_timeout_seconds)
+
         def _on_done(edited: StoryBible | None) -> None:
+            if modal.timed_out:
+                self._log_ai(
+                    f"⏱ Hết {int(self._review_timeout_seconds)}s không phản hồi — tự động xác nhận nhân vật & tiếp tục dịch.",
+                    "dim",
+                )
             result_holder.append(edited)
             done_evt.set()
 
-        self.push_screen(StoryBibleReviewModal(bible), _on_done)
+        self.bell()
+        self.push_screen(modal, _on_done)
+
+    def _notify_result(self, title: str, message: str, *, is_error: bool = False) -> None:
+        try:
+            self.call_from_thread(self.bell)
+        except Exception:
+            pass
+        send_desktop_notification(title, message, is_error=is_error, enabled=self.cfg.notify)
 
     def _build_hooks(self) -> PipelineHooks:
         done_pages = 0
@@ -2043,6 +2149,10 @@ class KoharuTUI(App[None]):
                 self._log_ai,
                 f"[bold green]Hoàn tất dịch {len(docs)} trang![/bold green] Lưu tại: [cyan]{out_dir}[/cyan] (gõ `/open` để mở)",
             )
+            self._notify_result(
+                "Koharu-VN · Dịch xong!",
+                f"Đã hoàn tất {len(docs)} trang -> {out_dir.name}",
+            )
         except PipelineCancelledError:
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
             self.call_from_thread(self._log_ai, "Tác vụ đã được hủy theo yêu cầu. Gõ `/resume` để chạy tiếp.", "yellow")
@@ -2053,6 +2163,7 @@ class KoharuTUI(App[None]):
                 f"Lỗi khi dịch truyện: [red]{exc}[/red]\n[dim]Mẹo: Gõ `/resume` để dịch tiếp từ trang đang dừng mà không tốn công dịch lại các trang đã xong.[/dim]",
                 "red",
             )
+            self._notify_result("Koharu-VN · Lỗi dịch truyện", str(exc), is_error=True)
 
     @work(thread=True)
     def _start_compose(
@@ -2098,6 +2209,10 @@ class KoharuTUI(App[None]):
                 self._log_ai,
                 f"[bold green]Hoàn tất sáng tác thoại CG ({self.cfg.compose_style.value})![/bold green] Lưu tại: [cyan]{out_dir}[/cyan]",
             )
+            self._notify_result(
+                "Koharu-VN · Sáng tác CG xong!",
+                f"Đã hoàn tất {len(docs)} ảnh CG -> {out_dir.name}",
+            )
         except PipelineCancelledError:
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
             self.call_from_thread(self._log_ai, "Tác vụ đã được hủy. Gõ `/resume` để chạy tiếp.", "yellow")
@@ -2108,6 +2223,7 @@ class KoharuTUI(App[None]):
                 f"Lỗi khi sáng tác CG: [red]{exc}[/red]\n[dim]Mẹo: Gõ `/resume` để chạy tiếp từ trang đang dừng.[/dim]",
                 "red",
             )
+            self._notify_result("Koharu-VN · Lỗi sáng tác CG", str(exc), is_error=True)
 
     def _launch_rename(self, input_path: Path, in_place: bool = False) -> None:
         if self.is_running_job:
@@ -2135,9 +2251,11 @@ class KoharuTUI(App[None]):
                 self._log_ai,
                 f"[bold green]Đã đổi tên 001..{len(files):03d}.webp (max quality 100)![/bold green] Lưu tại: [cyan]{out_dir}[/cyan]",
             )
+            self._notify_result("Koharu-VN · Đổi tên WebP xong!", f"{len(files)} ảnh -> {out_dir.name}")
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(self._log_ai, f"Lỗi khi đổi tên & chuyển WebP: [red]{exc}[/red]", "red")
+            self._notify_result("Koharu-VN · Lỗi đóng gói WebP", str(exc), is_error=True)
 
     @work(thread=True)
     def _start_rerender(self, output_dir: Path) -> None:
@@ -2156,9 +2274,11 @@ class KoharuTUI(App[None]):
                 self._log_ai,
                 f"[bold green]Đã render lại {len(docs)} trang (0 giây API)![/bold green] Tại: [cyan]{output_dir}[/cyan]",
             )
+            self._notify_result("Koharu-VN · Rerender xong!", f"{len(docs)} trang tại {output_dir.name}")
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(self._log_ai, f"Lỗi khi rerender: [red]{exc}[/red]", "red")
+            self._notify_result("Koharu-VN · Lỗi rerender", str(exc), is_error=True)
 
     @work(thread=True)
     def _warmup_models_worker(self) -> None:

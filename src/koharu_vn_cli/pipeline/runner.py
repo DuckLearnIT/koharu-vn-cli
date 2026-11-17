@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -158,7 +159,16 @@ def _detect_image_ext(path: Path) -> str | None:
 
 
 def _is_supported_image(path: Path) -> bool:
-    return path.is_file() and _detect_image_ext(path) is not None
+    if not path.is_file():
+        return False
+    if path.name.startswith("._") or "__MACOSX" in path.parts:
+        return False
+    try:
+        if path.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    return _detect_image_ext(path) is not None
 
 
 def _resolve_output_ext(path: Path, output_format: str = "original") -> str:
@@ -198,6 +208,24 @@ def natural_key(path: Path) -> tuple[int, int, list[int | str]]:
     return (1, 0, parts)
 
 
+def _archive_natural_key(
+    root: Path, path: Path
+) -> tuple[tuple[list[int | str], ...], tuple[int, int, list[int | str]]]:
+    try:
+        rel = path.relative_to(root)
+        dir_key = tuple(
+            [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", part)]
+            for part in rel.parts[:-1]
+        )
+    except ValueError:
+        dir_key = ()
+    return dir_key, natural_key(path)
+
+
+def _cache_stem_for_page(img_path: Path, idx: int, seq_pad: int, stem_counts: Counter[str]) -> str:
+    return f"{idx:0{seq_pad}d}_{img_path.stem}" if stem_counts[img_path.stem] > 1 else img_path.stem
+
+
 def collect_inputs(input_path: Path, extract_dir: Path | None) -> tuple[list[Path], str]:
     """Collect naturally sorted image paths from a single image, folder, or .zip/.cbz archive."""
     if not input_path.exists():
@@ -208,15 +236,21 @@ def collect_inputs(input_path: Path, extract_dir: Path | None) -> tuple[list[Pat
             if extract_dir is None:
                 raise ValueError("extract_dir is required for archive input")
             root_resolved = extract_dir.resolve()
-            with zipfile.ZipFile(input_path, "r") as zf:
-                for member in zf.infolist():
-                    target = (root_resolved / member.filename).resolve()
-                    if not target.is_relative_to(root_resolved):
-                        continue
-                    zf.extract(member, extract_dir)
+            try:
+                with zipfile.ZipFile(input_path, "r") as zf:
+                    for member in zf.infolist():
+                        m_path = Path(member.filename)
+                        if "__MACOSX" in m_path.parts or m_path.name.startswith("._"):
+                            continue
+                        target = (root_resolved / member.filename).resolve()
+                        if not target.is_relative_to(root_resolved):
+                            continue
+                        zf.extract(member, extract_dir)
+            except zipfile.BadZipFile as exc:
+                raise ValueError(f"File nén không hợp lệ hoặc bị hỏng: {input_path.name}") from exc
             imgs = sorted(
                 (p for p in extract_dir.rglob("*") if _is_supported_image(p)),
-                key=natural_key,
+                key=lambda p: _archive_natural_key(extract_dir, p),
             )
             return imgs, input_path.stem
         if _is_supported_image(input_path):
@@ -230,7 +264,7 @@ def collect_inputs(input_path: Path, extract_dir: Path | None) -> tuple[list[Pat
     if not imgs:
         imgs = sorted(
             (p for p in input_path.rglob("*") if _is_supported_image(p)),
-            key=natural_key,
+            key=lambda p: _archive_natural_key(input_path, p),
         )
     return imgs, input_path.name
 
@@ -700,6 +734,7 @@ def run_translate_pipeline(
 
         docs_by_idx: dict[int, PageDocument] = {}
         seq_pad = max(3, len(str(total)))
+        stem_counts = Counter(p.stem for p in images)
         translation_memory: dict[str, str] = {}
         scene_summaries_by_page: dict[int, dict[int, str]] = {sc.scene_id: {} for sc in scenes}
 
@@ -896,13 +931,14 @@ def run_translate_pipeline(
                         hooks.check_cancelled()
                         idx = p_idx + 1
                         img_path = images[p_idx]
+                        cache_stem = _cache_stem_for_page(img_path, idx, seq_pad, stem_counts)
                         out_img_path = out_dir / _output_image_name(
                             img_path,
                             output_format=output_format,
-                            seq_index=idx if sequential_names else None,
+                            seq_index=idx if (sequential_names or stem_counts[img_path.stem] > 1) else None,
                             seq_pad=seq_pad,
                         )
-                        json_path = cache_dir / f"{img_path.stem}.koharu.json"
+                        json_path = cache_dir / f"{cache_stem}.koharu.json"
 
                         if resume and out_img_path.is_file() and json_path.is_file():
                             prev_doc = PageDocument.model_validate_json(
@@ -950,7 +986,7 @@ def run_translate_pipeline(
                         if abort_event.is_set():
                             return
                         hooks.check_cancelled()
-                        clean_path = cache_dir / f"{img_path.stem}.clean.png"
+                        clean_path = cache_dir / f"{cache_stem}.clean.png"
                         region_items: list[TextRegionItem] = [
                             TextRegionItem(
                                 id=reg_idx,
@@ -1545,15 +1581,17 @@ def run_compose_pipeline(
                 sheet_results = {}
 
         seq_pad = max(3, len(str(total)))
+        stem_counts = Counter(p.stem for p in images)
         for idx, img_path in enumerate(images, start=1):
             hooks.check_cancelled()
+            cache_stem = _cache_stem_for_page(img_path, idx, seq_pad, stem_counts)
             out_img_path = out_dir / _output_image_name(
                 img_path,
                 output_format=output_format,
-                seq_index=idx if sequential_names else None,
+                seq_index=idx if (sequential_names or stem_counts[img_path.stem] > 1) else None,
                 seq_pad=seq_pad,
             )
-            json_path = cache_dir / f"{img_path.stem}.koharu.json"
+            json_path = cache_dir / f"{cache_stem}.koharu.json"
 
             if resume and out_img_path.is_file() and json_path.is_file():
                 prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
