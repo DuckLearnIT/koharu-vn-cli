@@ -106,6 +106,7 @@ def translate(
     skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi dịch xong 100% (mặc định: bật)."),
+    workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song (0 = tự động theo số API key)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
 ) -> None:
     """Dịch truyện tranh (Nhật, Hàn, Trung, Anh -> Tiếng Việt) sửa triệt để lỗi cỡ chữ, viền & đè chữ."""
@@ -113,11 +114,11 @@ def translate(
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
-    eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
     eff_vision = cfg.vision_translate if vision is None else vision
     eff_skip_sfx = cfg.skip_sfx if skip_sfx is None else skip_sfx
     eff_gpu = cfg.use_gpu if gpu is None else gpu
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
+    eff_workers = cfg.workers if workers is None else max(0, min(workers, 16))
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -126,12 +127,15 @@ def translate(
         console=console,
     ) as progress:
         task = progress.add_task("Đang dịch truyện...", total=None)
+        completed_pages = 0
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
             progress.update(task, total=max(1, total), description=f"[{idx}/{total}] {name}: {detail}")
 
         def on_page_done(idx: int, total: int, name: str, doc, out_path: Path) -> None:
-            progress.update(task, completed=idx)
+            nonlocal completed_pages
+            completed_pages += 1
+            progress.update(task, total=max(1, total), completed=completed_pages)
 
         def on_story_bible(bible) -> None:
             game_tag = f" [{bible.source_game}]" if getattr(bible, "source_game", "") else ""
@@ -167,6 +171,7 @@ def translate(
                 use_gpu=eff_gpu,
                 resume=resume,
                 clean_cache=eff_clean_cache,
+                max_workers=eff_workers,
                 hooks=PipelineHooks(
                     on_step=on_step,
                     on_page_done=on_page_done,

@@ -2087,5 +2087,126 @@ def test_clean_cache_removes_cache_only_when_all_pages_complete(tmp_path: Path, 
     assert not (cg_out_clean / ".koharu_cache").exists()
 
 
+def test_parallel_3stage_sliding_workers_and_pipelined_detect_inpaint(tmp_path: Path, monkeypatch):
+    import threading
+    import time
+    import pytest
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    for i in range(1, 5):
+        Image.new("RGB", (240, 320), (240, 240, 240)).save(in_dir / f"p{i}.png")
+
+    gpu_mu = threading.Lock()
+    active_gpu = 0
+    gpu_overlap = False
+    detect_count = 0
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            nonlocal active_gpu, gpu_overlap, detect_count
+            with gpu_mu:
+                active_gpu += 1
+                if active_gpu > 1:
+                    gpu_overlap = True
+            try:
+                detect_count += 1
+                time.sleep(0.01)
+                mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+                return [DetectedRegion((40, 40, 180, 120), (30, 30, 190, 130), None, True, False, 0.9)], mask
+            finally:
+                with gpu_mu:
+                    active_gpu -= 1
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            nonlocal active_gpu, gpu_overlap
+            with gpu_mu:
+                active_gpu += 1
+                if active_gpu > 1:
+                    gpu_overlap = True
+            try:
+                time.sleep(0.01)
+                return rgb.copy()
+            finally:
+                with gpu_mu:
+                    active_gpu -= 1
+
+    class FakeCache:
+        def get_detector(self, accurate=True):
+            return FakeDet()
+
+        def get_inpainter(self):
+            return FakeInp()
+
+    llm_mu = threading.Lock()
+    active_llm = 0
+    max_active_llm = 0
+    used_keys: list[str] = []
+    started_order: list[int] = []
+    detect_counts_at_llm_start: list[int] = []
+
+    def fake_translate_page(self, rgb, regions, **kwargs):
+        nonlocal active_llm, max_active_llm
+        p_idx = kwargs["page_index"]
+        with llm_mu:
+            active_llm += 1
+            max_active_llm = max(max_active_llm, active_llm)
+            used_keys.append(self.api_key)
+            started_order.append(p_idx)
+            detect_counts_at_llm_start.append(detect_count)
+        try:
+            # Make page 1 slower than page 2 so worker 2 steals page 3 while worker 1 still finishes page 1
+            time.sleep(0.14 if p_idx == 1 else 0.05)
+            out = [r.model_copy(update={"source_text": "JP", "translated_text": f"Trang {p_idx}"}) for r in regions]
+            return out, f"Tóm tắt {p_idx}"
+        finally:
+            with llm_mu:
+                active_llm -= 1
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.VisionLLMClient.translate_page", fake_translate_page)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out_parallel",
+        api_keys=["key-A", "key-B"],
+        story_pass=False,
+        max_workers=0,  # auto -> 2 workers matching 2 API keys
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+
+    assert not gpu_overlap
+    assert max(detect_counts_at_llm_start) == 4
+    assert max_active_llm == 2
+    assert set(used_keys) == {"key-A", "key-B"}
+    assert started_order[0] in (1, 2) and set(started_order[:2]) == {1, 2}
+    # All 4 docs returned sorted strictly 1..4 even when page 2 completed before page 1
+    assert [d.regions[0].translated_text for d in docs] == ["Trang 1", "Trang 2", "Trang 3", "Trang 4"]
+    assert all((out_dir / f"p{i}.png").is_file() for i in range(1, 5))
+
+    # Fatal error when skip_blocked=False must unwind all 3 stages cleanly without deadlock
+    def fail_on_p3(self, rgb, regions, **kwargs):
+        if kwargs["page_index"] == 3:
+            raise ContentBlockedError("FATAL_BLOCK")
+        time.sleep(0.02)
+        out = [r.model_copy(update={"source_text": "JP", "translated_text": "OK"}) for r in regions]
+        return out, ""
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.VisionLLMClient.translate_page", fail_on_p3)
+    with pytest.raises(ContentBlockedError, match="FATAL_BLOCK"):
+        run_translate_pipeline(
+            in_dir,
+            output=tmp_path / "out_err",
+            api_keys=["key-A", "key-B"],
+            story_pass=False,
+            skip_blocked=False,
+            model_cache=FakeCache(),  # type: ignore[arg-type]
+        )
+
+
+
 
 

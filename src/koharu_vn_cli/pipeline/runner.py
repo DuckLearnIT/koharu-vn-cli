@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -332,6 +334,82 @@ def expand_composed_boxes_if_tight(
     return resolve_box_overlaps(adjusted, img_w, img_h, gap=max(10, int(min_dim * 0.012)))
 
 
+@dataclass
+class _PreparedVisionPage:
+    scene_id: int
+    idx: int
+    img_path: Path
+    out_img_path: Path
+    json_path: Path
+    clean_path: Path
+    w: int
+    h: int
+    rgb: np.ndarray
+    seg_mask: np.ndarray
+    detected: list[DetectedRegion]
+    region_items: list[TextRegionItem]
+
+
+@dataclass
+class _PreparedOcrBatch:
+    scene_id: int
+    pages: list[
+        tuple[int, Path, Path, Path, Path, int, int, bytes, list[DetectedRegion], list[TextRegionItem], dict[int, str]]
+    ]
+
+
+@dataclass
+class _TranslatedRenderTask:
+    idx: int
+    img_path: Path
+    out_img_path: Path
+    json_path: Path
+    clean_path: Path
+    w: int
+    h: int
+    rgb: np.ndarray
+    seg_mask: np.ndarray
+    detected: list[DetectedRegion]
+    translated_items: list[TextRegionItem]
+    summary: str
+
+
+def _q_put(
+    q: queue.Queue[object],
+    item: object,
+    abort_event: threading.Event,
+    hooks: PipelineHooks,
+) -> bool:
+    """Put item into a bounded queue without deadlocking on abort or cancellation."""
+    while not abort_event.is_set():
+        if hooks.is_cancelled and hooks.is_cancelled():
+            abort_event.set()
+            return False
+        try:
+            q.put(item, timeout=0.1)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _q_get(
+    q: queue.Queue[object],
+    abort_event: threading.Event,
+    hooks: PipelineHooks,
+) -> tuple[bool, object]:
+    """Get item from queue cleanly without deadlocking on abort or cancellation."""
+    while not abort_event.is_set():
+        if hooks.is_cancelled and hooks.is_cancelled():
+            abort_event.set()
+            return False, None
+        try:
+            return True, q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+    return False, None
+
+
 def _cleanup_cache_dir(
     cache_dir: Path,
     *,
@@ -495,12 +573,14 @@ def run_translate_pipeline(
     skip_blocked: bool = True,
     resume: bool = False,
     clean_cache: bool = True,
+    max_workers: int = 0,
     model_cache: ModelCache | None = None,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
     """Run full manga translation pipeline end-to-end and return output dir & documents."""
     hooks = hooks or PipelineHooks()
     cache = model_cache or ModelCache()
+    hooks_lock = threading.Lock()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         images, base_name = collect_inputs(input_path, Path(tmp_dir))
@@ -513,15 +593,23 @@ def run_translate_pipeline(
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         total = len(images)
+
+        def _emit_step(idx: int, name: str, stage: str, detail: str) -> None:
+            with hooks_lock:
+                hooks.emit_step(idx, total, name, stage, detail)
+
+        def _emit_page_done(idx: int, name: str, doc: PageDocument, out_path: Path) -> None:
+            with hooks_lock:
+                hooks.emit_page_done(idx, total, name, doc, out_path)
+
         eff_story_model = (story_model or "").strip() or model
         eff_fallback = (fallback_model or "").strip() or None
         eff_story_fallback = (story_fallback_model or "").strip() or None
         mode_tag = "Vision" if vision_translate else "No-Vision OCR"
         fb_s_tag = f" [FB: {eff_story_fallback}]" if eff_story_fallback else ""
         fb_m_tag = f" [FB quota: {eff_fallback}]" if eff_fallback else ""
-        hooks.emit_step(
+        _emit_step(
             0,
-            total,
             base_name,
             "init",
             f"Kiểm tra API & ONNX (Chính: {eff_story_model}{fb_s_tag} -> Phụ ({mode_tag}): {model}{fb_m_tag})...",
@@ -533,7 +621,7 @@ def run_translate_pipeline(
             model=model,
             fallback_model=eff_fallback,
             base_url=base_url,
-            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            on_status=lambda msg: _emit_step(0, base_name, "api", msg),
         )
         story_llm = VisionLLMClient(
             api_key=api_key,
@@ -541,7 +629,7 @@ def run_translate_pipeline(
             model=eff_story_model,
             base_url=base_url,
             timeout=STORY_MODEL_TIMEOUT,
-            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            on_status=lambda msg: _emit_step(0, base_name, "api", msg),
         )
         story_fallback_llm = (
             VisionLLMClient(
@@ -550,11 +638,17 @@ def run_translate_pipeline(
                 model=eff_story_fallback,
                 base_url=base_url,
                 timeout=STORY_MODEL_TIMEOUT,
-                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+                on_status=lambda msg: _emit_step(0, base_name, "api", msg),
             )
             if eff_story_fallback and eff_story_fallback != eff_story_model
             else None
         )
+        key_pool = list(llm.api_keys)
+        if max_workers > 0:
+            worker_count = max(1, min(max_workers, total, 16))
+        else:
+            worker_count = max(1, min(len(key_pool) or 1, total, 12))
+
         if isinstance(cache, ModelCache):
             detector = cache.get_detector(accurate=accurate_detector, use_gpu=use_gpu)
             inpainter = cache.get_inpainter(use_gpu=use_gpu)
@@ -566,12 +660,16 @@ def run_translate_pipeline(
 
         det_dev = active_ort_provider_label(getattr(detector, "_rtdetr", None))
         inp_dev = active_ort_provider_label(getattr(inpainter, "_lama", None))
-        hooks.emit_step(
+        pipe_desc = (
+            f"3 tầng song song ({worker_count} luồng API từ {len(key_pool) or 1} key)"
+            if worker_count > 1
+            else "3 tầng gối đầu (Detect + LLM + Inpaint)"
+        )
+        _emit_step(
             0,
-            total,
             base_name,
             "device",
-            f"Thiết bị ONNX: Detector={det_dev} · LaMa Inpaint={inp_dev}",
+            f"Thiết bị ONNX: Detector={det_dev} · LaMa Inpaint={inp_dev} · Pipeline: {pipe_desc}",
         )
 
         scenes = cluster_story_scenes(images)
@@ -600,9 +698,81 @@ def run_translate_pipeline(
             hooks=hooks,
         )
 
-        docs: list[PageDocument] = []
+        docs_by_idx: dict[int, PageDocument] = {}
         seq_pad = max(3, len(str(total)))
         translation_memory: dict[str, str] = {}
+        scene_summaries_by_page: dict[int, dict[int, str]] = {sc.scene_id: {} for sc in scenes}
+
+        state_lock = threading.Lock()
+        gpu_lock = threading.Lock()
+        ocr_init_lock = threading.Lock()
+        error_lock = threading.Lock()
+        worker_done_lock = threading.Lock()
+        abort_event = threading.Event()
+        first_error: list[BaseException] = []
+
+        def _rotated_keys(w_idx: int) -> list[str] | None:
+            if not key_pool:
+                return None
+            offset = w_idx % len(key_pool)
+            return key_pool[offset:] + key_pool[:offset]
+
+        worker_clients: list[tuple[VisionLLMClient, VisionLLMClient, VisionLLMClient | None]] = []
+        for w_idx in range(worker_count):
+            if w_idx == 0:
+                worker_clients.append((llm, story_llm, story_fallback_llm))
+                continue
+            r_keys = _rotated_keys(w_idx)
+            r_primary = r_keys[0] if r_keys else api_key
+            worker_clients.append(
+                (
+                    VisionLLMClient(
+                        api_key=r_primary,
+                        api_keys=r_keys,
+                        model=model,
+                        fallback_model=eff_fallback,
+                        base_url=base_url,
+                        on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+                    ),
+                    VisionLLMClient(
+                        api_key=r_primary,
+                        api_keys=r_keys,
+                        model=eff_story_model,
+                        base_url=base_url,
+                        timeout=STORY_MODEL_TIMEOUT,
+                        on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+                    ),
+                    (
+                        VisionLLMClient(
+                            api_key=r_primary,
+                            api_keys=r_keys,
+                            model=eff_story_fallback,
+                            base_url=base_url,
+                            timeout=STORY_MODEL_TIMEOUT,
+                            on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+                        )
+                        if eff_story_fallback and eff_story_fallback != eff_story_model
+                        else None
+                    ),
+                )
+            )
+
+        def _record_error(exc: BaseException) -> None:
+            with error_lock:
+                if not first_error:
+                    first_error.append(exc)
+            abort_event.set()
+
+        def _ensure_ocr_engine():
+            nonlocal ocr_engine
+            with ocr_init_lock:
+                if ocr_engine is None and hasattr(cache, "get_ocr"):
+                    ocr_engine = (
+                        cache.get_ocr(use_gpu=use_gpu)
+                        if isinstance(cache, ModelCache)
+                        else cache.get_ocr()
+                    )
+                return ocr_engine
 
         def _remember_translations(items: list[TextRegionItem]) -> None:
             for item in items:
@@ -616,7 +786,11 @@ def run_translate_pipeline(
                     if key:
                         translation_memory[key] = item.translated_text.strip()
 
-        def _apply_memory_to_untranslated(items: list[TextRegionItem], ocr_texts: dict[int, str] | None = None) -> list[TextRegionItem]:
+        def _apply_memory_to_untranslated(
+            items: list[TextRegionItem],
+            mem_snapshot: dict[str, str],
+            ocr_texts: dict[int, str] | None = None,
+        ) -> list[TextRegionItem]:
             fixed: list[TextRegionItem] = []
             for item in items:
                 if skip_sfx and item.kind == "floating" and looks_like_floating_sfx(item.source_text):
@@ -626,11 +800,16 @@ def run_translate_pipeline(
                     continue
                 if region_needs_translation(item):
                     src_key = normalize_source_key((ocr_texts or {}).get(item.id, "") or item.source_text)
-                    cached_vn = translation_memory.get(src_key, "")
+                    cached_vn = mem_snapshot.get(src_key, "")
                     if cached_vn:
                         item = item.model_copy(update={"translated_text": cached_vn})
                 fixed.append(item)
             return fixed
+
+        def _scene_prev_summaries(scene_id: int, before_idx: int) -> list[str]:
+            with state_lock:
+                by_page = scene_summaries_by_page.get(scene_id, {})
+                return [txt for p_num, txt in sorted(by_page.items()) if p_num < before_idx and txt]
 
         def _finalize_inpaint_and_colors(
             idx: int,
@@ -650,18 +829,16 @@ def run_translate_pipeline(
             sfx_count = sum(1 for r in items if skip_sfx and r.is_sfx)
             active_detected = [det for det, _ in active_pairs]
             if not active_detected:
-                hooks.emit_step(
+                _emit_step(
                     idx,
-                    total,
                     img_name,
                     "inpaint",
                     f"Chỉ có {sfx_count} SFX — giữ nguyên tranh gốc không tẩy/dịch!",
                 )
                 return rgb, items
 
-            hooks.emit_step(
+            _emit_step(
                 idx,
-                total,
                 img_name,
                 "inpaint",
                 (
@@ -671,7 +848,8 @@ def run_translate_pipeline(
                 ),
             )
             erasure_mask = build_erasure_mask(rgb, seg_mask, active_detected)
-            clean_rgb = inpainter.inpaint(rgb, erasure_mask)
+            with gpu_lock:
+                clean_rgb = inpainter.inpaint(rgb, erasure_mask)
             updated_by_id: dict[int, TextRegionItem] = {}
             for det, reg in active_pairs:
                 t_col, s_col, s_factor, is_dark = classify_region_colors(
@@ -689,336 +867,519 @@ def run_translate_pipeline(
             merged = [updated_by_id.get(r.id, r) for r in items]
             return clean_rgb, merged
 
-        for sc in scenes:
-            scene_summaries: list[str] = []
-            # Tuple: (idx, img_path, out_img_path, json_path, clean_path, w, h, seg_png_bytes, detected, region_items, ocr_texts)
-            pending_ocr_pages: list[
-                tuple[int, Path, Path, Path, Path, int, int, bytes, list[DetectedRegion], list[TextRegionItem], dict[int, str]]
-            ] = []
+        buf_size = max(4, worker_count + 3)
+        translate_queue: queue.Queue[object] = queue.Queue(maxsize=buf_size)
+        finalize_queue: queue.Queue[object] = queue.Queue(maxsize=buf_size)
 
-            for p_idx in sc.page_indices:
-                idx = p_idx + 1
-                img_path = images[p_idx]
-                hooks.check_cancelled()
-                out_img_path = out_dir / _output_image_name(
-                    img_path,
-                    output_format=output_format,
-                    seq_index=idx if sequential_names else None,
-                    seq_pad=seq_pad,
-                )
-                json_path = cache_dir / f"{img_path.stem}.koharu.json"
+        def _detect_producer() -> None:
+            try:
+                for sc in scenes:
+                    pending_ocr_pages: list[
+                        tuple[
+                            int,
+                            Path,
+                            Path,
+                            Path,
+                            Path,
+                            int,
+                            int,
+                            bytes,
+                            list[DetectedRegion],
+                            list[TextRegionItem],
+                            dict[int, str],
+                        ]
+                    ] = []
 
-                if resume and out_img_path.is_file() and json_path.is_file():
-                    prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
-                    if not any(region_needs_translation(r) for r in prev_doc.regions):
-                        _remember_translations(prev_doc.regions)
-                        if prev_doc.page_summary:
-                            scene_summaries.append(prev_doc.page_summary)
-                        docs.append(prev_doc)
-                        hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
-                        hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
-                        continue
-                    hooks.emit_step(idx, total, img_path.name, "retry", "Phát hiện vùng chưa dịch ở cache cũ -> dịch lại trang này...")
+                    for p_idx in sc.page_indices:
+                        if abort_event.is_set():
+                            return
+                        hooks.check_cancelled()
+                        idx = p_idx + 1
+                        img_path = images[p_idx]
+                        out_img_path = out_dir / _output_image_name(
+                            img_path,
+                            output_format=output_format,
+                            seq_index=idx if sequential_names else None,
+                            seq_pad=seq_pad,
+                        )
+                        json_path = cache_dir / f"{img_path.stem}.koharu.json"
 
-                rgb = load_rgb(img_path)
-                h, w = rgb.shape[:2]
-
-                hooks.emit_step(idx, total, img_path.name, "detect", f"Đọc ảnh {w}×{h}, đang dò khung thoại...")
-                detected, seg_mask = detector.detect(rgb, conf_thresh=conf)
-                if not detected:
-                    save_image(Image.fromarray(rgb), out_img_path)
-                    doc = PageDocument(
-                        image_path=str(img_path.resolve()),
-                        cleaned_image_path=str(out_img_path.resolve()),
-                        width=w,
-                        height=h,
-                        mode="translate",
-                        source_language=lang,
-                        regions=[],
-                    )
-                    docs.append(doc)
-                    hooks.emit_step(idx, total, img_path.name, "empty", "Không có khung thoại, giữ nguyên ảnh gốc")
-                    hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
-                    continue
-
-                hooks.check_cancelled()
-                t0 = time.perf_counter()
-                clean_path = cache_dir / f"{img_path.stem}.clean.png"
-
-                region_items: list[TextRegionItem] = [
-                    TextRegionItem(
-                        id=reg_idx,
-                        kind="bubble" if reg.is_bubble else "floating",
-                        text_bbox=reg.text_bbox,
-                        bubble_bbox=reg.bubble_bbox,
-                        bubble_contour=reg.bubble_contour,
-                        font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
-                        angle=reg.angle,
-                        is_dark_bubble=reg.is_dark_bubble,
-                        draw_bubble=False,
-                        confidence=reg.confidence,
-                    )
-                    for reg_idx, reg in enumerate(detected, start=1)
-                ]
-
-                if not vision_translate and ocr_engine is not None:
-                    hooks.check_cancelled()
-                    hooks.emit_step(
-                        idx,
-                        total,
-                        img_path.name,
-                        "ocr",
-                        f"Đang OCR cục bộ {len(region_items)} vùng chữ (No-Vision)...",
-                    )
-                    ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
-                    if skip_sfx:
-                        for reg_it in region_items:
-                            raw_ocr = (ocr_texts.get(reg_it.id, "") or "").strip()
-                            if raw_ocr:
-                                reg_it.source_text = raw_ocr
-                            if reg_it.kind == "floating" and looks_like_floating_sfx(raw_ocr):
-                                reg_it.is_sfx = True
-                    ok_enc, seg_buf = cv2.imencode(".png", seg_mask)
-                    seg_bytes = seg_buf.tobytes() if ok_enc else b""
-                    pending_ocr_pages.append(
-                        (idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, detected, region_items, ocr_texts)
-                    )
-                    continue
-
-                hooks.check_cancelled()
-                hooks.emit_step(
-                    idx,
-                    total,
-                    img_path.name,
-                    "llm",
-                    f"Đang gửi {len(region_items)} vùng chữ lên {llm.model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
-                )
-                prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
-                next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
-                try:
-                    translated_items, summary = llm.translate_page(
-                        rgb=rgb,
-                        regions=region_items,
-                        source_lang=lang,
-                        previous_summaries=scene_summaries,
-                        extra_instructions=prompt,
-                        story_bible=story_bible,
-                        page_index=idx,
-                        prev_rgb=prev_rgb,
-                        next_rgb=next_rgb,
-                        tags=tags,
-                        skip_sfx=skip_sfx,
-                    )
-                except ContentBlockedError as exc:
-                    fallback_done = False
-                    if hasattr(cache, "get_ocr"):
-                        try:
-                            if ocr_engine is None:
-                                ocr_engine = (
-                                    cache.get_ocr(use_gpu=use_gpu)
-                                    if isinstance(cache, ModelCache)
-                                    else cache.get_ocr()
-                                )
-                            hooks.emit_step(
+                        if resume and out_img_path.is_file() and json_path.is_file():
+                            prev_doc = PageDocument.model_validate_json(
+                                json_path.read_text(encoding="utf-8")
+                            )
+                            if not any(region_needs_translation(r) for r in prev_doc.regions):
+                                with state_lock:
+                                    _remember_translations(prev_doc.regions)
+                                    if prev_doc.page_summary:
+                                        scene_summaries_by_page[sc.scene_id][idx] = prev_doc.page_summary
+                                    docs_by_idx[idx] = prev_doc
+                                _emit_step(idx, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
+                                _emit_page_done(idx, img_path.name, prev_doc, out_img_path)
+                                continue
+                            _emit_step(
                                 idx,
-                                total,
                                 img_path.name,
-                                "ocr_fallback",
-                                f"⚠ Trang {idx}/{total} bị lọc ảnh -> tự động fallback OCR cục bộ + dịch text-only (0 ảnh)...",
+                                "retry",
+                                "Phát hiện vùng chưa dịch ở cache cũ -> dịch lại trang này...",
                             )
-                            ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
-                            ocr_kw = {
-                                "regions": region_items,
-                                "ocr_texts": ocr_texts,
-                                "source_lang": lang,
-                                "previous_summaries": scene_summaries,
-                                "extra_instructions": prompt,
-                                "story_bible": story_bible,
-                                "page_index": idx,
-                                "tags": tags,
-                                "translation_memory": translation_memory,
-                                "skip_sfx": skip_sfx,
-                            }
-                            try:
-                                translated_items, summary = llm.translate_page_from_ocr(**ocr_kw)
-                                fallback_done = True
-                            except ContentBlockedError as inner_exc:
-                                exc = inner_exc
-                                if story_llm.model != llm.model:
-                                    try:
-                                        translated_items, summary = story_llm.translate_page_from_ocr(**ocr_kw)
-                                        fallback_done = True
-                                    except ContentBlockedError as s_exc:
-                                        exc = s_exc
-                                if not fallback_done and story_fallback_llm is not None:
-                                    translated_items, summary = story_fallback_llm.translate_page_from_ocr(**ocr_kw)
-                                    fallback_done = True
-                        except ContentBlockedError as ocr_exc:
-                            exc = ocr_exc
-                    if not fallback_done:
-                        if not skip_blocked:
-                            raise
-                        save_image(Image.fromarray(rgb), out_img_path)
-                        hooks.emit_step(
-                            idx,
-                            total,
-                            img_path.name,
-                            "blocked",
-                            f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
-                        )
-                        continue
-                translated_items = _apply_memory_to_untranslated(translated_items)
-                if any(region_needs_translation(r) for r in translated_items):
-                    still_missing = [r for r in translated_items if region_needs_translation(r)]
-                    if hasattr(cache, "get_ocr"):
-                        try:
-                            if ocr_engine is None:
-                                ocr_engine = (
-                                    cache.get_ocr(use_gpu=use_gpu)
-                                    if isinstance(cache, ModelCache)
-                                    else cache.get_ocr()
-                                )
-                            missing_ocr = ocr_engine.recognize_regions(rgb, still_missing)
-                            for mr in still_missing:
-                                if missing_ocr.get(mr.id):
-                                    mr.source_text = missing_ocr[mr.id]
-                            still_missing = _apply_memory_to_untranslated(still_missing, missing_ocr)
-                            need_api = [r for r in still_missing if region_needs_translation(r)]
-                            if need_api:
-                                retried_items, retry_sum = llm.translate_page_from_ocr(
-                                    regions=need_api,
-                                    ocr_texts=missing_ocr,
-                                    source_lang=lang,
-                                    previous_summaries=scene_summaries,
-                                    extra_instructions=prompt,
-                                    story_bible=story_bible,
-                                    page_index=idx,
-                                    tags=tags,
-                                    translation_memory=translation_memory,
-                                    skip_sfx=skip_sfx,
-                                )
-                                by_missing_id = {r.id: r for r in retried_items}
-                            else:
-                                by_missing_id = {r.id: r for r in still_missing}
-                                retry_sum = ""
-                            translated_items = [by_missing_id.get(r.id, r) for r in translated_items]
-                            if not summary and retry_sum:
-                                summary = retry_sum
-                        except Exception:
-                            pass
-                _remember_translations(translated_items)
-                if summary:
-                    scene_summaries.append(summary)
 
-                hooks.check_cancelled()
-                clean_rgb, translated_items = _finalize_inpaint_and_colors(
-                    idx, img_path.name, rgb, seg_mask, detected, translated_items
-                )
-                save_image(Image.fromarray(clean_rgb), clean_path)
-                translated_items = adapt_regions_for_readability(translated_items, w, h)
+                        rgb = load_rgb(img_path)
+                        h, w = rgb.shape[:2]
 
-                hooks.check_cancelled()
-                hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
-                doc = PageDocument(
-                    image_path=str(img_path.resolve()),
-                    cleaned_image_path=str(clean_path.resolve()),
-                    width=w,
-                    height=h,
-                    mode="translate",
-                    source_language=lang,
-                    page_summary=summary,
-                    regions=translated_items,
-                )
-                json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
-
-                final_img = render_document(clean_rgb, doc)
-                save_image(final_img, out_img_path)
-                docs.append(doc)
-                hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
-
-            if pending_ocr_pages:
-                for start_i in range(0, len(pending_ocr_pages), 10):
-                    chunk = pending_ocr_pages[start_i : start_i + 10]
-                    hooks.check_cancelled()
-                    batch_input = [
-                        (item[0], [r for r in item[9] if not (skip_sfx and r.is_sfx)], item[10])
-                        for item in chunk
-                        if any(not (skip_sfx and r.is_sfx) for r in item[9])
-                    ]
-                    batch_res: dict[int, tuple[list[TextRegionItem], str]] = {}
-                    if batch_input:
-                        hooks.emit_step(
-                            chunk[0][0],
-                            total,
-                            chunk[0][1].name,
-                            "llm",
-                            f"Tuyến {sc.scene_id}: Gửi text OCR {len(batch_input)} trang tới {llm.model} (0 ảnh)...",
-                        )
-                        try:
-                            batch_res = llm.translate_scene_from_ocr(
-                                batch_input,
-                                source_lang=lang,
-                                previous_summaries=scene_summaries,
-                                extra_instructions=prompt,
-                                story_bible=story_bible,
-                                tags=tags,
-                                translation_memory=translation_memory,
-                                skip_sfx=skip_sfx,
-                                scene_id=sc.scene_id,
+                        _emit_step(idx, img_path.name, "detect", f"Đọc ảnh {w}×{h}, đang dò khung thoại...")
+                        with gpu_lock:
+                            detected, seg_mask = detector.detect(rgb, conf_thresh=conf)
+                        if not detected:
+                            save_image(Image.fromarray(rgb), out_img_path)
+                            doc = PageDocument(
+                                image_path=str(img_path.resolve()),
+                                cleaned_image_path=str(out_img_path.resolve()),
+                                width=w,
+                                height=h,
+                                mode="translate",
+                                source_language=lang,
+                                regions=[],
                             )
-                        except ContentBlockedError as exc:
-                            if not skip_blocked:
-                                raise
-                            for idx, img_path, out_img_path, *_ in chunk:
-                                rgb_orig = load_rgb(img_path)
-                                save_image(Image.fromarray(rgb_orig), out_img_path)
-                                hooks.emit_step(
-                                    idx,
-                                    total,
-                                    img_path.name,
-                                    "blocked",
-                                    f"⚠ Tuyến {sc.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
-                                )
+                            with state_lock:
+                                docs_by_idx[idx] = doc
+                            _emit_step(idx, img_path.name, "empty", "Không có khung thoại, giữ nguyên ảnh gốc")
+                            _emit_page_done(idx, img_path.name, doc, out_img_path)
                             continue
 
-                    for idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, det_list, reg_items, _ocrs in chunk:
-                        sub_items, summary = batch_res.get(idx, (reg_items, ""))
-                        sub_map = {r.id: r for r in sub_items}
-                        translated_items = [sub_map.get(r.id, r) for r in reg_items]
-                        translated_items = _apply_memory_to_untranslated(translated_items, _ocrs)
-                        _remember_translations(translated_items)
-                        if summary:
-                            scene_summaries.append(summary)
+                        if abort_event.is_set():
+                            return
+                        hooks.check_cancelled()
+                        clean_path = cache_dir / f"{img_path.stem}.clean.png"
+                        region_items: list[TextRegionItem] = [
+                            TextRegionItem(
+                                id=reg_idx,
+                                kind="bubble" if reg.is_bubble else "floating",
+                                text_bbox=reg.text_bbox,
+                                bubble_bbox=reg.bubble_bbox,
+                                bubble_contour=reg.bubble_contour,
+                                font_name=font or ("animeace3" if reg.is_bubble else "pangolin"),
+                                angle=reg.angle,
+                                is_dark_bubble=reg.is_dark_bubble,
+                                draw_bubble=False,
+                                confidence=reg.confidence,
+                            )
+                            for reg_idx, reg in enumerate(detected, start=1)
+                        ]
 
-                        rgb_page = load_rgb(img_path)
-                        seg_arr = (
-                            cv2.imdecode(np.frombuffer(seg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-                            if seg_bytes
-                            else None
+                        if not vision_translate and ocr_engine is not None:
+                            _emit_step(
+                                idx,
+                                img_path.name,
+                                "ocr",
+                                f"Đang OCR cục bộ {len(region_items)} vùng chữ (No-Vision)...",
+                            )
+                            with gpu_lock:
+                                ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
+                            if skip_sfx:
+                                for reg_it in region_items:
+                                    raw_ocr = (ocr_texts.get(reg_it.id, "") or "").strip()
+                                    if raw_ocr:
+                                        reg_it.source_text = raw_ocr
+                                    if reg_it.kind == "floating" and looks_like_floating_sfx(raw_ocr):
+                                        reg_it.is_sfx = True
+                            ok_enc, seg_buf = cv2.imencode(".png", seg_mask)
+                            seg_bytes = seg_buf.tobytes() if ok_enc else b""
+                            pending_ocr_pages.append(
+                                (
+                                    idx,
+                                    img_path,
+                                    out_img_path,
+                                    json_path,
+                                    clean_path,
+                                    w,
+                                    h,
+                                    seg_bytes,
+                                    detected,
+                                    region_items,
+                                    ocr_texts,
+                                )
+                            )
+                            if len(pending_ocr_pages) >= 10:
+                                batch = _PreparedOcrBatch(scene_id=sc.scene_id, pages=pending_ocr_pages)
+                                pending_ocr_pages = []
+                                if not _q_put(translate_queue, batch, abort_event, hooks):
+                                    return
+                            continue
+
+                        task = _PreparedVisionPage(
+                            scene_id=sc.scene_id,
+                            idx=idx,
+                            img_path=img_path,
+                            out_img_path=out_img_path,
+                            json_path=json_path,
+                            clean_path=clean_path,
+                            w=w,
+                            h=h,
+                            rgb=rgb,
+                            seg_mask=seg_mask,
+                            detected=detected,
+                            region_items=region_items,
                         )
-                        if seg_arr is None:
-                            seg_arr = np.zeros((h, w), dtype=np.uint8)
-                        clean_rgb, translated_items = _finalize_inpaint_and_colors(
-                            idx, img_path.name, rgb_page, seg_arr, det_list, translated_items
+                        if not _q_put(translate_queue, task, abort_event, hooks):
+                            return
+
+                    if pending_ocr_pages:
+                        batch = _PreparedOcrBatch(scene_id=sc.scene_id, pages=pending_ocr_pages)
+                        if not _q_put(translate_queue, batch, abort_event, hooks):
+                            return
+            except BaseException as exc:
+                _record_error(exc)
+            finally:
+                if not abort_event.is_set():
+                    for _ in range(worker_count):
+                        if not _q_put(translate_queue, None, abort_event, hooks):
+                            break
+
+        remaining_llm_workers = worker_count
+
+        def _translate_vision_task(
+            task: _PreparedVisionPage,
+            worker_prefix: str,
+            w_llm: VisionLLMClient,
+            w_story_llm: VisionLLMClient,
+            w_story_fallback: VisionLLMClient | None,
+        ) -> None:
+            t0 = time.perf_counter()
+            idx = task.idx
+            _emit_step(
+                idx,
+                task.img_path.name,
+                "llm",
+                f"{worker_prefix}Đang gửi {len(task.region_items)} vùng chữ lên {w_llm.model} để OCR & dịch ({time.perf_counter() - t0:.1f}s)...",
+            )
+            prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
+            next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
+            prev_summaries = _scene_prev_summaries(task.scene_id, idx)
+
+            try:
+                translated_items, summary = w_llm.translate_page(
+                    rgb=task.rgb,
+                    regions=task.region_items,
+                    source_lang=lang,
+                    previous_summaries=prev_summaries,
+                    extra_instructions=prompt,
+                    story_bible=story_bible,
+                    page_index=idx,
+                    prev_rgb=prev_rgb,
+                    next_rgb=next_rgb,
+                    tags=tags,
+                    skip_sfx=skip_sfx,
+                )
+            except ContentBlockedError as exc:
+                fallback_done = False
+                eng = _ensure_ocr_engine()
+                if eng is not None:
+                    try:
+                        _emit_step(
+                            idx,
+                            task.img_path.name,
+                            "ocr_fallback",
+                            f"⚠ {worker_prefix}Trang {idx}/{total} bị lọc ảnh -> tự động fallback OCR cục bộ + dịch text-only (0 ảnh)...",
                         )
-                        save_image(Image.fromarray(clean_rgb), clean_path)
-                        translated_items = adapt_regions_for_readability(translated_items, w, h)
-                        hooks.emit_step(idx, total, img_path.name, "typeset", "Đang sắp chữ Tiếng Việt 2× supersampling...")
-                        doc = PageDocument(
-                            image_path=str(img_path.resolve()),
-                            cleaned_image_path=str(clean_path.resolve()),
-                            width=w,
-                            height=h,
-                            mode="translate",
-                            source_language=lang,
-                            page_summary=summary,
-                            regions=translated_items,
+                        with gpu_lock:
+                            ocr_texts = eng.recognize_regions(task.rgb, task.region_items)
+                        with state_lock:
+                            mem_snapshot = dict(translation_memory)
+                        ocr_kw = {
+                            "regions": task.region_items,
+                            "ocr_texts": ocr_texts,
+                            "source_lang": lang,
+                            "previous_summaries": _scene_prev_summaries(task.scene_id, idx),
+                            "extra_instructions": prompt,
+                            "story_bible": story_bible,
+                            "page_index": idx,
+                            "tags": tags,
+                            "translation_memory": mem_snapshot,
+                            "skip_sfx": skip_sfx,
+                        }
+                        try:
+                            translated_items, summary = w_llm.translate_page_from_ocr(**ocr_kw)
+                            fallback_done = True
+                        except ContentBlockedError as inner_exc:
+                            exc = inner_exc
+                            if w_story_llm.model != w_llm.model:
+                                try:
+                                    translated_items, summary = w_story_llm.translate_page_from_ocr(**ocr_kw)
+                                    fallback_done = True
+                                except ContentBlockedError as s_exc:
+                                    exc = s_exc
+                            if not fallback_done and w_story_fallback is not None:
+                                translated_items, summary = w_story_fallback.translate_page_from_ocr(**ocr_kw)
+                                fallback_done = True
+                    except ContentBlockedError as ocr_exc:
+                        exc = ocr_exc
+                if not fallback_done:
+                    if not skip_blocked:
+                        raise
+                    save_image(Image.fromarray(task.rgb), task.out_img_path)
+                    _emit_step(
+                        idx,
+                        task.img_path.name,
+                        "blocked",
+                        f"⚠ Trang {idx}/{total} bị bộ lọc chặn ({exc}) — tạm giữ ảnh gốc & tiếp tục trang sau!",
+                    )
+                    return
+
+            with state_lock:
+                mem_snapshot = dict(translation_memory)
+            translated_items = _apply_memory_to_untranslated(translated_items, mem_snapshot)
+            if any(region_needs_translation(r) for r in translated_items):
+                still_missing = [r for r in translated_items if region_needs_translation(r)]
+                eng = _ensure_ocr_engine()
+                if eng is not None:
+                    try:
+                        with gpu_lock:
+                            missing_ocr = eng.recognize_regions(task.rgb, still_missing)
+                        for mr in still_missing:
+                            if missing_ocr.get(mr.id):
+                                mr.source_text = missing_ocr[mr.id]
+                        with state_lock:
+                            mem_snapshot = dict(translation_memory)
+                        still_missing = _apply_memory_to_untranslated(
+                            still_missing, mem_snapshot, missing_ocr
                         )
-                        json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
-                        final_img = render_document(clean_rgb, doc)
-                        save_image(final_img, out_img_path)
-                        docs.append(doc)
-                        hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
+                        need_api = [r for r in still_missing if region_needs_translation(r)]
+                        if need_api:
+                            retried_items, retry_sum = w_llm.translate_page_from_ocr(
+                                regions=need_api,
+                                ocr_texts=missing_ocr,
+                                source_lang=lang,
+                                previous_summaries=_scene_prev_summaries(task.scene_id, idx),
+                                extra_instructions=prompt,
+                                story_bible=story_bible,
+                                page_index=idx,
+                                tags=tags,
+                                translation_memory=mem_snapshot,
+                                skip_sfx=skip_sfx,
+                            )
+                            by_missing_id = {r.id: r for r in retried_items}
+                        else:
+                            by_missing_id = {r.id: r for r in still_missing}
+                            retry_sum = ""
+                        translated_items = [by_missing_id.get(r.id, r) for r in translated_items]
+                        if not summary and retry_sum:
+                            summary = retry_sum
+                    except Exception:
+                        pass
+
+            with state_lock:
+                _remember_translations(translated_items)
+                if summary:
+                    scene_summaries_by_page[task.scene_id][idx] = summary
+
+            _q_put(
+                finalize_queue,
+                _TranslatedRenderTask(
+                    idx=idx,
+                    img_path=task.img_path,
+                    out_img_path=task.out_img_path,
+                    json_path=task.json_path,
+                    clean_path=task.clean_path,
+                    w=task.w,
+                    h=task.h,
+                    rgb=task.rgb,
+                    seg_mask=task.seg_mask,
+                    detected=task.detected,
+                    translated_items=translated_items,
+                    summary=summary,
+                ),
+                abort_event,
+                hooks,
+            )
+
+        def _translate_ocr_batch_task(
+            batch: _PreparedOcrBatch,
+            worker_prefix: str,
+            w_llm: VisionLLMClient,
+        ) -> None:
+            chunk = batch.pages
+            batch_input = [
+                (item[0], [r for r in item[9] if not (skip_sfx and r.is_sfx)], item[10])
+                for item in chunk
+                if any(not (skip_sfx and r.is_sfx) for r in item[9])
+            ]
+            batch_res: dict[int, tuple[list[TextRegionItem], str]] = {}
+            if batch_input:
+                first_idx = chunk[0][0]
+                _emit_step(
+                    first_idx,
+                    chunk[0][1].name,
+                    "llm",
+                    f"{worker_prefix}Tuyến {batch.scene_id}: Gửi text OCR {len(batch_input)} trang tới {w_llm.model} (0 ảnh)...",
+                )
+                with state_lock:
+                    mem_snapshot = dict(translation_memory)
+                try:
+                    batch_res = w_llm.translate_scene_from_ocr(
+                        batch_input,
+                        source_lang=lang,
+                        previous_summaries=_scene_prev_summaries(batch.scene_id, first_idx),
+                        extra_instructions=prompt,
+                        story_bible=story_bible,
+                        tags=tags,
+                        translation_memory=mem_snapshot,
+                        skip_sfx=skip_sfx,
+                        scene_id=batch.scene_id,
+                    )
+                except ContentBlockedError as exc:
+                    if not skip_blocked:
+                        raise
+                    for idx, img_path, out_img_path, *_ in chunk:
+                        rgb_orig = load_rgb(img_path)
+                        save_image(Image.fromarray(rgb_orig), out_img_path)
+                        _emit_step(
+                            idx,
+                            img_path.name,
+                            "blocked",
+                            f"⚠ Tuyến {batch.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
+                        )
+                    return
+
+            for idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, det_list, reg_items, _ocrs in chunk:
+                sub_items, summary = batch_res.get(idx, (reg_items, ""))
+                sub_map = {r.id: r for r in sub_items}
+                translated_items = [sub_map.get(r.id, r) for r in reg_items]
+                with state_lock:
+                    mem_snapshot = dict(translation_memory)
+                translated_items = _apply_memory_to_untranslated(
+                    translated_items, mem_snapshot, _ocrs
+                )
+                with state_lock:
+                    _remember_translations(translated_items)
+                    if summary:
+                        scene_summaries_by_page[batch.scene_id][idx] = summary
+
+                rgb_page = load_rgb(img_path)
+                seg_arr = (
+                    cv2.imdecode(np.frombuffer(seg_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+                    if seg_bytes
+                    else None
+                )
+                if seg_arr is None:
+                    seg_arr = np.zeros((h, w), dtype=np.uint8)
+                if not _q_put(
+                    finalize_queue,
+                    _TranslatedRenderTask(
+                        idx=idx,
+                        img_path=img_path,
+                        out_img_path=out_img_path,
+                        json_path=json_path,
+                        clean_path=clean_path,
+                        w=w,
+                        h=h,
+                        rgb=rgb_page,
+                        seg_mask=seg_arr,
+                        detected=det_list,
+                        translated_items=translated_items,
+                        summary=summary,
+                    ),
+                    abort_event,
+                    hooks,
+                ):
+                    return
+
+        def _llm_worker(worker_id: int) -> None:
+            nonlocal remaining_llm_workers
+            w_llm, w_story_llm, w_story_fallback = worker_clients[worker_id]
+            worker_prefix = f"[W{worker_id + 1}] " if worker_count > 1 else ""
+            try:
+                while not abort_event.is_set():
+                    ok, task = _q_get(translate_queue, abort_event, hooks)
+                    if not ok or task is None:
+                        break
+                    hooks.check_cancelled()
+                    if isinstance(task, _PreparedVisionPage):
+                        _translate_vision_task(
+                            task, worker_prefix, w_llm, w_story_llm, w_story_fallback
+                        )
+                    elif isinstance(task, _PreparedOcrBatch):
+                        _translate_ocr_batch_task(task, worker_prefix, w_llm)
+            except BaseException as exc:
+                _record_error(exc)
+            finally:
+                with worker_done_lock:
+                    remaining_llm_workers -= 1
+                    is_last = remaining_llm_workers == 0
+                if is_last and not abort_event.is_set():
+                    _q_put(finalize_queue, None, abort_event, hooks)
+
+        def _finalize_consumer() -> None:
+            try:
+                while not abort_event.is_set():
+                    ok, rtask = _q_get(finalize_queue, abort_event, hooks)
+                    if not ok or rtask is None:
+                        break
+                    hooks.check_cancelled()
+                    assert isinstance(rtask, _TranslatedRenderTask)
+                    clean_rgb, items_ready = _finalize_inpaint_and_colors(
+                        rtask.idx,
+                        rtask.img_path.name,
+                        rtask.rgb,
+                        rtask.seg_mask,
+                        rtask.detected,
+                        rtask.translated_items,
+                    )
+                    save_image(Image.fromarray(clean_rgb), rtask.clean_path)
+                    items_ready = adapt_regions_for_readability(items_ready, rtask.w, rtask.h)
+
+                    hooks.check_cancelled()
+                    _emit_step(
+                        rtask.idx,
+                        rtask.img_path.name,
+                        "typeset",
+                        "Đang sắp chữ Tiếng Việt 2× supersampling...",
+                    )
+                    doc = PageDocument(
+                        image_path=str(rtask.img_path.resolve()),
+                        cleaned_image_path=str(rtask.clean_path.resolve()),
+                        width=rtask.w,
+                        height=rtask.h,
+                        mode="translate",
+                        source_language=lang,
+                        page_summary=rtask.summary,
+                        regions=items_ready,
+                    )
+                    rtask.json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+
+                    final_img = render_document(clean_rgb, doc)
+                    save_image(final_img, rtask.out_img_path)
+                    with state_lock:
+                        docs_by_idx[rtask.idx] = doc
+                    _emit_page_done(rtask.idx, rtask.img_path.name, doc, rtask.out_img_path)
+            except BaseException as exc:
+                _record_error(exc)
+
+        threads: list[threading.Thread] = [
+            threading.Thread(target=_detect_producer, name="koharu-detect", daemon=True),
+            *[
+                threading.Thread(
+                    target=_llm_worker, args=(w_i,), name=f"koharu-llm-{w_i + 1}", daemon=True
+                )
+                for w_i in range(worker_count)
+            ],
+            threading.Thread(target=_finalize_consumer, name="koharu-finalize", daemon=True),
+        ]
+        for th in threads:
+            th.start()
+        try:
+            for th in threads:
+                th.join()
+        except BaseException as exc:
+            _record_error(exc)
+            for th in threads:
+                th.join(timeout=1.0)
+            raise
+
+        if first_error:
+            raise first_error[0]
+
+        docs = [docs_by_idx[i] for i in sorted(docs_by_idx)]
 
         if save_cbz:
             package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")

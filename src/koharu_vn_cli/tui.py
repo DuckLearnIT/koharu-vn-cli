@@ -62,6 +62,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
     SlashSpec("/cache", "[clean|keep]", "Tự xóa .koharu_cache sau khi dịch xong 100% (mặc định: tự xóa)"),
+    SlashSpec("/workers", "[số|auto]", "Số luồng API dịch song song N, N+1... (auto = theo số API key)"),
     SlashSpec("/gpu", "[on|off]", "Bật/tắt tăng tốc GPU (CUDA) cho Detector, LaMa Inpaint & OCR"),
     SlashSpec("/style", "", "Chọn 1 trong 2/4 kiểu sáng tác thoại CG (cg-oval / manga-tail)"),
     SlashSpec("/lang", "", "Chọn ngôn ngữ nguồn ưu tiên (auto / ja / ko / zh / en)"),
@@ -893,6 +894,11 @@ class KoharuTUI(App[None]):
             f"Lang: [cyan]{self.cfg.lang}[/cyan]"
         )
 
+        workers_lbl = (
+            f"Auto ({len(self.cfg.effective_api_keys()) or 1} key)"
+            if self.cfg.workers <= 0
+            else f"{self.cfg.workers} luồng"
+        )
         sb_cfg = self.query_one("#sb-config", Static)
         sb_cfg.update(
             f"Model chính: [bold magenta]{self.cfg.story_model or f'chung ({self.cfg.model})'}[/bold magenta]\n"
@@ -908,6 +914,7 @@ class KoharuTUI(App[None]):
             f"Font: [white]{self.cfg.font or 'auto (animeace3/pangolin)'}[/white]\n"
             f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
             f"Cache: [cyan]{'Tự xóa khi xong 100%' if self.cfg.clean_cache else 'Giữ .koharu_cache'}[/cyan]\n"
+            f"Luồng dịch: [cyan]{workers_lbl}[/cyan]\n"
             f"Prompt: [dim]{(self.cfg.custom_prompt[:46] + '...') if len(self.cfg.custom_prompt) > 46 else (self.cfg.custom_prompt or 'không')}[/dim]"
         )
 
@@ -1529,6 +1536,29 @@ class KoharuTUI(App[None]):
                 self._log_ai(
                     "Cache: [bold yellow]GIỮ LẠI[/bold yellow] — giữ `.koharu_cache` để `/rerender` hoặc chỉnh sửa thoại sau."
                 )
+        elif cmd == "/workers":
+            val = rest.strip().lower()
+            if not val:
+                cur_keys = len(self.cfg.effective_api_keys()) or 1
+                lbl = f"Auto (hiện có {cur_keys} key)" if self.cfg.workers <= 0 else f"{self.cfg.workers} luồng"
+                self._log_ai(
+                    f"Luồng dịch hiện tại: [bold cyan]{lbl}[/bold cyan]. Dùng `/workers auto` hoặc `/workers <1..16>` để đổi."
+                )
+            elif val in {"auto", "0", "off"}:
+                self.cfg.workers = 0
+                save_config(self.cfg)
+                self._refresh_chrome()
+                cur_keys = len(self.cfg.effective_api_keys()) or 1
+                self._log_ai(
+                    f"Luồng dịch: [bold cyan]Auto ({cur_keys} luồng theo số API key)[/bold cyan] + Detect/Inpaint chạy song song."
+                )
+            elif val.isdigit() and 1 <= int(val) <= 16:
+                self.cfg.workers = int(val)
+                save_config(self.cfg)
+                self._refresh_chrome()
+                self._log_ai(f"Đã đặt số luồng dịch API song song: [bold cyan]{self.cfg.workers}[/bold cyan].")
+            else:
+                self._log_ai("Giá trị không hợp lệ. Gõ `/workers auto` hoặc `/workers 4` (tối đa 16).", style="yellow")
         elif cmd == "/gpu":
             val = rest.strip().lower()
             if val in {"on", "1", "true"}:
@@ -1891,14 +1921,25 @@ class KoharuTUI(App[None]):
         self.push_screen(StoryBibleReviewModal(bible), _on_done)
 
     def _build_hooks(self) -> PipelineHooks:
+        done_pages = 0
+        max_pct = 2.0
+
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
-            pct = (idx / max(1, total)) * 100.0 if idx > 0 else 5.0
+            nonlocal max_pct
             stage_tag = f"[{idx}/{total}] {name}" if idx > 0 else name
-            self.call_from_thread(self._set_job_ui, True, f"[cyan]{stage_tag}[/cyan]\n{detail}", pct)
+            if idx <= 0:
+                max_pct = max(max_pct, 5.0)
+            self.call_from_thread(self._set_job_ui, True, f"[cyan]{stage_tag}[/cyan]\n{detail}", max_pct)
             self.call_from_thread(self._log_ai, f"[dim]{stage_tag}[/dim] · {detail}")
 
         def on_page_done(idx: int, total: int, name: str, doc: PageDocument, out_path: Path) -> None:
+            nonlocal done_pages, max_pct
+            done_pages += 1
+            max_pct = max(max_pct, (done_pages / max(1, total)) * 100.0)
             self.call_from_thread(self._log_page_table, idx, total, name, doc, out_path)
+            self.call_from_thread(
+                self._set_job_ui, True, f"[green]Xong {done_pages}/{total}[/green]\n{name}", max_pct
+            )
 
         def on_story_bible(bible: StoryBible) -> None:
             self.call_from_thread(self._log_story_bible, bible)
@@ -1989,6 +2030,7 @@ class KoharuTUI(App[None]):
                 use_gpu=self.cfg.use_gpu,
                 resume=resume,
                 clean_cache=self.cfg.clean_cache,
+                max_workers=self.cfg.workers,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
             )

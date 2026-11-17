@@ -149,6 +149,14 @@ def test_tui_slash_popup_style_picker_and_rerender(tmp_path: Path, monkeypatch) 
             await pilot.pause()
             assert app.cfg.clean_cache is True
 
+            # 3f. `/workers` sets explicit parallel API worker count or resets to auto
+            app.dispatch_command("/workers 3")
+            await pilot.pause()
+            assert app.cfg.workers == 3
+            app.dispatch_command("/workers auto")
+            await pilot.pause()
+            assert app.cfg.workers == 0
+
             # 4. Run `/rerender` in background worker inside TUI
             app.dispatch_command(f'/rerender "{out_dir}"')
             deadline = time.monotonic() + 8.0
