@@ -2971,6 +2971,104 @@ def test_compose_selective_page_range_cli_and_tui(
     assert res_help.exit_code == 0 and "--pages" in res_help.stdout
 
 
+def test_compose_density_low_high_enforcement_and_visual_grounding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify low caps at 1-2 items, high triggers 6-page batching + auto top-up >=5 items, and visual_scene grounding."""
+    from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
+
+    client = VisionLLMClient(api_key="dummy-key")
+    dummy_rgb = np.zeros((600, 500, 3), dtype=np.uint8)
+
+    # 1) LOW density: even if model returns 4 items, enforces max 2 (bubble + floating)
+    seen_low_prompts: list[str] = []
+
+    def fake_low_call(system_prompt, user_prompt, images=None, temperature=0.65):
+        seen_low_prompts.append(user_prompt)
+        return {
+            "visual_scene": "Góc POV, cô gái đang cúi nhẹ nhìn thẳng ngại ngùng.",
+            "page_summary": "Ánh mắt ngại ngùng",
+            "items": [
+                {"id": 1, "kind": "bubble", "bubble_style": "white_oval", "box_2d": [40, 40, 200, 220], "text": "Đừng nhìn vậy chứ..."},
+                {"id": 2, "kind": "bubble", "bubble_style": "dark_translucent", "box_2d": [40, 740, 200, 940], "text": "Ngại chết đi được..."},
+                {"id": 3, "kind": "floating", "bubble_style": "none", "box_2d": [700, 80, 790, 280], "text": "Ưm..."},
+                {"id": 4, "kind": "floating", "bubble_style": "none", "box_2d": [720, 680, 810, 900], "text": "Hộc..."},
+            ],
+        }
+
+    monkeypatch.setattr(client, "_call_json", fake_low_call)
+    low_items, _ = client.compose_cg_page(dummy_rgb, density="low")
+    assert len(low_items) == 2
+    assert '"visual_scene"' in seen_low_prompts[0] and "LOW" in seen_low_prompts[0]
+
+    # 2) HIGH density: if initial call under-delivers (only 2 items), automatic top-up brings total >= 5
+    call_idx = 0
+
+    def fake_high_call(system_prompt, user_prompt, images=None, temperature=0.65):
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 1:
+            return {
+                "visual_scene": "Hai nhân vật sát cạnh nhau trên giường.",
+                "page_summary": "Cao trào sát cạnh",
+                "items": [
+                    {"id": 1, "kind": "bubble", "bubble_style": "white_oval", "box_2d": [40, 40, 220, 240], "text": "Chậm chút đi mà..."},
+                    {"id": 2, "kind": "floating", "bubble_style": "none", "box_2d": [700, 80, 790, 280], "text": "Ưm...♡"},
+                ],
+            }
+        return {
+            "items": [
+                {"id": 3, "kind": "bubble", "bubble_style": "dark_translucent", "box_2d": [50, 720, 240, 940], "text": "Không nhịn nổi mất..."},
+                {"id": 4, "kind": "bubble", "bubble_style": "white_oval", "box_2d": [320, 730, 490, 950], "text": "Ngoan nào, nghe lời anh..."},
+                {"id": 5, "kind": "floating", "bubble_style": "none", "box_2d": [740, 680, 850, 920], "text": "Khít quá..."},
+                {"id": 6, "kind": "floating", "bubble_style": "none", "box_2d": [520, 50, 620, 240], "text": "Hộc..."},
+            ]
+        }
+
+    monkeypatch.setattr(client, "_call_json", fake_high_call)
+    high_items, _ = client.compose_cg_page(dummy_rgb, density="high")
+    assert call_idx == 2
+    assert 5 <= len(high_items) <= 8
+
+    # 3) HIGH density sheet splits >6 pages into batches of 6 and supplements under-filled pages
+    cg_dir = tmp_path / "high_cg"
+    cg_dir.mkdir()
+    paths, sizes = [], []
+    for i in range(8):
+        p = cg_dir / f"{i + 1}.png"
+        Image.new("RGB", (300, 400), (40 + i * 20, 60, 90)).save(p)
+        paths.append(p)
+        sizes.append((300, 400))
+
+    sheet_batches: list[list[int]] = []
+
+    def fake_sheet_batch(image_paths, image_sizes, page_numbers, total_pages, **kwargs):
+        sheet_batches.append(list(page_numbers))
+        return {
+            p_no: (
+                [
+                    TextRegionItem(
+                        id=j,
+                        kind="bubble" if j <= 3 else "floating",
+                        bubble_style=BubbleStyle.WHITE_OVAL if j <= 3 else BubbleStyle.NONE,
+                        text_bbox=(20, 20 + j * 40, 140, 55 + j * 40),
+                        bubble_bbox=(20, 20 + j * 40, 140, 55 + j * 40) if j <= 3 else None,
+                        translated_text=f"Thoại {p_no}.{j}",
+                        draw_bubble=(j <= 3),
+                    )
+                    for j in range(1, 6)
+                ],
+                f"Tóm tắt {p_no}",
+            )
+            for p_no in page_numbers
+        }
+
+    monkeypatch.setattr(client, "_compose_cg_sheet_batch", fake_sheet_batch)
+    sheet_res = client.compose_cg_sheet(paths, sizes, density="high")
+    assert sheet_batches == [[1, 2, 3, 4, 5, 6], [7, 8]]
+    assert all(len(sheet_res[p][0]) >= 5 for p in range(1, 9))
+
+
 
 
 

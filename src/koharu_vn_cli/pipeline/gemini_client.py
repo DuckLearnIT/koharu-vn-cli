@@ -381,10 +381,14 @@ def _build_story_contact_sheets(
 
     total_sel = len(selected)
     per_sheet = max(1, pages_per_sheet) if pages_per_sheet else max(1, total_sel)
-    if per_sheet <= 9:
-        tile_w, tile_h = 340, 440
+    if per_sheet <= 4:
+        tile_w, tile_h = 520, 680
+    elif per_sheet <= 6:
+        tile_w, tile_h = 440, 580
+    elif per_sheet <= 9:
+        tile_w, tile_h = 380, 490
     elif per_sheet <= 12:
-        tile_w, tile_h = 300, 380
+        tile_w, tile_h = 310, 400
     elif per_sheet <= 16:
         tile_w, tile_h = 280, 360
     elif per_sheet <= 25:
@@ -420,7 +424,7 @@ def _build_story_contact_sheets(
         sheets.append(
             (
                 f"Sheet tổng hợp {len(chunk)} trang (từ Trang {first_no} đến Trang {last_no} / tổng {total}):",
-                _pil_to_jpeg_b64(canvas, max_side=1800 if per_sheet > 9 else 1500, quality=86),
+                _pil_to_jpeg_b64(canvas, max_side=1800, quality=88),
             )
         )
     return sheets
@@ -1161,7 +1165,7 @@ class VisionLLMClient:
             '  "scene_arcs": [\n'
             '    {"scene_id": 1, "start_page": 1, "end_page": 7, "title": "Tiêu đề ngắn tuyến này", "plot": "Diễn biến & hoàn cảnh riêng tuyến 1", "pronoun_notes": "Xưng hô riêng tuyến này"}\n'
             "  ],\n"
-            '  "page_beats": {"1": "Tình huống cụ thể ảnh 1"}\n'
+            '  "page_beats": {"1": "[Bối cảnh + Tư thế/Ánh mắt (nhìn thẳng POV hay bạn diễn) + Biểu cảm + Tâm lý chuyển tiếp trang kế]"}\n'
             "}"
         )
         data = self._call_json(
@@ -1695,17 +1699,19 @@ class VisionLLMClient:
     ) -> tuple[list[TextRegionItem], str]:
         """
         Analyze a textless Artist CG illustration and compose natural Vietnamese dialogue
-        with spatial placement avoiding faces/focal areas, supporting both bubble & floating text.
+        with visual scene grounding, strict density adherence (`low` 1-2, `medium` 3-5, `high` 5-8),
+        and spatial placement avoiding faces/focal areas.
         """
         h, w = rgb.shape[:2]
         img_b64 = _pil_to_jpeg_b64(Image.fromarray(rgb), max_side=1400, quality=90)
+        eff_density = (density or "medium").strip().lower()
+        if eff_density not in {"low", "medium", "high"}:
+            eff_density = "medium"
 
-        density_guide = {
-            "low": "1 đến 3 câu thoại ngắn gọn, chừa nhiều khoảng trống cho tranh.",
-            "medium": "3 đến 5 câu thoại/biểu cảm cân đối, nhịp truyện tự nhiên.",
-            "high": "5 đến 8 câu thoại gồm cả thoại chính, suy nghĩ thầm và tiếng thốt/SFX.",
-        }.get(density, "3 đến 5 câu thoại cân đối.")
+        min_n, max_n = _compose_density_bounds(eff_density)
+        density_guide = _compose_density_rule(eff_density)
         style_rule = _compose_style_rule(preset)
+        schema_examples = _compose_items_example_json(eff_density, preset)
 
         bible_block = ""
         if story_bible:
@@ -1717,7 +1723,7 @@ class VisionLLMClient:
         if previous_summaries:
             joined = "\n".join(f"- Ảnh trước {i + 1}: {s}" for i, s in enumerate(previous_summaries[-6:]))
             context_block = (
-                "\nMạch truyện của các bức CG trước (hãy nối tiếp tình tiết, giữ đúng tên & xưng hô nhân vật):\n"
+                "\nMạch truyện & lời thoại ngay trước đó (hãy nối tiếp tự nhiên, phản hồi trực tiếp diễn biến vừa xảy ra):\n"
                 f"{joined}\n"
             )
 
@@ -1726,21 +1732,25 @@ class VisionLLMClient:
 
         system_prompt = (
             "Bạn là biên kịch & đạo diễn dàn trang truyện tranh/CG chuyên nghiệp.\n"
-            "Nhiệm vụ: Quan sát kỹ bức tranh Artist CG (biểu cảm khuôn mặt, ánh mắt, cử chỉ, trang phục, bối cảnh), "
-            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, giàu cảm xúc, có nhịp điệu điện ảnh và đúng thể loại/tag, đồng thời xác định tọa độ đặt chữ thẩm mỹ nhất.\n"
+            "Nhiệm vụ: Trước tiên hãy quan sát kỹ ĐÚNG NHỮNG GÌ CÓ TRONG TRANH (góc nhìn POV nhìn thẳng người xem hay góc thứ 3 có nhiều người, "
+            "ánh mắt, biểu cảm miệng-má, bàn tay đang chạm vào đâu, trang phục, đạo cụ, bối cảnh), rồi sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, "
+            "bám sát đúng tình huống đó và đặt hộp thoại vào các khoảng trống hợp lý.\n"
             + self._localization_rules()
-            + "\nNGUYÊN TẮC SÁNG TÁC THOẠI CG ĐỈNH CAO:\n"
-            "- Phân vai & cảm xúc RÕ RÀNG giữa các khung:\n"
-            "  + `white_oval` / `speech_tail`: lời nói bật thành tiếng (súc tích 3–12 từ/bóng, tự nhiên, tránh văn viết dài dòng).\n"
-            "  + `dark_translucent`: nội tâm / suy nghĩ thầm / lẩm bẩm run rẩy (chữ trắng gọn, sắc).\n"
-            "  + `floating` (`none`): tiếng thở khẽ / thì thầm sát miệng / âm thanh ngắn (chỉ 1–5 từ như 'Ưm...', 'Chậm... chút...', 'Khít quá...♡', không nhồi câu dài).\n"
-            "- ĐA DẠNG CÂU TỪ & LEO THANG CẢM XÚC: mỗi trang phải đẩy tiến triển mới về tâm lý hoặc hành động, TUYỆT ĐỐI KHÔNG lặp lại nguyên văn câu mở đầu hoặc rên y hệt trang trước.\n"
-            "QUY TẮC ĐẶT TỌA ĐỘ THẨM MỸ:\n"
+            + "\nNGUYÊN TẮC HIỂU NGỮ CẢNH & SÁNG TÁC THOẠI CG ĐỈNH CAO:\n"
+            "- XÁC ĐỊNH RÕ GÓC NHÌN & AI ĐANG NÓI: Nếu là góc nhìn POV nhân vật nhìn thẳng người xem -> đối đáp trực tiếp với bạn đọc ('anh', 'thầy', 'cậu'...). Nếu có >= 2 nhân vật trong khung -> viết trao đổi qua lại giữa các nhân vật, đặt bóng thoại về phía người đang nói.\n"
+            "- BÁM SÁT TỪNG CHI TIẾT THỊ GIÁC: Biểu cảm ngại ngùng/che mặt -> ngập ngừng thẹn thùng; cười nhếch mép/áp sát -> trêu chọc, chủ động; nhắm mắt thở dốc/đỏ bừng -> câu ngắn đứt quãng đúng nhịp cảm xúc; KHÔNG bịa chi tiết ngoài tranh.\n"
+            "- Phân vai rõ ràng giữa các khung:\n"
+            "  + `white_oval` / `speech_tail`: lời nói bật thành tiếng (3–12 từ/bóng, gọn sắc).\n"
+            "  + `dark_translucent`: nội tâm / suy nghĩ thầm / lẩm bẩm run rẩy (chữ trắng gọn, sâu).\n"
+            "  + `floating` (`none`): tiếng thở khẽ / thì thầm sát miệng / âm thanh cảm xúc ngắn (1–5 từ).\n"
+            "- ĐA DẠNG CÂU TỪ & LEO THANG CẢM XÚC: mỗi trang phải đẩy tiến triển mới về tâm lý hoặc hành động, TUYỆT ĐỐI KHÔNG lặp lại câu mở đầu y hệt trang trước.\n"
+            + f"\nRÀNG BUỘC SỐ LƯỢNG BẮT BUỘC: {density_guide}\n"
+            + "QUY TẮC ĐẶT TỌA ĐỘ THẨM MỸ:\n"
             "- Hệ tọa độ chuẩn hóa [ymin, xmin, ymax, xmax] từ 0 đến 1000 (0=trên/trái, 1000=dưới/phải).\n"
             "- TUYỆT ĐỐI KHÔNG đặt hộp thoại che khuôn mặt, mắt, miệng, tóc mái chính hoặc điểm nhấn hành động/cơ thể.\n"
-            "- Ưu tiên đặt bóng thoại ở vùng nền trống, góc trên/rìa ảnh hoặc khoảng trống cân đối quanh nhân vật.\n"
+            "- Ưu tiên đặt bóng thoại ở vùng nền trống, góc trên/rìa ảnh hoặc khoảng trống rải đều quanh nhân vật (KHÔNG dồn hết vào 1 góc).\n"
             "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG để dễ đọc trên điện thoại: "
-            "chiều rộng khoảng 130..250/1000 và chiều cao khoảng 130..260/1000 (tránh tạo bóng oval bé xíu dưới 100/1000).\n"
+            "chiều rộng khoảng 130..250/1000 và chiều cao khoảng 130..260/1000.\n"
             "- Các hộp thoại tuyệt đối không được chồng chéo lên nhau và phải cách mép ảnh tối thiểu 20/1000.\n"
             "Bắt buộc trả về đúng JSON hợp lệ."
         )
@@ -1748,37 +1758,25 @@ class VisionLLMClient:
         page_label = f" (Ảnh {page_index})" if page_index else ""
         user_prompt = (
             f"Kích thước ảnh gốc{page_label}: {w}x{h}.{bible_block}{context_block}{tags_block}{prompt_block}\n"
-            f"Mật độ thoại mong muốn: {density_guide}\n"
+            f"MẬT ĐỘ THOẠI BẮT BUỘC ({eff_density.upper()} — ĐÚNG {min_n}..{max_n} MỤC): {density_guide}\n"
             f"Quy tắc loại thoại:\n{style_rule}\n\n"
-            "Hãy phân tích bức ảnh và trả về JSON đúng cấu trúc:\n"
+            "Hãy điền `visual_scene` mô tả chính xác ảnh trước khi viết `items`, trả về JSON đúng cấu trúc:\n"
             "{\n"
+            '  "visual_scene": "Mô tả nhanh góc nhìn (POV hay 2+ người), biểu cảm mắt/miệng, hành động tay & các khoảng nền trống quanh nhân vật",\n'
             '  "page_summary": "Tóm tắt 1-2 câu tình huống & xưng hô để nối tiếp cho ảnh sau",\n'
-            '  "items": [\n'
-            "    {\n"
-            '      "id": 1,\n'
-            '      "kind": "bubble | floating",\n'
-            '      "bubble_style": "white_oval | dark_translucent | speech_tail | none",\n'
-            '      "box_2d": [ymin, xmin, ymax, xmax],\n'
-            '      "tail_target": [y, x] hoặc null,\n'
-            '      "text": "Nội dung lời thoại Tiếng Việt tự nhiên",\n'
-            '      "text_color": [R, G, B],\n'
-            '      "stroke_color": [R, G, B] hoặc null,\n'
-            '      "angle": 0\n'
-            "    }\n"
-            "  ]\n"
+            f'  "items": [\n{schema_examples}\n  ]\n'
             "}"
         )
 
         images_payload: list[tuple[str, str]] = [("Bức tranh CG cần sáng tác thoại:", img_b64)]
-        if not story_bible:
-            if prev_rgb is not None:
-                images_payload.append(
-                    ("(Tham chiếu cảnh CG trước để nối tiếp cảm xúc):", _pil_to_jpeg_b64(Image.fromarray(prev_rgb), max_side=720, quality=76))
-                )
-            if next_rgb is not None:
-                images_payload.append(
-                    ("(Tham chiếu cảnh CG sau để dẫn dắt hợp lý):", _pil_to_jpeg_b64(Image.fromarray(next_rgb), max_side=720, quality=76))
-                )
+        if prev_rgb is not None:
+            images_payload.append(
+                ("(Tham chiếu cảnh CG liền trước để nối tiếp ánh mắt, hành động & mạch thoại):", _pil_to_jpeg_b64(Image.fromarray(prev_rgb), max_side=720, quality=76))
+            )
+        if next_rgb is not None and not story_bible:
+            images_payload.append(
+                ("(Tham chiếu cảnh CG sau để dẫn dắt hợp lý):", _pil_to_jpeg_b64(Image.fromarray(next_rgb), max_side=720, quality=76))
+            )
 
         data = self._call_json(
             system_prompt,
@@ -1787,8 +1785,100 @@ class VisionLLMClient:
             temperature=0.65,
         )
 
-        items = _parse_composed_items(data.get("items", []), w=w, h=h, preset=preset)
+        items = _parse_composed_items(
+            data.get("items", []), w=w, h=h, preset=preset, density=eff_density
+        )
+        # If user requested HIGH density (>=5) and model stopped short at 1-4 items, do 1 targeted supplement pass
+        if eff_density == "high" and 0 < len(items) < min_n:
+            items = self._top_up_high_density_items(
+                img_b64=img_b64,
+                w=w,
+                h=h,
+                preset=preset,
+                existing_items=items,
+                target_min=min_n,
+                target_max=max_n,
+                visual_scene=str(data.get("visual_scene", "")).strip(),
+                page_summary=str(data.get("page_summary", "")).strip(),
+                bible_block=bible_block,
+                tags_block=tags_block,
+                prompt_block=prompt_block,
+            )
         return items, str(data.get("page_summary", "")).strip()
+
+    def _top_up_high_density_items(
+        self,
+        *,
+        img_b64: str,
+        w: int,
+        h: int,
+        preset: ComposePreset,
+        existing_items: list[TextRegionItem],
+        target_min: int,
+        target_max: int,
+        visual_scene: str,
+        page_summary: str,
+        bible_block: str,
+        tags_block: str,
+        prompt_block: str,
+    ) -> list[TextRegionItem]:
+        """Supplement additional non-overlapping bubbles/whispers/thoughts when `high` density returned too few items."""
+        need_more = max(1, target_min - len(existing_items))
+        occupied = [
+            {
+                "id": it.id,
+                "kind": it.kind,
+                "box_2d": [
+                    round(it.text_bbox[1] * 1000 / max(1, h)),
+                    round(it.text_bbox[0] * 1000 / max(1, w)),
+                    round(it.text_bbox[3] * 1000 / max(1, h)),
+                    round(it.text_bbox[2] * 1000 / max(1, w)),
+                ],
+                "text": it.translated_text,
+            }
+            for it in existing_items
+        ]
+        next_id = max((it.id for it in existing_items), default=0) + 1
+        sys_p = (
+            "Bạn là đạo diễn dàn trang CG. Hiện đang bật chế độ MẬT ĐỘ CAO (HIGH: cần 5–8 khung thoại/ảnh) "
+            "nhưng trang này mới có ít khung.\n"
+            + self._localization_rules()
+            + "Hãy sáng tác BỔ SUNG thêm các bóng thoại phản hồi, suy nghĩ thầm (`dark_translucent`) hoặc tiếng thở/thì thầm (`floating`) "
+            "vào CÁC KHOẢNG TRỐNG CHƯA DÙNG (tuyệt đối không đè lên tọa độ đã có và không che mặt nhân vật)."
+        )
+        usr_p = (
+            f"Ngữ cảnh ảnh: {visual_scene or page_summary}.{bible_block}{tags_block}{prompt_block}\n"
+            f"Đã có {len(existing_items)} khung: {json.dumps(occupied, ensure_ascii=False)}\n"
+            f"Hãy tạo THÊM từ {need_more} đến {max(need_more, target_max - len(existing_items))} khung mới (id bắt đầu từ {next_id}), "
+            f"bảo đảm tổng cộng đạt {target_min}..{target_max} khung và không trùng lặp nội dung.\n"
+            "Trả về JSON: {\"items\": [...]}"
+        )
+        try:
+            extra_data = self._call_json(
+                sys_p,
+                usr_p,
+                images=[("Ảnh CG cần bổ sung thêm thoại cho đủ mật độ HIGH:", img_b64)],
+                temperature=0.7,
+            )
+            extra_raw = extra_data.get("items", []) if isinstance(extra_data, dict) else []
+            extra_items = _parse_composed_items(
+                extra_raw, w=w, h=h, preset=preset, density="medium"
+            )
+        except Exception:
+            return existing_items
+
+        seen = {normalize_source_key(it.translated_text).lower() for it in existing_items}
+        merged = list(existing_items)
+        for it in extra_items:
+            norm = normalize_source_key(it.translated_text).lower()
+            if norm and norm in seen:
+                continue
+            if norm:
+                seen.add(norm)
+            merged.append(it.model_copy(update={"id": len(merged) + 1}))
+            if len(merged) >= target_max:
+                break
+        return resolve_box_overlaps(merged, w, h)
 
     def compose_cg_sheet(
         self,
@@ -1802,19 +1892,26 @@ class VisionLLMClient:
     ) -> dict[int, tuple[list[TextRegionItem], str]]:
         """
         Batch CG composition on numbered contact sheets:
-        - Up to 18 pages -> 1 single full sheet call.
-        - > 18 pages (e.g. 50-100+ CGs) -> automatically splits into crisp 12-page sheets
-          preserving plot continuity across batches so characters & details stay sharp.
+        - Adapts batch size by density (`high`: 6 crisp pages per sheet so every page reliably gets 5-8 items;
+          `low`/`medium`: up to 18 in 1 sheet or 12-page batches).
+        - If `high` density still receives <5 items for any sheet cell, automatically tops it up per page.
         """
         total = len(image_paths)
         if total == 0:
             return {}
-        if total > 18:
-            results: dict[int, tuple[list[TextRegionItem], str]] = {}
+        eff_density = (density or "medium").strip().lower()
+        if eff_density not in {"low", "medium", "high"}:
+            eff_density = "medium"
+        min_n, _ = _compose_density_bounds(eff_density)
+
+        batch_limit = 6 if eff_density == "high" else 12
+        single_cap = 6 if eff_density == "high" else 18
+
+        results: dict[int, tuple[list[TextRegionItem], str]] = {}
+        if total > single_cap:
             running_summaries: list[str] = []
-            batch_size = 12
-            for start in range(0, total, batch_size):
-                end = min(total, start + batch_size)
+            for start in range(0, total, batch_limit):
+                end = min(total, start + batch_limit)
                 page_nums = list(range(start + 1, end + 1))
                 self._emit_status(
                     f"Sáng tác batch Trang {page_nums[0]}–{page_nums[-1]}/{total} trên sheet nét cao..."
@@ -1825,7 +1922,7 @@ class VisionLLMClient:
                     page_numbers=page_nums,
                     total_pages=total,
                     preset=preset,
-                    density=density,
+                    density=eff_density,
                     story_prompt=story_prompt,
                     story_bible=story_bible,
                     previous_summaries=running_summaries,
@@ -1834,21 +1931,68 @@ class VisionLLMClient:
                 for p_no, val in sorted(batch_res.items()):
                     results[p_no] = val
                     if val[1]:
-                        running_summaries.append(val[1])
-            return results
+                        lines_snip = " / ".join(it.translated_text for it in val[0][:2] if it.translated_text)
+                        running_summaries.append(f"{val[1]} ({lines_snip})" if lines_snip else val[1])
+        else:
+            results = self._compose_cg_sheet_batch(
+                image_paths=image_paths,
+                image_sizes=image_sizes,
+                page_numbers=list(range(1, total + 1)),
+                total_pages=total,
+                preset=preset,
+                density=eff_density,
+                story_prompt=story_prompt,
+                story_bible=story_bible,
+                previous_summaries=None,
+                tags=tags,
+            )
 
-        return self._compose_cg_sheet_batch(
-            image_paths=image_paths,
-            image_sizes=image_sizes,
-            page_numbers=list(range(1, total + 1)),
-            total_pages=total,
-            preset=preset,
-            density=density,
-            story_prompt=story_prompt,
-            story_bible=story_bible,
-            previous_summaries=None,
-            tags=tags,
-        )
+        # Guarantee `high` density (5-8 items) even if sheet call skipped/under-filled individual cells
+        if eff_density == "high":
+            bible_txt = story_bible.to_prompt_block() if story_bible else ""
+            bible_block = f"\n=== HỒ SƠ CỐT TRUYỆN & NHÂN VẬT TOÀN BỘ CG ===\n{bible_txt}\n==========================================\n" if bible_txt else ""
+            tags_block = _format_tags_block(tags)
+            prompt_block = f"\nChỉ dẫn kịch bản / phong cách từ người dùng: {story_prompt}\n" if story_prompt else ""
+            for p_no in range(1, total + 1):
+                cur_items, cur_sum = results.get(p_no, ([], ""))
+                if len(cur_items) >= min_n:
+                    continue
+                try:
+                    with Image.open(image_paths[p_no - 1]) as im:
+                        rgb_im = im.convert("RGB")
+                        pw, ph = rgb_im.size
+                        img_b64 = _pil_to_jpeg_b64(rgb_im, max_side=1400, quality=90)
+                    if cur_items:
+                        self._emit_status(f"Bổ sung thoại Trang {p_no}/{total} cho đủ mật độ HIGH ({len(cur_items)} -> {min_n}+)...")
+                        topped = self._top_up_high_density_items(
+                            img_b64=img_b64,
+                            w=pw,
+                            h=ph,
+                            preset=preset,
+                            existing_items=cur_items,
+                            target_min=min_n,
+                            target_max=8,
+                            visual_scene=cur_sum,
+                            page_summary=cur_sum,
+                            bible_block=bible_block,
+                            tags_block=tags_block,
+                            prompt_block=prompt_block,
+                        )
+                        results[p_no] = (topped, cur_sum)
+                    else:
+                        results[p_no] = self.compose_cg_page(
+                            np.array(rgb_im),
+                            preset=preset,
+                            density="high",
+                            previous_summaries=[results[k][1] for k in sorted(results) if k < p_no and results[k][1]],
+                            story_prompt=story_prompt,
+                            story_bible=story_bible,
+                            page_index=p_no,
+                            tags=tags,
+                        )
+                except Exception:
+                    pass
+        return results
 
     def _compose_cg_sheet_batch(
         self,
@@ -1872,11 +2016,12 @@ class VisionLLMClient:
         if not sheets:
             return {}
 
-        density_guide = {
-            "low": "1 đến 3 câu thoại ngắn gọn mỗi ảnh, chừa nhiều khoảng trống cho tranh.",
-            "medium": "3 đến 5 câu thoại/biểu cảm cân đối mỗi ảnh, nhịp truyện tự nhiên.",
-            "high": "5 đến 8 câu thoại mỗi ảnh gồm thoại chính, suy nghĩ thầm và tiếng thốt/SFX.",
-        }.get(density, "3 đến 5 câu thoại cân đối mỗi ảnh.")
+        eff_density = (density or "medium").strip().lower()
+        if eff_density not in {"low", "medium", "high"}:
+            eff_density = "medium"
+        min_n, max_n = _compose_density_bounds(eff_density)
+        density_guide = _compose_density_rule(eff_density)
+        schema_examples = _compose_items_example_json(eff_density, preset)
         style_rule = _compose_style_rule(preset)
         bible_block = ""
         if story_bible:
@@ -1886,20 +2031,23 @@ class VisionLLMClient:
         prev_block = ""
         if previous_summaries:
             joined = "\n".join(f"- Cảnh trước: {s}" for s in previous_summaries[-6:])
-            prev_block = f"\nDiễn biến liền trước cụm ảnh này (giữ mạch nối tiếp):\n{joined}\n"
+            prev_block = f"\nDiễn biến & thoại liền trước cụm ảnh này (giữ mạch nối tiếp tự nhiên):\n{joined}\n"
         tags_block = _format_tags_block(tags)
         prompt_block = f"\nChỉ dẫn kịch bản / phong cách từ người dùng: {story_prompt}\n" if story_prompt else ""
 
         system_prompt = (
             "Bạn là biên kịch & đạo diễn dàn trang truyện tranh/CG chuyên nghiệp.\n"
-            "Nhiệm vụ: Quan sát toàn bộ các ô ảnh được đánh số 'Trang X/Y' trên sheet tổng hợp, "
-            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, mạch lạc theo diễn tiến từng trang, "
+            "Nhiệm vụ: Quan sát KỸ TỪNG Ô ẢNH được đánh số 'Trang X/Y' trên sheet tổng hợp "
+            "(xác định đúng góc nhìn POV hay >=2 người, ánh mắt, nét mặt, hành động tay, bối cảnh), "
+            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, nối tiếp mượt mà giữa các trang, "
             "và trả về tọa độ đặt chữ riêng cho TỪNG TRANG.\n"
             + self._localization_rules()
-            + "\nNGUYÊN TẮC SÁNG TÁC THOẠI CG NỐI TIẾP:\n"
+            + "\nNGUYÊN TẮC HIỂU NGỮ CẢNH & SÁNG TÁC THOẠI CG NỐI TIẾP:\n"
+            "- Phân biệt rõ POV (nói thẳng với người xem) và cảnh đối đáp nhiều người (đặt bóng về phía người nói).\n"
             "- Mỗi bóng thoại ngắn gọn (3–12 từ), tiếng thở/thì thầm `floating` siêu ngắn (1–5 từ).\n"
             "- Mỗi trang kế tiếp PHẢI có chuyển biến tâm lý/hành động mới; KHÔNG lặp lại nguyên văn câu thoại của trang trước.\n"
-            "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
+            + f"\nRÀNG BUỘC SỐ LƯỢNG MỖI TRANG (BẮT BUỘC): {density_guide}\n"
+            + "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
             "- Với mỗi trang, `box_2d: [ymin, xmin, ymax, xmax]` tính từ 0 đến 1000 TRONG PHẠM VI Ô ẢNH CỦA TRANG ĐÓ (không phải tọa độ cả sheet).\n"
             "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG (rộng ~130..250/1000, cao ~130..260/1000) để chữ dễ đọc trên điện thoại.\n"
             "- TUYỆT ĐỐI KHÔNG che khuôn mặt, mắt, miệng hoặc hành động chính; các hộp không được chồng chéo và cách mép ô ảnh tối thiểu 20/1000.\n"
@@ -1909,27 +2057,16 @@ class VisionLLMClient:
         user_prompt = (
             f"Các trang cần sáng tác trên sheet này ({len(image_paths)} ảnh: {page_range_label} / tổng {total_pages}):"
             f"{bible_block}{prev_block}{tags_block}{prompt_block}\n"
-            f"Mật độ thoại mỗi ảnh: {density_guide}\n"
+            f"MẬT ĐỘ THOẠI BẮT BUỘC MỖI ẢNH ({eff_density.upper()} — ĐÚNG {min_n}..{max_n} MỤC/TRANG): {density_guide}\n"
             f"Quy tắc loại thoại:\n{style_rule}\n\n"
             f"Hãy trả về JSON cho ĐỦ TẤT CẢ {len(image_paths)} trang ({page_range_label}) theo đúng số `page` ghi trên đầu mỗi ô ảnh:\n"
             "{\n"
             '  "pages": [\n'
             "    {\n"
             f'      "page": {page_numbers[0]},\n'
+            '      "visual_scene": "Góc nhìn, nét mặt, hành động đang thấy trong trang này",\n'
             '      "page_summary": "Tóm tắt 1 câu diễn biến trang này",\n'
-            '      "items": [\n'
-            "        {\n"
-            '          "id": 1,\n'
-            '          "kind": "bubble | floating",\n'
-            '          "bubble_style": "white_oval | dark_translucent | speech_tail | none",\n'
-            '          "box_2d": [ymin, xmin, ymax, xmax],\n'
-            '          "tail_target": [y, x] hoặc null,\n'
-            '          "text": "Nội dung lời thoại Tiếng Việt tự nhiên",\n'
-            '          "text_color": [R, G, B],\n'
-            '          "stroke_color": [R, G, B] hoặc null,\n'
-            '          "angle": 0\n'
-            "        }\n"
-            "      ]\n"
+            f'      "items": [\n{schema_examples}\n      ]\n'
             "    }\n"
             "  ]\n"
             "}"
@@ -1944,9 +2081,80 @@ class VisionLLMClient:
                 continue
             if p_no in page_map:
                 w, h = page_map[p_no]
-                items = _parse_composed_items(p_obj.get("items", []), w=w, h=h, preset=preset)
+                items = _parse_composed_items(
+                    p_obj.get("items", []), w=w, h=h, preset=preset, density=eff_density
+                )
                 results[p_no] = (items, str(p_obj.get("page_summary", "")).strip())
         return results
+
+
+def _compose_density_bounds(density: str) -> tuple[int, int]:
+    d = (density or "medium").strip().lower()
+    if d == "low":
+        return (1, 2)
+    if d == "high":
+        return (5, 8)
+    return (3, 5)
+
+
+def _compose_density_rule(density: str) -> str:
+    d = (density or "medium").strip().lower()
+    if d == "low":
+        return (
+            "CHẾ ĐỘ ÍT (LOW) — BẮT BUỘC CHỈ ĐÚNG 1 ĐẾN 2 MỤC/ẢNH (TUYỆT ĐỐI KHÔNG QUÁ 2 MỤC!): "
+            "chỉ giữ 1 bóng thoại đắt giá nhất (+ tối đa 1 chữ thì thầm `floating` nếu thật sự cần), để khoảng trống rộng thoáng tôn bức tranh."
+        )
+    if d == "high":
+        return (
+            "CHẾ ĐỘ NHIỀU (HIGH) — BẮT BUỘC ĐẦY ĐẶN TỪ 5 ĐẾN 8 MỤC/ẢNH (TUYỆT ĐỐI KHÔNG ĐƯỢC ÍT HƠN 5 MỤC!): "
+            "gồm ít nhất 2–3 `white_oval`/`speech_tail` (trao đổi qua lại nhiều nhịp), 1–2 `dark_translucent` (nội tâm thầm kín), "
+            "và 2–3 `floating` (tiếng thở hổn hển / thì thầm sát tai / SFX cảm xúc đặt rải đều quanh cảnh)."
+        )
+    return (
+        "CHẾ ĐỘ VỪA PHẢI (MEDIUM) — BẮT BUỘC TẠO ĐÚNG 3 ĐẾN 5 MỤC/ẢNH: "
+        "cân bằng 2–3 bóng thoại chính + 1–2 suy nghĩ thầm (`dark_translucent`) hoặc tiếng thở/thì thầm (`floating`)."
+    )
+
+
+def _compose_items_example_json(density: str, preset: ComposePreset) -> str:
+    d = (density or "medium").strip().lower()
+    b_style = "speech_tail" if preset == ComposePreset.MANGA_TAIL else "white_oval"
+    sample_1 = (
+        '        {"id": 1, "kind": "bubble", "bubble_style": "'
+        + ("none" if preset == ComposePreset.FLOATING_ONLY else b_style)
+        + '", "box_2d": [60, 40, 240, 270], "tail_target": '
+        + ("[280, 390]" if b_style == "speech_tail" else "null")
+        + ', "text": "Lời thoại chính bật thành tiếng...", "text_color": [18, 18, 18], "stroke_color": null, "angle": 0}'
+    )
+    sample_2 = (
+        '        {"id": 2, "kind": "'
+        + ("floating" if preset == ComposePreset.FLOATING_ONLY else "bubble")
+        + '", "bubble_style": "'
+        + ("none" if preset == ComposePreset.FLOATING_ONLY else "dark_translucent")
+        + '", "box_2d": [70, 700, 260, 940], "tail_target": null, "text": "Suy nghĩ thầm kín...", "text_color": [255, 255, 255], "stroke_color": [18, 18, 18], "angle": 0}'
+    )
+    sample_3 = (
+        '        {"id": 3, "kind": "floating", "bubble_style": "none", '
+        '"box_2d": [680, 60, 790, 280], "tail_target": null, "text": "Ưm... chậm thôi...", "text_color": [255, 255, 255], "stroke_color": [18, 18, 18], "angle": -4}'
+    )
+    sample_4 = (
+        '        {"id": 4, "kind": "'
+        + ("floating" if preset == ComposePreset.FLOATING_ONLY else "bubble")
+        + '", "bubble_style": "'
+        + ("none" if preset == ComposePreset.FLOATING_ONLY else b_style)
+        + '", "box_2d": [320, 720, 500, 950], "tail_target": '
+        + ("[390, 620]" if b_style == "speech_tail" else "null")
+        + ', "text": "Câu đáp lại nhịp hai...", "text_color": [18, 18, 18], "stroke_color": null, "angle": 0}'
+    )
+    sample_5 = (
+        '        {"id": 5, "kind": "floating", "bubble_style": "none", '
+        '"box_2d": [740, 690, 860, 930], "tail_target": null, "text": "Nóng quá...♡", "text_color": [255, 200, 225], "stroke_color": [20, 15, 25], "angle": 5}'
+    )
+    if d == "low":
+        return sample_1
+    if d == "high":
+        return ",\n".join((sample_1, sample_2, sample_3, sample_4, sample_5))
+    return ",\n".join((sample_1, sample_2, sample_3))
 
 
 def _compose_style_rule(preset: ComposePreset) -> str:
@@ -1978,6 +2186,7 @@ def _parse_composed_items(
     w: int,
     h: int,
     preset: ComposePreset,
+    density: str = "medium",
 ) -> list[TextRegionItem]:
     from koharu_vn_cli.pipeline.typesetter import sanitize_render_text
 
@@ -2074,5 +2283,20 @@ def _parse_composed_items(
         )
 
     if items:
+        _, max_n = _compose_density_bounds(density)
+        if (density or "medium").strip().lower() == "low" and len(items) > max_n:
+            bubbles = [it for it in items if it.kind == "bubble"]
+            floats = [it for it in items if it.kind != "bubble"]
+            kept: list[TextRegionItem] = []
+            if bubbles:
+                kept.append(bubbles[0])
+            if len(kept) < max_n and floats:
+                kept.append(floats[0])
+            for it in items:
+                if len(kept) >= max_n:
+                    break
+                if it not in kept:
+                    kept.append(it)
+            items = [it.model_copy(update={"id": idx}) for idx, it in enumerate(kept, start=1)]
         items = resolve_box_overlaps(items, w, h)
     return items

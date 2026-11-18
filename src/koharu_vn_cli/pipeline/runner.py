@@ -2122,7 +2122,8 @@ def run_compose_pipeline(
             if items:
                 items = expand_composed_boxes_if_tight(items, w, h)
             if summary:
-                previous_summaries.append(summary)
+                lines_snip = " / ".join(it.translated_text for it in items[:2] if it.translated_text)
+                previous_summaries.append(f"{summary} [Thoại: {lines_snip}]" if lines_snip else summary)
 
             hooks.check_cancelled()
             hooks.emit_step(idx, total, img_path.name, "render", "Vẽ bubble/chữ thường & xuất ảnh CG...")
