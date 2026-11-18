@@ -448,11 +448,13 @@ def test_tags_injection_and_natural_spoken_vietnamese_rules(monkeypatch):
     client.compose_cg_page(dummy_rgb, tags="vanilla, sweet")
     assert "[THỂ LOẠI / TAGS]: vanilla, sweet" in captured[-1]["user"]
     assert "KHẨU NGỮ ĐỜI THƯỜNG" in captured[-1]["system"]
+    assert "HUMAN.md" in captured[-1]["system"]
 
     reg = TextRegionItem(id=1, kind="bubble", text_bbox=(10, 10, 120, 80))
     client.translate_page(dummy_rgb, [reg], tags="NTR, angst")
     assert "[THỂ LOẠI / TAGS]: NTR, angst" in captured[-1]["user"]
     assert "KHẨU NGỮ TIẾNG VIỆT ĐỜI THƯỜNG" in captured[-1]["system"]
+    assert "HUMAN.md" in captured[-1]["system"]
 
 
 def test_single_full_sheet_packing_and_compose_cg_sheet(tmp_path: Path, monkeypatch):

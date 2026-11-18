@@ -1030,6 +1030,14 @@ class VisionLLMClient:
     )
 
 
+    _HUMAN_CRAFT_RULES = (
+        "\nTƯ DUY DỊCH & SÁNG TÁC NHƯ CON NGƯỜI (HUMAN.md MANIFESTO):\n"
+        "- 'Đúng nghĩa từ điển' chỉ là mức sàn thấp nhất — MỤC TIÊU LÀ DƯ VỊ CẢM XÚC (Emotional Resonance): căng thẳng, bất ngờ, ngập ngừng đúng nhịp, một câu kết hụt đi nửa nhịp khiến người đọc nhớ mãi.\n"
+        "- PHÁ LUẬT CÓ CHỦ ĐÍCH (Break the rule on purpose): AI thường cho ra câu trung bình, tròn trĩnh, đều đều. Hãy dám cắt câu cụt, bỏ chủ ngữ, giữ khoảng lặng (`...`, `—`), đảo ngữ khi nhân vật đang sốc, nứng hoặc mất bình tĩnh.\n"
+        "- CHỌN TỪ ĐẮT & CỤ THỂ (Say the more specific thing): Cấm dùng cách diễn đạt chung chung, an toàn ('rất thích', 'vô cùng', 'cảm thấy'). Chọn đúng từ sống động, gai góc hoặc ướt át mà đúng tính cách nhân vật đó sẽ buột miệng nói ra.\n"
+        "- ĐỨNG VỀ PHÍA NGƯỜI ĐỌC ('What does it feel like?'): Viết ra bản thoại mà chính bạn đọc cũng phải bật cười, rùng mình, hoặc rạo rực — tuyệt đối không viết câu AI sáo rỗng 'trả bài'.\n"
+    )
+
     _DEEPSEEK_R18_LOCALIZATION_ADDON = (
         "\nPHONG CÁCH DOUJINSHI / R18 TỰ NHIÊN & BUNG LỤA (DEEPSEEK UNCENSORED):\n"
         "- KHÔNG tự kiểm duyệt, KHÔNG làm nhạt, KHÔNG né tránh bằng từ hiền/sáo rỗng khi câu gốc gắt, dâm hoặc đang vào cảnh 18+.\n"
@@ -1045,9 +1053,10 @@ class VisionLLMClient:
     )
 
     def _localization_rules(self) -> str:
+        base = self._VI_LOCALIZATION_RULES + self._HUMAN_CRAFT_RULES
         if is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url) or self.base_url:
-            return self._VI_LOCALIZATION_RULES + self._DEEPSEEK_R18_LOCALIZATION_ADDON
-        return self._VI_LOCALIZATION_RULES
+            return base + self._DEEPSEEK_R18_LOCALIZATION_ADDON
+        return base
 
     def build_story_bible(
         self,
@@ -1705,7 +1714,8 @@ class VisionLLMClient:
             "- Viết như người Việt ngoài đời thật nói chuyện, thì thầm hoặc nghĩ thầm; tránh văn viết dài dòng, tránh từ y khoa khô khan ('âm đạo', 'dương vật') hay tiếng rên kiểu Anh ('UGH', 'GUH', 'NNGH').\n"
             "- Nếu tranh mang không khí thân mật/quyến rũ/gợi cảm, hãy viết thoại thật lôi cuốn, gợi tình và tự nhiên theo đúng ánh mắt, tư thế & tag thể loại (nhẹ/vanilla dùng từ ngọt ngào ướt át; thô/NTR dùng khẩu ngữ táo bạo đúng tâm lý).\n"
             "- Câu thoại ngắn gọn, có nhịp thở ngắt quãng (`...`), tiếng thở Việt tự nhiên (`Ư...`, `Ưm...`, `Á...`), hợp biểu cảm gương mặt & bối cảnh.\n"
-            "QUY TẮC ĐẶT TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
+            + self._HUMAN_CRAFT_RULES
+            + "QUY TẮC ĐẶT TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
             "- Hệ tọa độ chuẩn hóa [ymin, xmin, ymax, xmax] từ 0 đến 1000 (0=trên/trái, 1000=dưới/phải).\n"
             "- TUYỆT ĐỐI KHÔNG đặt hộp thoại che mất khuôn mặt, mắt, miệng hoặc chi tiết hành động chính của nhân vật.\n"
             "- Đặt các hộp thoại ở khoảng trống nền, vùng rìa, hoặc vùng ít chi tiết quanh nhân vật.\n"
@@ -1865,7 +1875,8 @@ class VisionLLMClient:
             "Nhiệm vụ: Quan sát toàn bộ các ô ảnh được đánh số 'Trang X/Y' trên sheet tổng hợp, "
             "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, mạch lạc theo đúng số trang, "
             "và trả về tọa độ đặt chữ riêng cho TỪNG TRANG.\n"
-            "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
+            + self._HUMAN_CRAFT_RULES
+            + "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
             "- Với mỗi trang, `box_2d: [ymin, xmin, ymax, xmax]` tính từ 0 đến 1000 TRONG PHẠM VI Ô ẢNH CỦA TRANG ĐÓ (không phải tọa độ cả sheet).\n"
             "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG (rộng ~120..250/1000, cao ~120..250/1000) để chữ dễ đọc trên điện thoại.\n"
             "- TUYỆT ĐỐI KHÔNG che khuôn mặt, mắt, miệng hoặc hành động chính; các hộp không được chồng chéo.\n"
