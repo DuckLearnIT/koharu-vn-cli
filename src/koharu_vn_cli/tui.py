@@ -66,13 +66,14 @@ class QueuedJob:
     tags: str = ""
     resume: bool = False
     in_place: bool = False
+    page_range: str = ""
 
 
 SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/translate", "<đường_dẫn|.zip> [--resume]", "Dịch truyện tranh / file .zip / .cbz (tự xếp queue nếu đang chạy)"),
     SlashSpec("/retranslate", "<đường_dẫn|.zip>", "Tái dịch ảnh/zip tải từ Drive (bỏ qua ảnh đã dịch, chỉ dịch lại ảnh chưa dịch)"),
     SlashSpec("/queue", "<đường_dẫn... | list | clear | start | remove N>", "Hàng đợi dịch liên tục nhiều tác phẩm kế tiếp nhau"),
-    SlashSpec("/compose", "<đường_dẫn> [--resume]", "Tự sáng tác thoại cho Artist CG không lời"),
+    SlashSpec("/compose", "<đường_dẫn> [--pages 1-20] [--resume]", "Tự sáng tác thoại cho Artist CG không lời (hỗ trợ chọn trang)"),
     SlashSpec("/resume", "[đường_dẫn]", "Chạy tiếp tác vụ bị dừng/lỗi từ trang chưa xong (bỏ qua trang đã dịch)"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
     SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
@@ -233,6 +234,49 @@ def extract_multiple_paths(raw: str) -> list[str]:
     return found
 
 
+def extract_page_range_arg(text: str, *, allow_bare: bool = True) -> tuple[str | None, str]:
+    """
+    Extract page-range filter such as `--pages 1-20`, `-p 21-41`, `trang 1-20`, or bare leading `1-20`.
+    Returns `(normalized_spec_or_none, remaining_text)`.
+    """
+    s = (text or "").strip()
+    if not s:
+        return None, ""
+
+    m_flag = re.search(
+        r"(?:--pages|-p)\s*(?:=\s*|\s+)([0-9]+(?:\s*(?:-|\.\.)\s*[0-9]*)?(?:\s*,\s*[0-9]+(?:\s*(?:-|\.\.)\s*[0-9]*)?)*)",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m_flag:
+        spec = re.sub(r"\s+", "", m_flag.group(1))
+        rem = (s[: m_flag.start()] + " " + s[m_flag.end() :]).strip()
+        return spec, re.sub(r"\s+", " ", rem).strip()
+
+    m_vi = re.search(
+        r"\b(?:từ\s+trang|trang|pages?)\s*:?\s*([0-9]+\s*(?:-|\.\.|đến|tới)\s*[0-9]+(?:\s*,\s*[0-9]+(?:\s*(?:-|\.\.)\s*[0-9]+)?)*)",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m_vi:
+        spec = re.sub(r"\s*(?:đến|tới)\s*", "-", m_vi.group(1), flags=re.IGNORECASE)
+        spec = re.sub(r"\s+", "", spec)
+        rem = (s[: m_vi.start()] + " " + s[m_vi.end() :]).strip()
+        return spec, re.sub(r"\s+", " ", rem).strip()
+
+    if allow_bare:
+        m_bare = re.match(
+            r"^(\d+\s*(?:-|\.\.)\s*\d*(?:\s*,\s*\d+(?:\s*(?:-|\.\.)\s*\d*)?)*)(?:\s+(.*))?$",
+            s,
+        )
+        if m_bare:
+            spec = re.sub(r"\s+", "", m_bare.group(1))
+            rem = (m_bare.group(2) or "").strip()
+            return spec, rem
+
+    return None, s
+
+
 def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
     """
     Interpret natural Vietnamese prompt into `(action, path, extra_opts)`.
@@ -277,24 +321,25 @@ def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
     is_translate = any(k in low for k in ("dịch", "translate", "raw", "manga", "manhwa", "manhua"))
 
     if path_str:
+        extracted_pages, rem_clean = extract_page_range_arg(rem, allow_bare=False)
         # Clean common command filler words to preserve meaningful story/tone hint
         hint = re.sub(
             r"\b(hãy|giúp|tôi|dịch|truyện|sáng tác|thoại|cg|compose|translate|cho|ảnh|thư mục|với|kiểu|phong cách|đuôi nhọn|cg-oval|manga-tail)\b",
             " ",
-            rem,
+            rem_clean,
             flags=re.IGNORECASE,
         )
         hint = re.sub(r"\s+", " ", hint).strip(" ,.-:")
 
         if is_compose and not is_translate:
-            return "compose", path_str, {"prompt": hint, "style": style_override}
+            return "compose", path_str, {"prompt": hint, "style": style_override, "pages": extracted_pages or ""}
         if is_translate and not is_compose:
             return "translate", path_str, {"prompt": hint}
         if style_override is not None:
-            return "compose", path_str, {"prompt": hint, "style": style_override}
+            return "compose", path_str, {"prompt": hint, "style": style_override, "pages": extracted_pages or ""}
         if Path(path_str).suffix.lower() in {".zip", ".cbz"}:
             return "translate", path_str, {"prompt": hint}
-        return "pick_action", path_str, {"prompt": hint}
+        return "pick_action", path_str, {"prompt": hint, "pages": extracted_pages or ""}
 
     return "chat", None, {"text": text}
 
@@ -434,8 +479,8 @@ class KeySetupModal(ModalScreen[tuple[str, str, str] | None]):
         self.dismiss(None)
 
 
-class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
-    """Interactive prompt asking for path, tags + custom instructions when `/translate` or `/compose` lacks args."""
+class RunJobModal(ModalScreen[tuple[str, str, str, str] | None]):
+    """Interactive prompt asking for path, optional page range, tags + custom instructions."""
 
     BINDINGS = [Binding("escape", "cancel", "Hủy")]
 
@@ -446,6 +491,7 @@ class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
         initial_prompt: str = "",
         style_name: str = "",
         initial_tags: str = "",
+        initial_pages: str = "",
     ) -> None:
         super().__init__()
         self.mode = mode
@@ -453,6 +499,7 @@ class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
         self.initial_prompt = initial_prompt
         self.style_name = style_name
         self.initial_tags = initial_tags
+        self.initial_pages = initial_pages
 
     def compose(self) -> ComposeResult:
         title = (
@@ -471,6 +518,9 @@ class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
             yield Label(title, id="modal-title")
             yield Label("Kéo thả hoặc dán đường dẫn ảnh / thư mục / file .cbz / .zip:", id="modal-subtitle")
             yield Input(value=self.initial_path, placeholder=r"C:\Users\Duck\Manga\Chap_01", id="job-path")
+            if self.mode == "compose":
+                yield Label("Chọn phạm vi trang (vd: 1-20, 21-41 — bỏ trống = toàn bộ):")
+                yield Input(value=self.initial_pages, placeholder="Tất cả trang (hoặc nhập 1-20, 21-41)...", id="job-pages")
             yield Label("Tag thể loại (vd: vanilla, NTR, tsundere, comedy):")
             yield Input(value=self.initial_tags, placeholder="Tùy chọn (vd: vanilla, ngọt ngào)...", id="job-tags")
             yield Label(hint)
@@ -484,6 +534,13 @@ class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
 
     @on(Input.Submitted, "#job-path")
     def _next_tags(self) -> None:
+        if self.mode == "compose":
+            self.query_one("#job-pages", Input).focus()
+        else:
+            self.query_one("#job-tags", Input).focus()
+
+    @on(Input.Submitted, "#job-pages")
+    def _next_tags_from_pages(self) -> None:
         self.query_one("#job-tags", Input).focus()
 
     @on(Input.Submitted, "#job-tags")
@@ -494,10 +551,11 @@ class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
     @on(Button.Pressed, "#run-btn")
     def _submit(self) -> None:
         p = strip_path_quotes(self.query_one("#job-path", Input).value)
+        pg = self.query_one("#job-pages", Input).value.strip() if self.mode == "compose" else ""
         tg = self.query_one("#job-tags", Input).value.strip()
         pr = self.query_one("#job-prompt", Input).value.strip()
         if p:
-            self.dismiss((p, pr, tg))
+            self.dismiss((p, pr, tg, pg))
 
     @on(Button.Pressed, "#cancel-btn")
     def _cancel(self) -> None:
@@ -1416,7 +1474,11 @@ class KoharuTUI(App[None]):
                 self.cfg.compose_style = extra["style"]
                 save_config(self.cfg)
                 self._refresh_chrome()
-            self._launch_compose(Path(path_str), extra.get("prompt") or "")
+            self._launch_compose(
+                Path(path_str),
+                extra.get("prompt") or "",
+                page_range=extra.get("pages") or "",
+            )
         elif action == "rerender" and path_str:
             self._launch_rerender(Path(path_str))
         elif action == "pick_action" and path_str:
@@ -1596,12 +1658,30 @@ class KoharuTUI(App[None]):
             resume_flag = "--resume" in rest
             cleaned_rest = rest.replace("--resume", "").strip()
             p_str, hint = split_cmd_and_hint(cleaned_rest)
+            page_range, hint = extract_page_range_arg(hint, allow_bare=True)
             if p_str:
-                self._launch_compose(Path(p_str), hint, resume=resume_flag)
+                self._launch_compose(Path(p_str), hint, resume=resume_flag, page_range=page_range or "")
             else:
                 self.push_screen(
-                    RunJobModal("compose", "", self.cfg.custom_prompt, self.cfg.compose_style.value, self.cfg.tags),
-                    lambda res: self._launch_compose(Path(res[0]), res[1], res[2], resume=resume_flag) if res else None,
+                    RunJobModal(
+                        "compose",
+                        "",
+                        self.cfg.custom_prompt,
+                        self.cfg.compose_style.value,
+                        self.cfg.tags,
+                        initial_pages=page_range or "",
+                    ),
+                    lambda res: (
+                        self._launch_compose(
+                            Path(res[0]),
+                            res[1],
+                            res[2],
+                            resume=resume_flag,
+                            page_range=res[3],
+                        )
+                        if res
+                        else None
+                    ),
                 )
         elif cmd == "/resume":
             p_str, hint = split_cmd_and_hint(rest)
@@ -2127,7 +2207,13 @@ class KoharuTUI(App[None]):
         elif job.mode == "retranslate":
             self._launch_retranslate(job.input_path, job.prompt, job.tags)
         elif job.mode == "compose":
-            self._launch_compose(job.input_path, job.prompt, job.tags, resume=job.resume)
+            self._launch_compose(
+                job.input_path,
+                job.prompt,
+                job.tags,
+                resume=job.resume,
+                page_range=job.page_range,
+            )
         elif job.mode == "rerender":
             self._launch_rerender(job.input_path)
         elif job.mode == "rename":
@@ -2409,7 +2495,13 @@ class KoharuTUI(App[None]):
         )
 
     def _launch_compose(
-        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+        self,
+        input_path: Path,
+        extra_prompt: str = "",
+        extra_tags: str = "",
+        *,
+        resume: bool = False,
+        page_range: str = "",
     ) -> None:
         if not self._ensure_llm_ready(needs_llm=True):
             return
@@ -2424,13 +2516,14 @@ class KoharuTUI(App[None]):
                     prompt=extra_prompt,
                     tags=extra_tags,
                     resume=resume,
+                    page_range=page_range,
                 )
             )
             return
         self.cfg.last_input_path = str(input_path)
         self.cfg.last_job_mode = "compose"
         save_config(self.cfg)
-        self._start_compose(input_path, extra_prompt, extra_tags, resume=resume)
+        self._start_compose(input_path, extra_prompt, extra_tags, resume=resume, page_range=page_range)
 
     def _launch_rerender(self, output_dir: Path) -> None:
         if self.is_running_job:
@@ -2520,10 +2613,21 @@ class KoharuTUI(App[None]):
 
     @work(thread=True)
     def _start_compose(
-        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+        self,
+        input_path: Path,
+        extra_prompt: str = "",
+        extra_tags: str = "",
+        *,
+        resume: bool = False,
+        page_range: str = "",
     ) -> None:
         self.cancel_event.clear()
-        mode_lbl = "Tiếp tục CG" if resume else f"Sáng tác CG ({self.cfg.compose_style.value})"
+        range_tag = f" [{page_range}]" if page_range else ""
+        mode_lbl = (
+            f"Tiếp tục CG{range_tag}"
+            if resume
+            else f"Sáng tác CG ({self.cfg.compose_style.value}{range_tag})"
+        )
         self.call_from_thread(
             self._set_job_ui, True, f"{mode_lbl}: {input_path.name}", 2.0
         )
@@ -2550,6 +2654,7 @@ class KoharuTUI(App[None]):
                 save_cbz=self.cfg.save_cbz,
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
+                page_range=page_range or None,
                 resume=resume,
                 clean_cache=self.cfg.clean_cache,
                 hooks=self._build_hooks(),

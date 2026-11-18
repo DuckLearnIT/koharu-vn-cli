@@ -310,6 +310,48 @@ def package_cbz(output_dir: Path, cbz_path: Path) -> None:
             zf.write(img, arcname=img.name)
 
 
+def parse_page_range_spec(spec: str, total: int) -> list[int]:
+    """
+    Parse 1-based page range specification like `'1-20'`, `'21-41'`, `'1-20, 25, 30-40'`,
+    `'21-'`, `'-20'` into sorted unique 1-based page numbers within `[1, total]`.
+    """
+    if total <= 0:
+        raise ValueError("Thư mục không có ảnh nào để chọn trang.")
+    cleaned = re.sub(r"\s+", "", (spec or "").strip())
+    if not cleaned:
+        return list(range(1, total + 1))
+
+    selected: set[int] = set()
+    for part in cleaned.split(","):
+        if not part:
+            continue
+        m_range = re.fullmatch(r"(\d+)?(?:-|\.\.)(\d+)?", part)
+        if m_range:
+            raw_s, raw_e = m_range.group(1), m_range.group(2)
+            if raw_s is None and raw_e is None:
+                raise ValueError(f"Khoảng trang không hợp lệ: '{part}'")
+            start = int(raw_s) if raw_s is not None else 1
+            end = int(raw_e) if raw_e is not None else total
+            if start <= 0 or end <= 0:
+                raise ValueError(f"Số trang phải >= 1: '{part}'")
+            if start > end:
+                start, end = end, start
+            for p in range(max(1, start), min(total, end) + 1):
+                selected.add(p)
+        elif part.isdigit():
+            val = int(part)
+            if 1 <= val <= total:
+                selected.add(val)
+        else:
+            raise ValueError(
+                f"Định dạng khoảng trang không hợp lệ: '{part}'. Ví dụ đúng: 1-20, 21-41 hoặc 1-10, 15."
+            )
+
+    if not selected:
+        raise ValueError(f"Không có trang nào nằm trong phạm vi 1..{total} cho '{spec}'.")
+    return sorted(selected)
+
+
 def expand_composed_boxes_if_tight(
     regions: list[TextRegionItem], img_w: int, img_h: int
 ) -> list[TextRegionItem]:
@@ -1865,18 +1907,27 @@ def run_compose_pipeline(
     save_cbz: bool = False,
     output_format: str = "original",
     sequential_names: bool = False,
+    page_range: str | None = None,
     skip_blocked: bool = True,
     resume: bool = False,
     clean_cache: bool = True,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
-    """Run Artist CG dialogue composition pipeline end-to-end."""
+    """Run Artist CG dialogue composition pipeline end-to-end (supports selective `page_range` like `'1-20'`)."""
     hooks = hooks or PipelineHooks()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        images, base_name = collect_inputs(input_path, Path(tmp_dir))
-        if not images:
+        all_images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        if not all_images:
             raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
+
+        orig_total = len(all_images)
+        indexed_images: list[tuple[int, Path]] = list(enumerate(all_images, start=1))
+        eff_range = (page_range or "").strip()
+        if eff_range:
+            chosen_nums = set(parse_page_range_spec(eff_range, orig_total))
+            indexed_images = [(orig_idx, p) for orig_idx, p in indexed_images if orig_idx in chosen_nums]
+        images = [p for _, p in indexed_images]
 
         out_dir = output or input_path.parent / f"{base_name}_composed"
         cache_dir = out_dir / ".koharu_cache"
@@ -1884,6 +1935,14 @@ def run_compose_pipeline(
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         total = len(images)
+        if eff_range:
+            hooks.emit_step(
+                0,
+                total,
+                base_name,
+                "range",
+                f"Đã chọn trang '{eff_range}': {total}/{orig_total} ảnh ({images[0].name} → {images[-1].name}).",
+            )
         if is_text_only_model(model, base_url):
             raise ValueError(
                 f"Chế độ /compose (sáng tác thoại cho CG không lời) cần model Vision nhìn được ảnh. "
@@ -1999,15 +2058,15 @@ def run_compose_pipeline(
                 )
                 sheet_results = {}
 
-        seq_pad = max(3, len(str(total)))
-        stem_counts = Counter(p.stem for p in images)
-        for idx, img_path in enumerate(images, start=1):
+        seq_pad = max(3, len(str(orig_total)))
+        stem_counts = Counter(p.stem for p in all_images)
+        for idx, (orig_idx, img_path) in enumerate(indexed_images, start=1):
             hooks.check_cancelled()
-            cache_stem = _cache_stem_for_page(img_path, idx, seq_pad, stem_counts)
+            cache_stem = _cache_stem_for_page(img_path, orig_idx, seq_pad, stem_counts)
             out_img_path = out_dir / _output_image_name(
                 img_path,
                 output_format=output_format,
-                seq_index=idx if (sequential_names or stem_counts[img_path.stem] > 1) else None,
+                seq_index=orig_idx if (sequential_names or stem_counts[img_path.stem] > 1) else None,
                 seq_pad=seq_pad,
             )
             json_path = cache_dir / f"{cache_stem}.koharu.json"

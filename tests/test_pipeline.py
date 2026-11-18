@@ -2871,6 +2871,106 @@ def test_floating_collision_avoidance_cjk_sanitize_ko_sfx_and_box_separation() -
     assert float_lay.font_size <= 25  # Outlier short whisper capped harmoniously!
 
 
+def test_compose_selective_page_range_cli_and_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify `--pages` / `/compose ... 1-20` slices sequentially and preserves 1-based numbering across batches."""
+    import pytest
+    from typer.testing import CliRunner
+
+    from koharu_vn_cli import cli
+    from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import parse_page_range_spec, run_compose_pipeline
+    from koharu_vn_cli.tui import KoharuTUI, extract_page_range_arg, parse_natural_intent
+
+    # 1) Parser coverage
+    assert parse_page_range_spec("1-20", 100) == list(range(1, 21))
+    assert parse_page_range_spec("21-41", 100) == list(range(21, 42))
+    assert parse_page_range_spec("1-3, 10, 98-", 100) == [1, 2, 3, 10, 98, 99, 100]
+    with pytest.raises(ValueError):
+        parse_page_range_spec("200-300", 100)
+
+    # 2) Incremental batch compose: 1-3 then 4-6 into the same folder without overwriting
+    cg_dir = tmp_path / "cg_set"
+    cg_dir.mkdir()
+    for i in range(1, 11):
+        Image.new("RGB", (200, 240), (i * 20, 40, 80)).save(cg_dir / f"{i}.png")
+
+    def fake_compose_sheet(self, image_paths, image_sizes, page_numbers, total_pages, **kwargs):
+        return {
+            p_no: (
+                [
+                    TextRegionItem(
+                        id=1,
+                        kind="bubble",
+                        bubble_style=BubbleStyle.WHITE_OVAL,
+                        text_bbox=(20, 20, 140, 110),
+                        bubble_bbox=(20, 20, 140, 110),
+                        translated_text=f"Thoại trang {p_no}",
+                        draw_bubble=True,
+                    )
+                ],
+                f"Tóm tắt {p_no}",
+            )
+            for p_no in page_numbers
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_compose_cg_sheet_batch", fake_compose_sheet)
+
+    out1, docs1 = run_compose_pipeline(
+        cg_dir,
+        api_key="sk-fake",
+        story_pass=False,
+        page_range="1-3",
+        sequential_names=True,
+        output_format="png",
+        clean_cache=False,
+    )
+    assert out1 == tmp_path / "cg_set_composed"
+    assert [Path(d.image_path).name for d in docs1] == ["1.png", "2.png", "3.png"]
+    assert all((out1 / f"{n:03d}.png").is_file() for n in (1, 2, 3))
+
+    out2, docs2 = run_compose_pipeline(
+        cg_dir,
+        api_key="sk-fake",
+        story_pass=False,
+        page_range="4-6",
+        sequential_names=True,
+        output_format="png",
+        clean_cache=False,
+    )
+    assert out2 == out1
+    assert [Path(d.image_path).name for d in docs2] == ["4.png", "5.png", "6.png"]
+    # Both batch 1 (001..003) and batch 2 (004..006) coexist cleanly!
+    assert all((out2 / f"{n:03d}.png").is_file() for n in range(1, 7))
+    assert not (out2 / "007.png").exists()
+
+    # 3) TUI & natural intent page-range parsing
+    spec, rem = extract_page_range_arg("--pages 21-41 ngọt ngào")
+    assert spec == "21-41" and rem == "ngọt ngào"
+    act, parsed_p, opts = parse_natural_intent(f'sáng tác thoại "{cg_dir}" trang 21-41 ngọt ngào')
+    assert act == "compose" and parsed_p == str(cg_dir) and opts["pages"] == "21-41"
+
+    app = KoharuTUI()
+    monkeypatch.setattr(app, "_refresh_chrome", lambda: None)
+    monkeypatch.setattr(app, "_log_ai", lambda *a, **kw: None)
+    monkeypatch.setattr(app, "_ensure_llm_ready", lambda needs_llm=True: True)
+    seen_launches: list[tuple[Path, str, str]] = []
+    monkeypatch.setattr(
+        app,
+        "_start_compose",
+        lambda input_path, prompt="", tags="", *, resume=False, page_range="": seen_launches.append(
+            (input_path, page_range, prompt)
+        ),
+    )
+    app.dispatch_command(f'/compose "{cg_dir}" 21-41 trêu chọc')
+    assert seen_launches == [(cg_dir, "21-41", "trêu chọc")]
+
+    # 4) CLI `--pages` option exposed on `compose`
+    res_help = CliRunner().invoke(cli.app, ["compose", "--help"])
+    assert res_help.exit_code == 0 and "--pages" in res_help.stdout
+
+
 
 
 

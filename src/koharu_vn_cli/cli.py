@@ -462,6 +462,7 @@ def compose(
     story_model: Optional[str] = typer.Option(None, "--story-model", help="Model CHÍNH (mạnh) cho Pass 1 phân tích full cốt truyện, nhân vật & tình huống."),
     story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback cho CHÍNH khi bị prohibit (thử 1 lượt rồi bỏ qua Pass 1)."),
     font: Optional[str] = typer.Option(None, "--font", help="Ghi đè font chữ Việt cho tất cả câu thoại."),
+    pages: Optional[str] = typer.Option(None, "-p", "--pages", help="Chọn phạm vi trang compose (vd: '1-20', '21-41', '1-10, 15')."),
     save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz."),
     output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
     seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
@@ -523,6 +524,7 @@ def compose(
                 save_cbz=save_cbz,
                 output_format=eff_format,
                 sequential_names=eff_seq,
+                page_range=pages,
                 resume=resume,
                 clean_cache=eff_clean_cache,
                 hooks=PipelineHooks(
