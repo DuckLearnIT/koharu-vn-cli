@@ -313,12 +313,15 @@ def package_cbz(output_dir: Path, cbz_path: Path) -> None:
 def expand_composed_boxes_if_tight(
     regions: list[TextRegionItem], img_w: int, img_h: int
 ) -> list[TextRegionItem]:
-    """Ensure compose bubbles & floating boxes are comfortably large and readable on mobile/desktop."""
+    """Ensure compose bubbles & floating boxes are comfortably large, collision-free, and typographically harmonious."""
     min_dim = min(img_w, img_h)
-    bubble_target_font = max(18, int(round(min_dim * 0.024)))
-    floating_target_font = max(16, int(round(min_dim * 0.020)))
-    max_bw = max(200, int(round(img_w * 0.36)))
-    max_bh = max(160, int(round(img_h * 0.36)))
+    bubble_target_font = max(16, int(round(min_dim * 0.022)))
+    floating_target_font = max(15, int(round(min_dim * 0.019)))
+    bubble_max_font = max(bubble_target_font + 2, min(26, int(round(min_dim * 0.028))))
+    floating_max_font = max(floating_target_font + 2, min(24, int(round(min_dim * 0.025))))
+    max_bw = max(200, int(round(img_w * 0.34)))
+    max_bh = max(160, int(round(img_h * 0.34)))
+    edge_pad = max(10, int(round(min_dim * 0.012)))
 
     adjusted: list[TextRegionItem] = []
     for reg in regions:
@@ -330,12 +333,12 @@ def expand_composed_boxes_if_tight(
         if is_bubble:
             if text_len <= 12:
                 min_bw = max(112, int(round(img_w * 0.095)))
-                min_bh = max(86, int(round(img_h * 0.095)))
+                min_bh = max(96, int(round(img_h * 0.10)))
             else:
                 min_bw = max(150, int(round(img_w * 0.125)))
-                min_bh = max(110, int(round(img_h * 0.12)))
+                min_bh = max(125, int(round(img_h * 0.125)))
         else:
-            min_bw, min_bh = 48, 28
+            min_bw, min_bh = 64, 32
 
         bx1, by1, bx2, by2 = copy.bubble_bbox or copy.text_bbox
         bw = max(min_bw, bx2 - bx1)
@@ -345,9 +348,9 @@ def expand_composed_boxes_if_tight(
         def _clamp_centered(cur_w: int, cur_h: int) -> tuple[int, int, int, int]:
             cw = min(max_bw, max(24, cur_w))
             ch = min(max_bh, max(20, cur_h))
-            nx1 = max(8, min(img_w - 8 - cw, cx - cw // 2))
-            ny1 = max(8, min(img_h - 8 - ch, cy - ch // 2))
-            return (nx1, ny1, min(img_w - 8, nx1 + cw), min(img_h - 8, ny1 + ch))
+            nx1 = max(edge_pad, min(img_w - edge_pad - cw, cx - cw // 2))
+            ny1 = max(edge_pad, min(img_h - edge_pad - ch, cy - ch // 2))
+            return (nx1, ny1, min(img_w - edge_pad, nx1 + cw), min(img_h - edge_pad, ny1 + ch))
 
         box = _clamp_centered(bw, bh)
         copy.text_bbox = box
@@ -355,10 +358,10 @@ def expand_composed_boxes_if_tight(
             copy.bubble_bbox = box
 
         for _ in range(5):
-            layout = solve_layout(copy)
+            layout = solve_layout(copy, canvas_size=(img_w, img_h))
             if layout.font_size >= target_font and not layout.overflowed:
                 break
-            scale = 1.24 if layout.overflowed else 1.18
+            scale = 1.22 if layout.overflowed else 1.16
             nbw = int(round((copy.text_bbox[2] - copy.text_bbox[0]) * scale))
             nbh = int(round((copy.text_bbox[3] - copy.text_bbox[1]) * scale))
             if nbw >= max_bw and nbh >= max_bh:
@@ -369,7 +372,17 @@ def expand_composed_boxes_if_tight(
                 copy.bubble_bbox = box
 
         adjusted.append(copy)
-    return resolve_box_overlaps(adjusted, img_w, img_h, gap=max(10, int(min_dim * 0.012)))
+
+    separated = resolve_box_overlaps(adjusted, img_w, img_h, gap=max(10, int(min_dim * 0.012)))
+    # Harmonize outlier font sizes across all regions on the page without shrinking oversized fits
+    for copy in separated:
+        if copy.font_size is not None:
+            continue
+        lay = solve_layout(copy, canvas_size=(img_w, img_h))
+        cap = bubble_max_font if copy.kind == "bubble" else floating_max_font
+        if lay.font_size > cap:
+            copy.font_size = float(cap)
+    return separated
 
 
 @dataclass
@@ -2031,6 +2044,7 @@ def run_compose_pipeline(
                         story_prompt=prompt,
                         story_bible=story_bible,
                         page_index=idx,
+                        prev_rgb=load_rgb(images[idx - 2]) if idx > 1 else None,
                         tags=tags,
                     )
                 except ContentBlockedError as exc:

@@ -1727,19 +1727,21 @@ class VisionLLMClient:
         system_prompt = (
             "Bạn là biên kịch & đạo diễn dàn trang truyện tranh/CG chuyên nghiệp.\n"
             "Nhiệm vụ: Quan sát kỹ bức tranh Artist CG (biểu cảm khuôn mặt, ánh mắt, cử chỉ, trang phục, bối cảnh), "
-            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, có cảm xúc và đúng thể loại/tag, đồng thời xác định tọa độ đặt chữ thẩm mỹ nhất.\n"
-            "NGUYÊN TẮC VIẾT THOẠI TỰ NHIÊN & GỢI CẢM ĐÚNG CONTEXT:\n"
-            "- Viết như người Việt ngoài đời thật nói chuyện, thì thầm hoặc nghĩ thầm; tránh văn viết dài dòng, tránh từ y khoa khô khan ('âm đạo', 'dương vật') hay tiếng rên kiểu Anh ('UGH', 'GUH', 'NNGH').\n"
-            "- Nếu tranh mang không khí thân mật/quyến rũ/gợi cảm, hãy viết thoại thật lôi cuốn, gợi tình và tự nhiên theo đúng ánh mắt, tư thế & tag thể loại (nhẹ/vanilla dùng từ ngọt ngào ướt át; thô/NTR dùng khẩu ngữ táo bạo đúng tâm lý).\n"
-            "- Câu thoại ngắn gọn, có nhịp thở ngắt quãng (`...`), tiếng thở Việt tự nhiên (`Ư...`, `Ưm...`, `Á...`), hợp biểu cảm gương mặt & bối cảnh.\n"
-            + self._HUMAN_CRAFT_RULES
-            + "QUY TẮC ĐẶT TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
+            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, giàu cảm xúc, có nhịp điệu điện ảnh và đúng thể loại/tag, đồng thời xác định tọa độ đặt chữ thẩm mỹ nhất.\n"
+            + self._localization_rules()
+            + "\nNGUYÊN TẮC SÁNG TÁC THOẠI CG ĐỈNH CAO:\n"
+            "- Phân vai & cảm xúc RÕ RÀNG giữa các khung:\n"
+            "  + `white_oval` / `speech_tail`: lời nói bật thành tiếng (súc tích 3–12 từ/bóng, tự nhiên, tránh văn viết dài dòng).\n"
+            "  + `dark_translucent`: nội tâm / suy nghĩ thầm / lẩm bẩm run rẩy (chữ trắng gọn, sắc).\n"
+            "  + `floating` (`none`): tiếng thở khẽ / thì thầm sát miệng / âm thanh ngắn (chỉ 1–5 từ như 'Ưm...', 'Chậm... chút...', 'Khít quá...♡', không nhồi câu dài).\n"
+            "- ĐA DẠNG CÂU TỪ & LEO THANG CẢM XÚC: mỗi trang phải đẩy tiến triển mới về tâm lý hoặc hành động, TUYỆT ĐỐI KHÔNG lặp lại nguyên văn câu mở đầu hoặc rên y hệt trang trước.\n"
+            "QUY TẮC ĐẶT TỌA ĐỘ THẨM MỸ:\n"
             "- Hệ tọa độ chuẩn hóa [ymin, xmin, ymax, xmax] từ 0 đến 1000 (0=trên/trái, 1000=dưới/phải).\n"
-            "- TUYỆT ĐỐI KHÔNG đặt hộp thoại che mất khuôn mặt, mắt, miệng hoặc chi tiết hành động chính của nhân vật.\n"
-            "- Đặt các hộp thoại ở khoảng trống nền, vùng rìa, hoặc vùng ít chi tiết quanh nhân vật.\n"
+            "- TUYỆT ĐỐI KHÔNG đặt hộp thoại che khuôn mặt, mắt, miệng, tóc mái chính hoặc điểm nhấn hành động/cơ thể.\n"
+            "- Ưu tiên đặt bóng thoại ở vùng nền trống, góc trên/rìa ảnh hoặc khoảng trống cân đối quanh nhân vật.\n"
             "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG để dễ đọc trên điện thoại: "
-            "chiều rộng khoảng 120..250/1000 và chiều cao khoảng 120..250/1000 (tránh tạo bóng oval bé xíu dưới 100/1000).\n"
-            "- Các hộp thoại tuyệt đối không được chồng chéo lên nhau.\n"
+            "chiều rộng khoảng 130..250/1000 và chiều cao khoảng 130..260/1000 (tránh tạo bóng oval bé xíu dưới 100/1000).\n"
+            "- Các hộp thoại tuyệt đối không được chồng chéo lên nhau và phải cách mép ảnh tối thiểu 20/1000.\n"
             "Bắt buộc trả về đúng JSON hợp lệ."
         )
 
@@ -1891,13 +1893,16 @@ class VisionLLMClient:
         system_prompt = (
             "Bạn là biên kịch & đạo diễn dàn trang truyện tranh/CG chuyên nghiệp.\n"
             "Nhiệm vụ: Quan sát toàn bộ các ô ảnh được đánh số 'Trang X/Y' trên sheet tổng hợp, "
-            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, mạch lạc theo đúng số trang, "
+            "sáng tác lời thoại Tiếng Việt theo KHẨU NGỮ ĐỜI THƯỜNG thật tự nhiên, mạch lạc theo diễn tiến từng trang, "
             "và trả về tọa độ đặt chữ riêng cho TỪNG TRANG.\n"
-            + self._HUMAN_CRAFT_RULES
-            + "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
+            + self._localization_rules()
+            + "\nNGUYÊN TẮC SÁNG TÁC THOẠI CG NỐI TIẾP:\n"
+            "- Mỗi bóng thoại ngắn gọn (3–12 từ), tiếng thở/thì thầm `floating` siêu ngắn (1–5 từ).\n"
+            "- Mỗi trang kế tiếp PHẢI có chuyển biến tâm lý/hành động mới; KHÔNG lặp lại nguyên văn câu thoại của trang trước.\n"
+            "QUY TẮC TỌA ĐỘ CỰC KỲ QUAN TRỌNG:\n"
             "- Với mỗi trang, `box_2d: [ymin, xmin, ymax, xmax]` tính từ 0 đến 1000 TRONG PHẠM VI Ô ẢNH CỦA TRANG ĐÓ (không phải tọa độ cả sheet).\n"
-            "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG (rộng ~120..250/1000, cao ~120..250/1000) để chữ dễ đọc trên điện thoại.\n"
-            "- TUYỆT ĐỐI KHÔNG che khuôn mặt, mắt, miệng hoặc hành động chính; các hộp không được chồng chéo.\n"
+            "- Kích thước `box_2d` cho bubble (`white_oval`, `dark_translucent`, `speech_tail`) PHẢI TO RÕ RÀNG (rộng ~130..250/1000, cao ~130..260/1000) để chữ dễ đọc trên điện thoại.\n"
+            "- TUYỆT ĐỐI KHÔNG che khuôn mặt, mắt, miệng hoặc hành động chính; các hộp không được chồng chéo và cách mép ô ảnh tối thiểu 20/1000.\n"
             "Bắt buộc trả về đúng JSON hợp lệ."
         )
         page_range_label = f"Trang {page_numbers[0]} đến {page_numbers[-1]}"
@@ -1974,12 +1979,20 @@ def _parse_composed_items(
     h: int,
     preset: ComposePreset,
 ) -> list[TextRegionItem]:
+    from koharu_vn_cli.pipeline.typesetter import sanitize_render_text
+
     items: list[TextRegionItem] = []
+    seen_texts: set[str] = set()
     for idx, raw in enumerate(raw_items or [], start=1):
-        text = str(raw.get("text", "")).strip()
+        text = sanitize_render_text(str(raw.get("text", "")).strip())
         box = raw.get("box_2d")
         if not text or not isinstance(box, (list, tuple)) or len(box) != 4:
             continue
+        norm_txt = normalize_source_key(text).lower()
+        if norm_txt and norm_txt in seen_texts:
+            continue
+        if norm_txt:
+            seen_texts.add(norm_txt)
 
         ymin, xmin, ymax, xmax = [max(0.0, min(1000.0, float(v))) for v in box]
         if ymax <= ymin or xmax <= xmin:

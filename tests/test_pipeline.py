@@ -2850,6 +2850,26 @@ def test_floating_collision_avoidance_cjk_sanitize_ko_sfx_and_box_separation() -
     wide_entry = next(s for b, s, _ in promoted if b == wide_merge)
     assert wide_entry == 0.40  # Not promoted above left_col!
 
+    # 5) Compose parsing sanitizes CJK brackets, deduplicates repeats, and harmonizes font sizes
+    from koharu_vn_cli.pipeline.gemini_client import _parse_composed_items
+    from koharu_vn_cli.pipeline.runner import expand_composed_boxes_if_tight
+
+    composed = _parse_composed_items(
+        [
+            {"id": 1, "kind": "bubble", "bubble_style": "white_oval", "box_2d": [50, 50, 260, 240], "text": "「Đừng nhìn vậy chứ...」"},
+            {"id": 2, "kind": "bubble", "bubble_style": "white_oval", "box_2d": [300, 50, 500, 240], "text": "「Đừng nhìn vậy chứ...」"},
+            {"id": 3, "kind": "floating", "bubble_style": "none", "box_2d": [720, 620, 860, 920], "text": "Ưm...♡"},
+        ],
+        w=1000,
+        h=1200,
+        preset=ComposePreset.CG_OVAL,
+    )
+    assert len(composed) == 2
+    assert composed[0].translated_text == '"Đừng nhìn vậy chứ..."'
+    expanded = expand_composed_boxes_if_tight(composed, 1000, 1200)
+    float_lay = solve_layout(expanded[1], canvas_size=(1000, 1200))
+    assert float_lay.font_size <= 25  # Outlier short whisper capped harmoniously!
+
 
 
 
