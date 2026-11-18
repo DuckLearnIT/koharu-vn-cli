@@ -506,21 +506,38 @@ def normalize_source_key(text: str) -> str:
 
 
 def region_needs_translation(reg: TextRegionItem) -> bool:
-    """Return True if a source CJK/Kana/Hangul non-SFX region is still empty or untranslated."""
+    """Return True if a non-SFX region is still empty, placeholder, or untranslated CJK/Kana/Hangul."""
     if reg.is_sfx:
         return False
     src = (reg.source_text or "").strip()
     vn = (reg.translated_text or "").strip()
-    if not src:
-        return False
     if not vn or vn.lower() in _PLACEHOLDER_TEXTS:
         return True
-    if _CJK_KANA_RE.search(src):
+    if _KANA_HANGUL_RE.search(vn):
+        return True
+    if src and _CJK_KANA_RE.search(src):
         if normalize_source_key(vn) == normalize_source_key(src):
             return True
-        if _KANA_HANGUL_RE.search(vn):
-            return True
     return False
+
+
+def _extract_items_list(data: Any) -> list[Any]:
+    """Extract region items list from any JSON envelope shape returned by Gemini/DeepSeek/Proxy."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("items", "regions", "translations", "lines", "results", "data"):
+        val = data.get(key)
+        if isinstance(val, list):
+            return val
+    pages = data.get("pages")
+    if isinstance(pages, list) and pages and isinstance(pages[0], dict):
+        for key in ("items", "regions", "translations"):
+            val = pages[0].get(key)
+            if isinstance(val, list):
+                return val
+    return []
 
 
 def _parse_int_id(val: Any) -> int | None:
@@ -640,12 +657,33 @@ class VisionLLMClient:
         return self._fallback_idx < len(self.fallback_models)
 
     def _switch_to_fallback_model(self, reason: str) -> bool:
-        """Advance to the next configured fallback model when the current model exhausts quota."""
+        """Advance to the next configured fallback model when the current model exhausts quota or is blocked."""
         if not self._has_fallback_model():
             return False
         old_model = self.model
-        self.model = self.fallback_models[self._fallback_idx]
+        new_model = self.fallback_models[self._fallback_idx]
+        self.model = new_model
         self._fallback_idx += 1
+        if is_deepseek_model(new_model) and not is_deepseek_endpoint(self.base_url):
+            self.base_url = DEEPSEEK_BASE_URL
+            try:
+                from koharu_vn_cli.config import load_config
+
+                ds_keys = load_config().effective_api_keys(model=new_model, base_url=DEEPSEEK_BASE_URL)
+                if ds_keys:
+                    self.api_keys = ds_keys
+            except Exception:
+                pass
+        elif not is_deepseek_model(new_model) and is_deepseek_endpoint(self.base_url):
+            self.base_url = None
+            try:
+                from koharu_vn_cli.config import load_config
+
+                gem_keys = load_config().effective_api_keys(model=new_model, base_url="")
+                if gem_keys:
+                    self.api_keys = gem_keys
+            except Exception:
+                pass
         self._key_idx = 0
         self.api_key = self.api_keys[0] if self.api_keys else ""
         self._emit_status(
@@ -820,18 +858,18 @@ class VisionLLMClient:
         candidates = data.get("candidates") or []
         if not candidates:
             block_reason = (data.get("promptFeedback") or {}).get("blockReason", "")
-            if block_reason:
+            if block_reason or images:
                 raise ContentBlockedError(
-                    f"Gemini API chặn nội dung ({block_reason}, model={self.model}). "
+                    f"Gemini API chặn nội dung ({block_reason or 'NO_CANDIDATES'}, model={self.model}). "
                     "Đây là bộ lọc cứng phía máy chủ Google đối với ảnh nhạy cảm/R18; "
-                    "hãy dùng /key với endpoint OpenAI-compatible (--base-url) chạy model Vision không bị chặn hoặc thử ảnh nhẹ hơn."
+                    "hãy dùng /key với endpoint OpenAI-compatible (--base-url) hoặc DeepSeek."
                 )
             raise ValueError(f"Gemini returned no candidates: {data}")
         finish_reason = str(candidates[0].get("finishReason", ""))
-        if finish_reason in ("PROHIBITED_CONTENT", "SAFETY"):
+        if finish_reason in ("PROHIBITED_CONTENT", "SAFETY", "IMAGE_SAFETY", "BLOCKLIST", "SPII"):
             raise ContentBlockedError(
                 f"Gemini API chặn phản hồi ({finish_reason}, model={self.model}). "
-                "Hãy dùng /key với endpoint --base-url phù hợp nếu xử lý nội dung R18."
+                "Hãy dùng /key với endpoint --base-url hoặc DeepSeek nếu xử lý nội dung R18."
             )
         parts_out = candidates[0].get("content", {}).get("parts", [])
         text_parts = [p.get("text", "") for p in parts_out if not p.get("thought") and p.get("text")]
@@ -839,7 +877,13 @@ class VisionLLMClient:
             text_parts = [p.get("text", "") for p in parts_out if p.get("text")]
         joined = "\n".join(text_parts)
         if not joined.strip():
+            if finish_reason in ("OTHER", "RECITATION") and images:
+                raise ContentBlockedError(
+                    f"Gemini API trả rỗng do bộ lọc ({finish_reason}, model={self.model})."
+                )
             raise ValueError(f"Gemini returned empty text (finishReason={finish_reason or 'unknown'})")
+        if _looks_like_soft_refusal(joined):
+            raise ContentBlockedError(f"Model từ chối mềm nội dung nhạy cảm (model={self.model}).")
         return joined
 
     def _call_openai_compatible(
@@ -976,7 +1020,7 @@ class VisionLLMClient:
         "NGUYÊN TẮC VIỆT HÓA TỰ NHIÊN & GỢI CẢM ĐÚNG CONTEXT (CỰC KỲ QUAN TRỌNG):\n"
         "- Viết như người Việt ngoài đời đang nói chuyện/thì thầm/rên rỉ thật; TUYỆT ĐỐI KHÔNG dịch word-by-word, không văn viết, không lối diễn văn sách vở hay từ y khoa khô khan.\n"
         "- Khi cảnh mang sắc thái thân mật/18+/trêu chọc, hãy dùng ngôn từ mềm mại, ướt át, gợi cảm hoặc táo bạo đúng với biểu cảm & ngữ cảnh gốc (vd: 'nhạy cảm quá...', 'đừng chạm chỗ đó mà...', 'sâu quá... chậm chút đi...', 'cứng hết cả lên rồi kìa', 'chịu hết nổi rồi...', 'bên trong khít chặt quá...').\n"
-        "- TUYỆT ĐỐI TRÁNH từ y khoa khô khan ('âm đạo', 'dương vật', 'giao hợp') và tiếng rên kiểu Anh ('UGH', 'GUH', 'BUH', 'NNGH', 'MMN', 'FUH'): đổi sang khẩu ngữ Việt tự nhiên theo sắc thái cảnh (nhẹ/vanilla: 'bên trong', 'chỗ đó', 'nóng hổi', 'ướt nhẹp'; thô/hardcore/NTR: 'nứng', 'chịch', 'bắn vào trong', 'dính bầu'...) và tiếng thở Việt ('Ư...', 'Ưm...', 'Á...', 'Aaa...', 'Hộc...', 'Khựa...').\n"
+        "- TUYỆT ĐỐI TRÁNH từ y khoa khô khan ('âm đạo', 'dương vật', 'giao hợp') và tiếng rên kiểu Anh ('UGH', 'GUH', 'BUH', 'NNGH', 'MMN', 'FUH'): đổi sang khẩu ngữ Việt tự nhiên theo sắc thái cảnh ('bên trong', 'chỗ đó', 'nóng hổi', 'ướt nhẹp', 'sâu quá', 'ra mất') và tiếng thở Việt ('Ư...', 'Ưm...', 'Á...', 'Aaa...', 'Hộc...', 'Khựa...').\n"
         "- CẤM dùng từ cứng, sáo rỗng ít ai nói ngoài đời như: 'hắn ta', 'ả', 'gã', 'cô nàng', 'thực sự là', 'vô cùng', 'cái đó', 'vậy sao', 'thèm thuồng lắm chứ', 'kẻ hầu', 'ấn ký' (trừ khi đúng bối cảnh kỳ ảo cổ trang: mới dùng 'ta - ngươi' hoặc danh xưng cổ trang).\n"
         "- Thay bằng khẩu ngữ ngắn gọn, có nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...): vd 'Cứ tưởng cô không thích cơ đấy', 'Ủa sao tự dưng...', 'Đừng có mà...', 'Nhói quá...'.\n"
         "- Câu ngắn gọn vừa khung thoại, giữ đúng sắc thái ngại ngùng / trêu chọc / đê mê / hoảng hốt / áp đảo của tuyến cảnh.\n"
@@ -1001,7 +1045,7 @@ class VisionLLMClient:
     )
 
     def _localization_rules(self) -> str:
-        if is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url):
+        if is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url) or self.base_url:
             return self._VI_LOCALIZATION_RULES + self._DEEPSEEK_R18_LOCALIZATION_ADDON
         return self._VI_LOCALIZATION_RULES
 
@@ -1232,9 +1276,11 @@ class VisionLLMClient:
             images=images_payload,
             temperature=0.25,
         )
+        raw_items = _extract_items_list(data)
+        summary = str(data.get("page_summary", "")).strip() if isinstance(data, dict) else ""
         return (
-            self._merge_translated_regions(regions, data.get("items", []), skip_sfx=skip_sfx),
-            str(data.get("page_summary", "")).strip(),
+            self._merge_translated_regions(regions, raw_items, skip_sfx=skip_sfx),
+            summary,
         )
 
     @staticmethod
@@ -1258,28 +1304,42 @@ class VisionLLMClient:
             match = by_id.get(copy.id)
             if match is None and positional_ok:
                 match = dict_items[idx]
-            fallback_src = (ocr_texts or {}).get(copy.id, copy.source_text)
+            fallback_src = ((ocr_texts or {}).get(copy.id, "") or copy.source_text or "").strip()
             if match:
-                copy.source_text = str(match.get("source_text", fallback_src)).strip() or fallback_src
+                raw_src = str(match.get("source_text", "") or "").strip()
+                if raw_src and raw_src.lower() not in _PLACEHOLDER_TEXTS:
+                    copy.source_text = raw_src
+                elif fallback_src:
+                    copy.source_text = fallback_src
+
+                vn = _extract_vn_from_item(match)
                 raw_is_sfx = _parse_bool_flag(match.get("is_sfx"))
                 norm_src = normalize_source_key(copy.source_text)
+                is_pure_floating_sfx = looks_like_floating_sfx(copy.source_text)
                 bubble_has_spoken = bool(re.search(r"[\u3040-\u309f\uac00-\ud7af]", norm_src))
-                # Protect spoken dialogue inside speech bubbles from accidental SFX mis-tagging
-                if raw_is_sfx and (
-                    copy.kind != "bubble"
-                    or (not bubble_has_spoken and len(norm_src) <= 8)
-                    or looks_like_floating_sfx(copy.source_text)
-                ):
-                    copy.is_sfx = True
-                elif copy.kind == "floating" and looks_like_floating_sfx(copy.source_text):
-                    copy.is_sfx = True
+
+                # Protect spoken dialogue & valid translations from accidental SFX mis-tagging:
+                # If the LLM produced a valid Vietnamese translation `vn` inside a speech bubble
+                # (or non-SFX text), NEVER discard `vn` just because `is_sfx` was set!
+                if copy.kind == "bubble":
+                    if raw_is_sfx and is_pure_floating_sfx and not vn and not bubble_has_spoken:
+                        copy.is_sfx = True
+                    else:
+                        copy.is_sfx = False
+                else:
+                    if is_pure_floating_sfx:
+                        copy.is_sfx = True
+                    elif raw_is_sfx and not vn:
+                        copy.is_sfx = True
+                    elif raw_is_sfx and len(norm_src) <= 4 and not bubble_has_spoken:
+                        copy.is_sfx = True
+                    else:
+                        copy.is_sfx = False
 
                 if skip_sfx and copy.is_sfx:
                     copy.translated_text = ""
-                else:
-                    vn = _extract_vn_from_item(match)
-                    if vn:
-                        copy.translated_text = vn
+                elif vn:
+                    copy.translated_text = vn
             else:
                 if fallback_src:
                     copy.source_text = fallback_src
@@ -1391,11 +1451,11 @@ class VisionLLMClient:
         )
         ocr_temp = 0.45 if (is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url)) else 0.25
         data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
-        raw_items = data.get("items") or data.get("regions") or []
+        raw_items = _extract_items_list(data)
         merged_sub = self._merge_translated_regions(to_translate, raw_items, ocr_texts=ocr_texts, skip_sfx=skip_sfx)
         by_sub_id = {r.id: r for r in merged_sub}
         updated = [by_sub_id.get(r.id, r) for r in working]
-        summary = str(data.get("page_summary", "")).strip()
+        summary = str(data.get("page_summary", "")).strip() if isinstance(data, dict) else ""
 
         # Guard against small models echoing Japanese or omitting an ID
         missing = [r for r in updated if region_needs_translation(r)]
@@ -1520,12 +1580,18 @@ class VisionLLMClient:
             "}"
         )
         ocr_temp = 0.45 if (is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url)) else 0.25
-        data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
+        try:
+            data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
+        except ContentBlockedError:
+            data = {}
 
+        raw_pages_list = [
+            p_entry
+            for p_entry in (data.get("pages", []) if isinstance(data, dict) else [])
+            if isinstance(p_entry, dict)
+        ]
         by_page: dict[int, dict[str, Any]] = {}
-        for p_entry in data.get("pages", []):
-            if not isinstance(p_entry, dict):
-                continue
+        for p_entry in raw_pages_list:
             p_raw = p_entry.get("page") or p_entry.get("page_number") or p_entry.get("page_index") or p_entry.get("id")
             parsed_p = _parse_int_id(p_raw)
             if parsed_p is not None:
@@ -1534,12 +1600,12 @@ class VisionLLMClient:
         mem = dict(translation_memory or {})
         out: dict[int, tuple[list[TextRegionItem], str]] = {}
         rolling_summaries = list(previous_summaries or [])
-        for pno, regs, ocrs in scene_pages:
+        for page_pos, (pno, regs, ocrs) in enumerate(scene_pages):
             entry = by_page.get(pno)
-            raw_page_items = (
-                (entry.get("items") or entry.get("regions")) if isinstance(entry, dict) else None
-            )
-            if entry and isinstance(raw_page_items, list):
+            if entry is None and len(raw_pages_list) == len(scene_pages):
+                entry = raw_pages_list[page_pos]
+            raw_page_items = _extract_items_list(entry) if isinstance(entry, dict) else None
+            if entry and raw_page_items:
                 merged = self._merge_translated_regions(regs, raw_page_items, ocr_texts=ocrs, skip_sfx=skip_sfx)
                 summary = str(entry.get("page_summary", "")).strip()
                 untranslated = [r for r in merged if region_needs_translation(r)]

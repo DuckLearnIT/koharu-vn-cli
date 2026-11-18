@@ -29,6 +29,7 @@ from koharu_vn_cli.pipeline.detector import (
     active_ort_provider_label,
 )
 from koharu_vn_cli.pipeline.gemini_client import (
+    DEEPSEEK_BASE_URL,
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
     VisionLLMClient,
@@ -1079,13 +1080,12 @@ def run_translate_pipeline(
                             )
                             with gpu_lock:
                                 ocr_texts = ocr_engine.recognize_regions(rgb, region_items)
-                            if skip_sfx:
-                                for reg_it in region_items:
-                                    raw_ocr = (ocr_texts.get(reg_it.id, "") or "").strip()
-                                    if raw_ocr:
-                                        reg_it.source_text = raw_ocr
-                                    if reg_it.kind == "floating" and looks_like_floating_sfx(raw_ocr):
-                                        reg_it.is_sfx = True
+                            for reg_it in region_items:
+                                raw_ocr = (ocr_texts.get(reg_it.id, "") or "").strip()
+                                if raw_ocr:
+                                    reg_it.source_text = raw_ocr
+                                if skip_sfx and reg_it.kind == "floating" and looks_like_floating_sfx(raw_ocr):
+                                    reg_it.is_sfx = True
                             ok_enc, seg_buf = cv2.imencode(".png", seg_mask)
                             seg_bytes = seg_buf.tobytes() if ok_enc else b""
                             pending_ocr_pages.append(
@@ -1103,7 +1103,7 @@ def run_translate_pipeline(
                                     ocr_texts,
                                 )
                             )
-                            if len(pending_ocr_pages) >= 10:
+                            if len(pending_ocr_pages) >= 4:
                                 batch = _PreparedOcrBatch(scene_id=sc.scene_id, pages=pending_ocr_pages)
                                 pending_ocr_pages = []
                                 if not _q_put(translate_queue, batch, abort_event, hooks):
@@ -1141,6 +1141,102 @@ def run_translate_pipeline(
 
         remaining_llm_workers = worker_count
 
+        def _build_ocr_fallback_chain(
+            w_llm: VisionLLMClient,
+            w_story_llm: VisionLLMClient,
+            w_story_fallback: VisionLLMClient | None,
+        ) -> list[VisionLLMClient]:
+            chain: list[VisionLLMClient] = [w_llm]
+            seen_models: set[str] = {w_llm.model}
+            for fb_m in w_llm.fallback_models:
+                if fb_m and fb_m not in seen_models:
+                    try:
+                        fb_client = VisionLLMClient(
+                            api_key=api_key,
+                            api_keys=api_keys,
+                            model=fb_m,
+                            base_url=None if fb_m.lower().startswith("deepseek-") else base_url,
+                            on_status=w_llm.on_status,
+                        )
+                        seen_models.add(fb_m)
+                        chain.append(fb_client)
+                    except Exception:
+                        pass
+            if w_story_llm.model not in seen_models:
+                seen_models.add(w_story_llm.model)
+                chain.append(w_story_llm)
+            if w_story_fallback is not None and w_story_fallback.model not in seen_models:
+                seen_models.add(w_story_fallback.model)
+                chain.append(w_story_fallback)
+            if "deepseek-chat" not in seen_models:
+                try:
+                    from koharu_vn_cli.config import load_config
+
+                    ds_keys = load_config().effective_api_keys(
+                        model="deepseek-chat", base_url=DEEPSEEK_BASE_URL
+                    )
+                    if ds_keys:
+                        ds_client = VisionLLMClient(
+                            api_key=ds_keys[0],
+                            api_keys=ds_keys,
+                            model="deepseek-chat",
+                            base_url=DEEPSEEK_BASE_URL,
+                            on_status=w_llm.on_status,
+                        )
+                        seen_models.add("deepseek-chat")
+                        chain.append(ds_client)
+                except Exception:
+                    pass
+            return chain
+
+        def _translate_regions_via_ocr_chain(
+            idx: int,
+            scene_id: int,
+            regions_sub: list[TextRegionItem],
+            ocr_texts: dict[int, str],
+            mem_snapshot: dict[str, str],
+            chain: list[VisionLLMClient],
+        ) -> tuple[list[TextRegionItem], str]:
+            ocr_kw = {
+                "regions": regions_sub,
+                "ocr_texts": ocr_texts,
+                "source_lang": lang,
+                "previous_summaries": _scene_prev_summaries(scene_id, idx),
+                "extra_instructions": prompt,
+                "story_bible": story_bible,
+                "page_index": idx,
+                "tags": tags,
+                "translation_memory": mem_snapshot,
+                "skip_sfx": skip_sfx,
+            }
+            last_exc: Exception | None = None
+            for cand_llm in chain:
+                try:
+                    return cand_llm.translate_page_from_ocr(**ocr_kw)
+                except ContentBlockedError as c_exc:
+                    last_exc = c_exc
+                    continue
+                except Exception as g_exc:
+                    last_exc = g_exc
+                    continue
+            # Last resort: if story_bible or previous_summaries triggered Gemini's text filter,
+            # retry with clean minimal context so the page still gets translated & inpainted!
+            if story_bible is not None or ocr_kw["previous_summaries"]:
+                clean_kw = {
+                    **ocr_kw,
+                    "story_bible": None,
+                    "previous_summaries": None,
+                }
+                for cand_llm in chain:
+                    try:
+                        return cand_llm.translate_page_from_ocr(**clean_kw)
+                    except Exception as c_exc:
+                        last_exc = c_exc
+                        continue
+            if last_exc is not None:
+                raise last_exc
+            return regions_sub, ""
+
         def _translate_vision_task(
             task: _PreparedVisionPage,
             worker_prefix: str,
@@ -1159,6 +1255,7 @@ def run_translate_pipeline(
             prev_rgb = load_rgb(images[idx - 2]) if (idx > 1 and not story_bible) else None
             next_rgb = load_rgb(images[idx]) if (idx < total and not story_bible) else None
             prev_summaries = _scene_prev_summaries(task.scene_id, idx)
+            ocr_chain = _build_ocr_fallback_chain(w_llm, w_story_llm, w_story_fallback)
 
             try:
                 translated_items, summary = w_llm.translate_page(
@@ -1187,36 +1284,23 @@ def run_translate_pipeline(
                         )
                         with gpu_lock:
                             ocr_texts = eng.recognize_regions(task.rgb, task.region_items)
+                        for reg_it in task.region_items:
+                            raw_ocr = (ocr_texts.get(reg_it.id, "") or "").strip()
+                            if raw_ocr:
+                                reg_it.source_text = raw_ocr
                         with state_lock:
                             mem_snapshot = dict(translation_memory)
-                        ocr_kw = {
-                            "regions": task.region_items,
-                            "ocr_texts": ocr_texts,
-                            "source_lang": lang,
-                            "previous_summaries": _scene_prev_summaries(task.scene_id, idx),
-                            "extra_instructions": prompt,
-                            "story_bible": story_bible,
-                            "page_index": idx,
-                            "tags": tags,
-                            "translation_memory": mem_snapshot,
-                            "skip_sfx": skip_sfx,
-                        }
-                        try:
-                            translated_items, summary = w_llm.translate_page_from_ocr(**ocr_kw)
-                            fallback_done = True
-                        except ContentBlockedError as inner_exc:
-                            exc = inner_exc
-                            if w_story_llm.model != w_llm.model:
-                                try:
-                                    translated_items, summary = w_story_llm.translate_page_from_ocr(**ocr_kw)
-                                    fallback_done = True
-                                except ContentBlockedError as s_exc:
-                                    exc = s_exc
-                            if not fallback_done and w_story_fallback is not None:
-                                translated_items, summary = w_story_fallback.translate_page_from_ocr(**ocr_kw)
-                                fallback_done = True
-                    except ContentBlockedError as ocr_exc:
-                        exc = ocr_exc
+                        translated_items, summary = _translate_regions_via_ocr_chain(
+                            idx,
+                            task.scene_id,
+                            task.region_items,
+                            ocr_texts,
+                            mem_snapshot,
+                            ocr_chain,
+                        )
+                        fallback_done = True
+                    except Exception as ocr_exc:
+                        exc = ocr_exc  # type: ignore[assignment]
                 if not fallback_done:
                     if not skip_blocked:
                         raise
@@ -1240,26 +1324,31 @@ def run_translate_pipeline(
                         with gpu_lock:
                             missing_ocr = eng.recognize_regions(task.rgb, still_missing)
                         for mr in still_missing:
-                            if missing_ocr.get(mr.id):
-                                mr.source_text = missing_ocr[mr.id]
+                            raw_ocr = (missing_ocr.get(mr.id, "") or "").strip()
+                            if raw_ocr:
+                                mr.source_text = raw_ocr
+                            elif not (mr.source_text or "").strip() and mr.kind == "floating":
+                                # Floating box with zero OCR text and zero Vision text is non-text noise
+                                mr.is_sfx = True
                         with state_lock:
                             mem_snapshot = dict(translation_memory)
                         still_missing = _apply_memory_to_untranslated(
                             still_missing, mem_snapshot, missing_ocr
                         )
-                        need_api = [r for r in still_missing if region_needs_translation(r)]
+                        need_api = [
+                            r
+                            for r in still_missing
+                            if region_needs_translation(r)
+                            and ((missing_ocr.get(r.id, "") or r.source_text or "").strip() or r.kind == "bubble")
+                        ]
                         if need_api:
-                            retried_items, retry_sum = w_llm.translate_page_from_ocr(
-                                regions=need_api,
-                                ocr_texts=missing_ocr,
-                                source_lang=lang,
-                                previous_summaries=_scene_prev_summaries(task.scene_id, idx),
-                                extra_instructions=prompt,
-                                story_bible=story_bible,
-                                page_index=idx,
-                                tags=tags,
-                                translation_memory=mem_snapshot,
-                                skip_sfx=skip_sfx,
+                            retried_items, retry_sum = _translate_regions_via_ocr_chain(
+                                idx,
+                                task.scene_id,
+                                need_api,
+                                missing_ocr,
+                                mem_snapshot,
+                                ocr_chain,
                             )
                             by_missing_id = {r.id: r for r in retried_items}
                         else:
@@ -1270,6 +1359,11 @@ def run_translate_pipeline(
                             summary = retry_sum
                     except Exception:
                         pass
+
+            # Ensure any region with a non-empty Vietnamese translation is never skipped as SFX during inpainting/typesetting
+            for item_r in translated_items:
+                if (item_r.translated_text or "").strip():
+                    item_r.is_sfx = False
 
             with state_lock:
                 _remember_translations(translated_items)
@@ -1300,8 +1394,11 @@ def run_translate_pipeline(
             batch: _PreparedOcrBatch,
             worker_prefix: str,
             w_llm: VisionLLMClient,
+            w_story_llm: VisionLLMClient,
+            w_story_fallback: VisionLLMClient | None,
         ) -> None:
             chunk = batch.pages
+            ocr_chain = _build_ocr_fallback_chain(w_llm, w_story_llm, w_story_fallback)
             batch_input = [
                 (item[0], [r for r in item[9] if not (skip_sfx and r.is_sfx)], item[10])
                 for item in chunk
@@ -1331,18 +1428,28 @@ def run_translate_pipeline(
                         scene_id=batch.scene_id,
                     )
                 except ContentBlockedError as exc:
-                    if not skip_blocked:
-                        raise
-                    for idx, img_path, out_img_path, *_ in chunk:
-                        rgb_orig = load_rgb(img_path)
-                        save_image(Image.fromarray(rgb_orig), out_img_path)
-                        _emit_step(
-                            idx,
-                            img_path.name,
-                            "blocked",
-                            f"⚠ Tuyến {batch.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
-                        )
-                    return
+                    for idx_p, regs_p, ocrs_p in batch_input:
+                        try:
+                            with state_lock:
+                                mem_snap_p = dict(translation_memory)
+                            batch_res[idx_p] = _translate_regions_via_ocr_chain(
+                                idx_p, batch.scene_id, regs_p, ocrs_p, mem_snap_p, ocr_chain
+                            )
+                        except ContentBlockedError as p_exc:
+                            exc = p_exc
+                    if not batch_res:
+                        if not skip_blocked:
+                            raise exc
+                        for idx, img_path, out_img_path, *_ in chunk:
+                            rgb_orig = load_rgb(img_path)
+                            save_image(Image.fromarray(rgb_orig), out_img_path)
+                            _emit_step(
+                                idx,
+                                img_path.name,
+                                "blocked",
+                                f"⚠ Tuyến {batch.scene_id} trang {idx} bị chặn ({exc}) — tạm giữ ảnh gốc!",
+                            )
+                        return
 
             for idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, det_list, reg_items, _ocrs in chunk:
                 sub_items, summary = batch_res.get(idx, (reg_items, ""))
@@ -1353,6 +1460,27 @@ def run_translate_pipeline(
                 translated_items = _apply_memory_to_untranslated(
                     translated_items, mem_snapshot, _ocrs
                 )
+                need_retry = [
+                    r
+                    for r in translated_items
+                    if region_needs_translation(r)
+                    and ((_ocrs.get(r.id, "") or r.source_text or "").strip() or r.kind == "bubble")
+                ]
+                if need_retry:
+                    try:
+                        fixed_items, fix_sum = _translate_regions_via_ocr_chain(
+                            idx, batch.scene_id, need_retry, _ocrs, mem_snapshot, ocr_chain
+                        )
+                        fix_map = {r.id: r for r in fixed_items}
+                        translated_items = [fix_map.get(r.id, r) for r in translated_items]
+                        if not summary and fix_sum:
+                            summary = fix_sum
+                    except Exception:
+                        pass
+
+                for item_r in translated_items:
+                    if (item_r.translated_text or "").strip():
+                        item_r.is_sfx = False
                 with state_lock:
                     _remember_translations(translated_items)
                     if summary:
@@ -1402,7 +1530,9 @@ def run_translate_pipeline(
                             task, worker_prefix, w_llm, w_story_llm, w_story_fallback
                         )
                     elif isinstance(task, _PreparedOcrBatch):
-                        _translate_ocr_batch_task(task, worker_prefix, w_llm)
+                        _translate_ocr_batch_task(
+                            task, worker_prefix, w_llm, w_story_llm, w_story_fallback
+                        )
             except BaseException as exc:
                 _record_error(exc)
             finally:

@@ -2383,6 +2383,105 @@ def test_deepseek_api_routing_payload_and_ocr_auto_mode(monkeypatch, tmp_path: P
         run_compose_pipeline(img_dir, model="deepseek-chat", api_key="sk-fake-deepseek-1")
 
 
+def test_vision_prohibit_ocr_fallback_chain_and_untranslated_page_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Verify Vision PROHIBIT + empty Vision items both recover via OCR fallback, inpaint, and render text."""
+    from koharu_vn_cli.models import StoryBible
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError, VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    in_dir = tmp_path / "manga"
+    in_dir.mkdir()
+    for name in ("p1.png", "p2.png"):
+        orig = np.full((240, 240, 3), 255, dtype=np.uint8)
+        orig[55:95, 55:125] = (15, 15, 15)  # dark ink inside speech bubble
+        Image.fromarray(orig).save(in_dir / name)
+
+    inpaint_calls: list[int] = []
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            mask[55:95, 55:125] = 255
+            return [DetectedRegion((40, 40, 160, 120), (30, 30, 170, 130), None, True, False, 0.95)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            inpaint_calls.append(int(np.count_nonzero(mask)))
+            out = rgb.copy()
+            out[mask > 127] = (255, 255, 255)
+            return out
+
+    class FakeOcr:
+        def recognize_regions(self, rgb, regions):
+            return {r.id: "イっちゃう…" for r in regions}
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            return FakeOcr()
+
+    def fake_story(self, images, **kwargs):
+        return StoryBible(title="R18 Test", full_plot_summary="Cốt truyện R18")
+
+    def fake_translate_page(self, rgb, regions, **kwargs):
+        if kwargs.get("page_index") == 1:
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+        # Page 2 simulates fast Vision returning empty items (source_text="", translated_text="")
+        return [r.model_copy() for r in regions], ""
+
+    def fake_call_json(self, system_prompt, user_prompt, images, temperature=0.3):
+        # Simulate Gemini blocking OCR prompt when StoryBible is attached, succeeding on clean retry or fallback
+        if "HỒ SƠ CỐT TRUYỆN" in user_prompt and self.model == "gemini-3.8-flash":
+            raise ContentBlockedError("PROHIBITED_CONTENT_TEXT")
+        # Also simulate LLM echoing placeholder source_text="..." and is_sfx=True alongside valid Vietnamese text
+        return {
+            "page_summary": "Đã dịch OCR",
+            "items": [
+                {
+                    "id": 1,
+                    "source_text": "...",
+                    "vietnamese": "Sướng quá không chịu nổi!",
+                    "is_sfx": True,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "build_story_bible", fake_story)
+    monkeypatch.setattr(VisionLLMClient, "translate_page", fake_translate_page)
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_call_json)
+
+    out_dir, docs = run_translate_pipeline(
+        in_dir,
+        output=tmp_path / "out",
+        api_key="dummy",
+        model="gemini-3.8-flash",
+        story_pass=True,
+        vision_translate=True,
+        output_format="png",
+        clean_cache=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+
+    assert len(docs) == 2
+    assert len(inpaint_calls) == 2 and all(c > 0 for c in inpaint_calls)
+    for idx, fname in enumerate(("p1.png", "p2.png")):
+        assert docs[idx].regions[0].is_sfx is False
+        assert docs[idx].regions[0].translated_text == "Sướng quá không chịu nổi!"
+        clean_arr = np.array(Image.open(out_dir / ".koharu_cache" / f"p{idx + 1}.clean.png").convert("RGB"))
+        out_arr = np.array(Image.open(out_dir / fname).convert("RGB"))
+        # Clean image was inpainted white, and final output image has dark rendered Vietnamese glyphs
+        assert int(clean_arr[55:95, 55:125].mean()) == 255
+        assert not np.array_equal(out_arr, clean_arr)
+
+
 
 
 
