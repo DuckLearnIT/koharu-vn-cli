@@ -457,6 +457,7 @@ def _format_tags_block(tags: str | None) -> str:
 _CJK_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 _KANA_HANGUL_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af]")
 _PURE_KATAKANA_RE = re.compile(r"^[\u3040-\u30ffーッンヴ]+$")
+_PURE_HANGUL_RE = re.compile(r"^[\uac00-\ud7af]+$")
 _SFX_STEMS_RE = re.compile(
     r"^(?:"
     r"ドキ|ドク|ビク|ピタ|ツル|ニュル|ヌル|ヌチ|グチュ|グチョ|ズチュ|ズボ|ジュポ|ピチャ|"
@@ -466,6 +467,12 @@ _SFX_STEMS_RE = re.compile(
     r"ド[ンー]|バ[ンー]|パ[ンー]|ポ[ンヨ]|ギ[ュヤ]|ズ[ンボ]|"
     r"ど[んー]|ば[んー]|ぱ[んー]|ぽ[んよ]|ぎ[ゅや]|ず[んぼ]"
     r")",
+)
+_KO_SFX_RE = re.compile(
+    r"^(?:"
+    r"하+아*앙*|으+아*앙*|흐+윽*|아+앙+|옥|푹|쩍|짝|탁|쿵|퍽|철퍽|질척|찔꺽|주륵|츄+릅*|쪽|"
+    r"두근|움찔|부르르|덜컥|스윽|슥|휘익|달칵|찰칵|꿀꺽|사각|바스락|짜릿"
+    r")+$"
 )
 _VN_TEXT_KEYS = ("vietnamese", "vi", "viet", "translated", "translated_text", "translation", "text_vi", "text")
 _PLACEHOLDER_TEXTS = {"", "...", "…", "(trống)", "n/a", "none", "null", "—", "-"}
@@ -480,10 +487,15 @@ def _parse_bool_flag(val: Any) -> bool:
 
 
 def looks_like_floating_sfx(text: str) -> bool:
-    """Return True only when non-bubble OCR text is unambiguously a sound-effect glyph."""
+    """Return True when non-bubble OCR text is unambiguously a Japanese/Korean sound-effect glyph."""
     cleaned = re.sub(r"[\s\u3000!！?？…・〜~\-ー♡♥]+", "", (text or "").strip())
     if not cleaned or len(cleaned) > 16:
         return False
+    if _PURE_HANGUL_RE.match(cleaned):
+        if _KO_SFX_RE.match(cleaned):
+            return True
+        # Single isolated Hangul syllable (e.g. '옥', '푹', '탁') floating outside bubbles without parentheses
+        return len(cleaned) == 1 and "(" not in (text or "") and ")" not in (text or "")
     if not _PURE_KATAKANA_RE.match(cleaned):
         return False
     return bool(_SFX_STEMS_RE.search(cleaned))
@@ -495,11 +507,11 @@ def _sfx_rule_block(skip_sfx: bool) -> str:
     return (
         "\nQUY TẮC BỎ QUA SFX (BẮT BUỘC):\n"
         "- Nếu khung [ID] là **SFX / từ tượng thanh / tiếng động hiệu ứng vẽ trực tiếp trên tranh** "
-        "(vd: ドン, ドキッ, ビクン, グチュ, ズチュ, バキッ, ゴゴゴ, カチッ, パンッ, ぽよん, ピチャ, ゾクッ... "
-        "dạng chữ hiệu ứng mô phỏng âm thanh hành động/cơ thể/môi trường): "
+        "(Nhật: ドン, ドキッ, ビクン, グチュ, ズチュ, バキッ, カチッ, ぱんっ, ぽよん; "
+        "Hàn: 하앙, 옥, 푹, 찔꺽, 철퍽, 주륵, 두근, 움찔, 짝; Trung: 咻, 啪...): "
         "BẮT BUỘC đặt `\"is_sfx\": true` và `\"vietnamese\": \"\"` (để TRỐNG hoàn toàn, KHÔNG dịch và KHÔNG chèn chữ đè tranh).\n"
-        "- NGƯỢC LẠI, với MỌI lời thoại trong bubble, suy nghĩ, lời dẫn, chữ chú thích hay tiếng rên/thở phát ra từ miệng nhân vật "
-        "(vd: 'あっ…ぐっ！！', 'んっ…', 'はぁ…', 'やめて…'): đặt `\"is_sfx\": false` và dịch sang Tiếng Việt tự nhiên.\n"
+        "- NGƯỢC LẠI, với MỌI lời thoại trong bubble, suy nghĩ trong ngoặc `(...)`, lời dẫn hay tiếng rên có câu chữ từ miệng nhân vật: "
+        "đặt `\"is_sfx\": false` và dịch sang Tiếng Việt tự nhiên.\n"
     )
 
 
@@ -1025,8 +1037,10 @@ class VisionLLMClient:
         "- Khi cảnh mang sắc thái thân mật/18+/trêu chọc, hãy dùng ngôn từ mềm mại, ướt át, gợi cảm hoặc táo bạo đúng với biểu cảm & ngữ cảnh gốc (vd: 'nhạy cảm quá...', 'đừng chạm chỗ đó mà...', 'sâu quá... chậm chút đi...', 'cứng hết cả lên rồi kìa', 'chịu hết nổi rồi...', 'bên trong khít chặt quá...').\n"
         "- TUYỆT ĐỐI TRÁNH từ y khoa khô khan ('âm đạo', 'dương vật', 'giao hợp') và tiếng rên kiểu Anh ('UGH', 'GUH', 'BUH', 'NNGH', 'MMN', 'FUH'): đổi sang khẩu ngữ Việt tự nhiên theo sắc thái cảnh ('bên trong', 'chỗ đó', 'nóng hổi', 'ướt nhẹp', 'sâu quá', 'ra mất') và tiếng thở Việt ('Ư...', 'Ưm...', 'Á...', 'Aaa...', 'Hộc...', 'Khựa...').\n"
         "- CẤM dùng từ cứng, sáo rỗng ít ai nói ngoài đời như: 'hắn ta', 'ả', 'gã', 'cô nàng', 'thực sự là', 'vô cùng', 'cái đó', 'vậy sao', 'thèm thuồng lắm chứ', 'kẻ hầu', 'ấn ký' (trừ khi đúng bối cảnh kỳ ảo cổ trang: mới dùng 'ta - ngươi' hoặc danh xưng cổ trang).\n"
-        "- Thay bằng khẩu ngữ ngắn gọn, có nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...): vd 'Cứ tưởng cô không thích cơ đấy', 'Ủa sao tự dưng...', 'Đừng có mà...', 'Nhói quá...'.\n"
-        "- Câu ngắn gọn vừa khung thoại, giữ đúng sắc thái ngại ngùng / trêu chọc / đê mê / hoảng hốt / áp đảo của tuyến cảnh.\n"
+        "- Câu ngắn gọn, súc tích VỪA KHÍT KHUNG THOẠI (tránh dịch rườm rà dài dòng làm chữ bị bóp nhỏ hoặc tràn khung), giữ nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...).\n"
+        "- KIỂM TRA CHÍNH TẢ & TÊN RIÊNG: TUYỆT ĐỐI không sai chính tả Tiếng Việt (vd: 'tao' không viết nhầm 'tạo', 'dừng lại' không viết 'đừng lại', 'cũng' không viết 'cứng'); giữ đúng chính tả chuẩn tiếng Anh/Romaji của nhân vật game/anime (vd: Blue Archive -> Iochi Mari, Utazumi Sakurako, Shimoe Koharu, tuyệt đối không bịa thêm âm tiết thừa).\n"
+        "- TUYỆT ĐỐI KHÔNG để dấu ngoặc Nhật `「」『』【】` trong chuỗi `vietnamese` (hãy dùng ngoặc kép `\"\"` hoặc bỏ ngoặc vì font Việt không có glyph đó sẽ biến thành ô vuông lỗi).\n"
+        "- Đúng ngữ khí nhân vật & văn phong truyện: không nhồi khẩu ngữ hài hước/tấu hài ('ối giồi ôi') vào cảnh đe dọa, uy hiếp hoặc nhân vật lạnh lùng.\n"
         "- Không giải thích dài dòng, không thêm chú thích ngoài lời thoại.\n"
         "- Tiếng thở/rên thoại của nhân vật (khi là lời nói/suy nghĩ, không phải SFX nền) dịch tự nhiên đúng chất doujinshi (vd: 'Ư...', 'Ưm...', 'Á...', 'Hộc...', 'Hả?!').\n"
         "Bắt buộc trả về đúng JSON hợp lệ."
@@ -1350,7 +1364,9 @@ class VisionLLMClient:
                 if skip_sfx and copy.is_sfx:
                     copy.translated_text = ""
                 elif vn:
-                    copy.translated_text = vn
+                    from koharu_vn_cli.pipeline.typesetter import sanitize_render_text
+
+                    copy.translated_text = sanitize_render_text(vn)
             else:
                 if fallback_src:
                     copy.source_text = fallback_src

@@ -2784,6 +2784,73 @@ def test_sfx_never_inpainted_or_translated_and_tui_cli_queue(
     assert cli_calls == [p1, p2]
 
 
+def test_floating_collision_avoidance_cjk_sanitize_ko_sfx_and_box_separation() -> None:
+    """Verify collision-free floating layout, CJK bracket sanitization, Hangul SFX filtering, and mega-box guard."""
+    from koharu_vn_cli.pipeline.detector import _promote_complete_boxes
+    from koharu_vn_cli.pipeline.gemini_client import looks_like_floating_sfx
+    from koharu_vn_cli.pipeline.typesetter import (
+        _rect_overlap,
+        adapt_regions_for_readability,
+        sanitize_render_text,
+        solve_layout,
+    )
+
+    # 1) CJK brackets sanitized cleanly so fonts never draw missing-glyph boxes
+    assert sanitize_render_text("Chẳng phải em nói 「Nếu có chuyện」 cơ mà?") == (
+        'Chẳng phải em nói "Nếu có chuyện" cơ mà?'
+    )
+
+    # 2) Korean Hangul SFX detected while Korean parenthetical speech stays dialogue
+    assert looks_like_floating_sfx("하앙 ♥") is True
+    assert looks_like_floating_sfx("옥") is True
+    assert looks_like_floating_sfx("푹") is True
+    assert looks_like_floating_sfx("찔꺽") is True
+    assert looks_like_floating_sfx("(용서해 주세요 사쿠라코님...)") is False
+    assert looks_like_floating_sfx("이런 더럽혀진 몸으로") is False
+
+    # 3) Adjacent tall-narrow floating columns widen safely WITHOUT overlapping each other or neighbors
+    regions = [
+        TextRegionItem(
+            id=1,
+            kind="floating",
+            text_bbox=(80, 120, 145, 340),
+            translated_text="Chẳng phải em từng nói là cứ nói với em cơ mà?",
+        ),
+        TextRegionItem(
+            id=2,
+            kind="floating",
+            text_bbox=(220, 125, 290, 345),
+            translated_text="Đ... đang nói cái gì thế hả... dừng lại đi mà...",
+        ),
+        TextRegionItem(
+            id=3,
+            kind="floating",
+            text_bbox=(735, 110, 798, 350),
+            translated_text="Bướm của bé Yui nè... chịu khó để anh mân mê cho đỡ đau nha...",
+        ),
+    ]
+    adapted = adapt_regions_for_readability(regions, img_w=800, img_h=1000)
+    # No two floating regions overlap after adaptation
+    assert not _rect_overlap(adapted[0].text_bbox, adapted[1].text_bbox, gap=6)
+    assert not _rect_overlap(adapted[1].text_bbox, adapted[2].text_bbox, gap=6)
+    # Right-edge box stays safely inside [10, 790] margin without clipping
+    assert adapted[2].text_bbox[2] <= 790
+    # Outlier floating font sizes stay balanced (never 35-44px giant text)
+    for reg in adapted:
+        lay = solve_layout(reg, canvas_size=(800, 1000))
+        assert 10 <= lay.font_size <= 28
+
+    # 4) _promote_complete_boxes refuses to glue two horizontally separate columns (>180px wide)
+    mask = np.zeros((200, 500), dtype=np.uint8)
+    mask[40:140, 40:90] = 220
+    mask[40:140, 320:380] = 220
+    left_col = (40, 40, 90, 140)
+    wide_merge = (35, 35, 385, 145)
+    promoted = _promote_complete_boxes([(left_col, 0.85, 2), (wide_merge, 0.40, 2)], mask)
+    wide_entry = next(s for b, s, _ in promoted if b == wide_merge)
+    assert wide_entry == 0.40  # Not promoted above left_col!
+
+
 
 
 

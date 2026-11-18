@@ -442,12 +442,17 @@ def _promote_complete_boxes(
     for box_l, sc_l, lbl_l in items:
         best_sc = sc_l
         area_l = box_area(box_l)
+        bw_l = box_l[2] - box_l[0]
         if sc_l >= 0.24 and area_l > 0:
             for box_s, sc_s, _ in items:
                 if sc_s <= best_sc:
                     continue
                 area_s = box_area(box_s)
+                bw_s = max(1, box_s[2] - box_s[0])
                 if area_s <= 0 or area_l <= area_s * 1.15 or area_l > area_s * 4.5:
+                    continue
+                # Never merge two horizontally separate dialogue/floating columns into one wide mega-box
+                if bw_l > max(bw_s * 1.95, 180):
                     continue
                 if containment_ratio(box_s, box_l) < 0.80:
                     continue
@@ -457,7 +462,7 @@ def _promote_complete_boxes(
                 sub_fg[sy1 - ly1 : sy2 - ly1, sx1 - lx1 : sx2 - lx1] = False
                 extra_area = max(1, (lx2 - lx1) * (ly2 - ly1) - (sx2 - sx1) * (sy2 - sy1))
                 extra_px = int(np.count_nonzero(sub_fg))
-                if extra_px >= 18 and (extra_px / extra_area) >= 0.03:
+                if extra_px >= 18 and (extra_px / extra_area) >= 0.035:
                     best_sc = max(best_sc, sc_s + 0.01)
         promoted.append((box_l, best_sc, lbl_l))
     return promoted
@@ -470,28 +475,31 @@ def _discover_unboxed_text_regions(
 ) -> list[DetectedRegion]:
     """Recover standalone glyph clusters lit up in UNet+DBNet `text_mask` that box detectors missed."""
     h, w = text_mask.shape[:2]
-    uncovered = (text_mask > 105).astype(np.uint8) * 255
+    uncovered = (text_mask > 82).astype(np.uint8) * 255
     for ex1, ey1, ex2, ey2 in existing_boxes:
         pad = 5
         uncovered[max(0, ey1 - pad) : min(h, ey2 + pad), max(0, ex1 - pad) : min(w, ex2 + pad)] = 0
 
-    if np.count_nonzero(uncovered) < 120:
+    if np.count_nonzero(uncovered) < 95:
         return []
 
-    closed = cv2.morphologyEx(uncovered, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+    closed = cv2.morphologyEx(uncovered, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 13)))
     num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(closed)
     recovered: list[DetectedRegion] = []
     page_area = h * w
     for lbl in range(1, num_lbl):
         cx, cy, cw, ch, area = (int(v) for v in stats[lbl])
-        if cw < 12 or ch < 12 or area < 140 or area > page_area * 0.25:
+        if cw < 12 or ch < 12 or area < 100 or area > page_area * 0.25:
             continue
         aspect = cw / max(1, ch)
         if aspect < 0.06 or aspect > 15.0:
             continue
         box = (max(0, cx - 2), max(0, cy - 2), min(w, cx + cw + 2), min(h, cy + ch + 2))
         crop_m = text_mask[box[1] : box[3], box[0] : box[2]]
-        if crop_m.size == 0 or int(crop_m.max()) < 155:
+        if crop_m.size == 0 or int(crop_m.max()) < 130:
+            continue
+        fg_ratio = float(np.count_nonzero(crop_m > 65)) / max(1, crop_m.size)
+        if fg_ratio < 0.03:
             continue
         refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, box, None)
         recovered.append(
@@ -617,13 +625,28 @@ class ComicDetector:
                     (b, _tile_clip_score(s, b, (wx1, wy1, wx2, wy2), w, h), l) for b, s, l in tile_blks
                 )
 
-        # Contrast-boosted pass captures translucent/low-contrast kanji & colored SFX
+        # Contrast-boosted pass captures translucent/low-contrast kanji & white-outlined Korean/JP floating text
         if enhanced_rgb is not None:
             enh_mask, enh_blks = self._run_ctd_crop(
                 enhanced_rgb, 0, 0, blk_conf_thresh=max(0.22, blk_conf_thresh - 0.04)
             )
             full_mask = np.maximum(full_mask, enh_mask)
             raw_blks.extend((b, s * 0.94, l) for b, s, l in enh_blks)
+            if max(h, w) > 1280 or max(w, h) / max(1, min(w, h)) > 1.8:
+                for wx1, wy1, wx2, wy2 in _compute_tile_windows(w, h, max_side=1024, overlap=0.22)[:6]:
+                    if (wx1, wy1, wx2, wy2) == (0, 0, w, h):
+                        continue
+                    t_mask, t_blks = self._run_ctd_crop(
+                        enhanced_rgb[wy1:wy2, wx1:wx2],
+                        wx1,
+                        wy1,
+                        blk_conf_thresh=max(0.22, blk_conf_thresh - 0.04),
+                    )
+                    full_mask[wy1:wy2, wx1:wx2] = np.maximum(full_mask[wy1:wy2, wx1:wx2], t_mask)
+                    raw_blks.extend(
+                        (b, _tile_clip_score(s * 0.94, b, (wx1, wy1, wx2, wy2), w, h), l)
+                        for b, s, l in t_blks
+                    )
 
         # Keep CTD `blk` hits backed by CTD's own fused UNet+DBNet mask to suppress texture/hair noise
         verified_blks: list[tuple[tuple[int, int, int, int], float, int]] = []
@@ -709,15 +732,18 @@ class ComicDetector:
         raw_texts = _promote_complete_boxes(raw_texts, text_mask)
         texts = _containment_nms(raw_texts, iou_thresh=0.40, contain_thresh=0.52)
 
-        # Verify low-confidence text candidates (0.18..conf_thresh) against fused UNet+DBNet text_mask
+        # Verify candidate text boxes against fused UNet+DBNet text_mask to drop texture/clothing false positives
         verified_texts: list[tuple[tuple[int, int, int, int], float, int]] = []
         for t_box, t_score, t_lbl in texts:
-            if t_score < conf_thresh:
-                x1, y1, x2, y2 = t_box
-                seg_crop = text_mask[y1:y2, x1:x2]
-                seg_ratio = float(np.count_nonzero(seg_crop > 65)) / max(1, seg_crop.size)
-                if seg_ratio < 0.025:
-                    continue
+            x1, y1, x2, y2 = t_box
+            if (x2 - x1) < 10 or (y2 - y1) < 10:
+                continue
+            seg_crop = text_mask[y1:y2, x1:x2]
+            seg_ratio = float(np.count_nonzero(seg_crop > 65)) / max(1, seg_crop.size)
+            if t_score < conf_thresh and seg_ratio < 0.025:
+                continue
+            if t_score < 0.55 and t_lbl == 2 and seg_ratio < 0.012:
+                continue
             verified_texts.append((t_box, t_score, t_lbl))
         texts = verified_texts
 

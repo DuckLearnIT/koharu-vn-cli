@@ -52,6 +52,45 @@ def _has_glyph(font_path: str, size: int, ch: str) -> bool:
     return len(glyph) > 0 and glyph != notdef
 
 
+_CJK_PUNCT_MAP = str.maketrans(
+    {
+        "「": '"',
+        "」": '"',
+        "『": '"',
+        "』": '"',
+        "【": "(",
+        "】": ")",
+        "〈": '"',
+        "〉": '"',
+        "《": '"',
+        "》": '"',
+        "〜": "~",
+        "～": "~",
+        "・": "·",
+        "　": " ",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
+
+
+def sanitize_render_text(text: str, primary_path: str | None = None, size: int = 16) -> str:
+    """Replace CJK brackets/unrenderable symbols with crisp equivalents so tofu boxes never appear."""
+    cleaned = (text or "").translate(_CJK_PUNCT_MAP)
+    if primary_path is None:
+        return cleaned
+    out: list[str] = []
+    for ch in cleaned:
+        if ch.isspace() or _has_glyph(primary_path, size, ch):
+            out.append(ch)
+            continue
+        if any(Path(fb).is_file() and _has_glyph(fb, size, ch) for fb in SYMBOL_FALLBACK_FONTS):
+            out.append(ch)
+    return "".join(out)
+
+
 def _pick_font_for_char(primary_path: str, size: int, ch: str) -> str:
     if _has_glyph(primary_path, size, ch):
         return primary_path
@@ -321,7 +360,11 @@ def solve_layout(
     font_path = str(resolve_font_path(region.font_name, kind=region.kind))
     if region.is_sfx and not (region.translated_text or "").strip():
         return SolvedLayout(font_path=font_path, font_size=14, line_height=17.0, lines=[])
-    text = (region.translated_text or region.source_text or "").strip()
+    text = sanitize_render_text(
+        (region.translated_text or region.source_text or "").strip(),
+        font_path,
+        18,
+    )
 
     box = region.bubble_bbox if (region.kind == "bubble" and region.bubble_bbox) else region.text_bbox
     x1, y1, x2, y2 = box
@@ -332,19 +375,19 @@ def solve_layout(
     is_rect = is_bubble and region.is_dark_bubble and not region.draw_bubble
     contour = region.bubble_contour if (is_bubble and not region.draw_bubble and not is_rect) else None
 
-    # Vertical Japanese floating text columns are tall & narrow: widen virtual box so
-    # horizontal Vietnamese text stays readable instead of wrapping 1 word per line at 9px.
-    if not is_bubble and box_w < 130.0 and box_h > box_w * 1.45:
+    # Keep tall narrow standalone floating boxes inside safe canvas margins if solve_layout is called directly
+    if not is_bubble and box_w < 120.0 and box_h > box_w * 1.45:
         cx = (x1 + x2) * 0.5
         cy = (y1 + y2) * 0.5
-        target_w = max(box_w, min(320.0, max(160.0, math.sqrt(max(1, len(text)) * 190.0))))
+        target_w = max(box_w, min(280.0, max(160.0, math.sqrt(max(1, len(text)) * 170.0))))
         if canvas_size is not None:
             cw, ch = canvas_size
-            target_w = min(target_w, max(80.0, cw - 12.0))
-            nx1 = max(6.0, min(cw - target_w - 6.0, cx - target_w * 0.5))
-            nx2 = min(float(cw - 6), nx1 + target_w)
-            ny1 = max(6.0, min(float(ch - 24), y1))
-            ny2 = min(float(ch - 6), max(ny1 + box_h, cy + box_h * 0.5))
+            edge_pad = max(10.0, cw * 0.012)
+            target_w = min(target_w, max(80.0, cw - 2.0 * edge_pad))
+            nx1 = max(edge_pad, min(cw - target_w - edge_pad, cx - target_w * 0.5))
+            nx2 = min(float(cw - edge_pad), nx1 + target_w)
+            ny1 = max(edge_pad, min(float(ch - 24), y1))
+            ny2 = min(float(ch - edge_pad), max(ny1 + box_h, cy + box_h * 0.5))
         else:
             nx1 = cx - target_w * 0.5
             nx2 = cx + target_w * 0.5
@@ -353,10 +396,21 @@ def solve_layout(
         x1, y1, x2, y2 = box
         box_w = max(12.0, float(x2 - x1))
         box_h = max(12.0, float(y2 - y1))
+    elif canvas_size is not None and not is_bubble:
+        cw, ch = canvas_size
+        edge_pad = max(10.0, cw * 0.012)
+        nx1 = max(edge_pad, min(float(cw - edge_pad - 24), float(x1)))
+        nx2 = min(float(cw - edge_pad), max(nx1 + 24.0, float(x2)))
+        ny1 = max(edge_pad, min(float(ch - edge_pad - 18), float(y1)))
+        ny2 = min(float(ch - edge_pad), max(ny1 + 18.0, float(y2)))
+        box = (int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2)))
+        x1, y1, x2, y2 = box
+        box_w = max(12.0, float(x2 - x1))
+        box_h = max(12.0, float(y2 - y1))
 
-    # Generous yet compact margins (fixes Koharu's 1.5*font_size horizontal pinch bug!)
-    pad_x = max(3.0, min(10.0, box_w * 0.065)) if is_bubble else max(2.0, box_w * 0.03)
-    pad_y = max(5.0, min(14.0, box_h * 0.085)) if is_bubble else max(2.0, box_h * 0.03)
+    # Generous yet compact margins (fixes horizontal pinch and keeps strokes inside edge)
+    pad_x = max(3.0, min(10.0, box_w * 0.065)) if is_bubble else max(4.0, box_w * 0.04)
+    pad_y = max(5.0, min(14.0, box_h * 0.085)) if is_bubble else max(3.0, box_h * 0.035)
 
     # Explicit paragraphs or flattened words
     paragraphs = [p.split() for p in text.splitlines() if p.strip()]
@@ -364,18 +418,20 @@ def solve_layout(
     if not words:
         return SolvedLayout(font_path=font_path, font_size=14, line_height=17.0, lines=[])
 
-    # Cap max font size proportionally so 1-word exclamations look tasteful while dialogue fills frame
+    # Cap max font size proportionally so floating lines look balanced alongside dialogue bubbles
     if region.font_size is not None:
         max_fs = min_fs = max(8, int(round(region.font_size)))
     else:
         if is_bubble:
-            max_fs = int(max(14, min(42, box_w * 0.42, box_h * 0.36)))
+            max_fs = int(max(14, min(38, box_w * 0.40, box_h * 0.34)))
             if len(words) <= 2:
-                max_fs = min(max_fs, int(max(14, min(box_w * 0.34, box_h * 0.24))))
-            min_fs = 10 if min(box_w, box_h) < 72 else 12
+                max_fs = min(max_fs, int(max(14, min(box_w * 0.32, box_h * 0.24))))
+            min_fs = 10 if min(box_w, box_h) < 76 else 11
         else:
-            max_fs = int(max(16, min(44, max(box_w, box_h * 0.45) * 0.38)))
-            min_fs = 13
+            max_fs = int(max(15, min(30, box_w * 0.24, max(box_w * 0.16, box_h * 0.28))))
+            if len(words) <= 2:
+                max_fs = min(max_fs, int(max(15, min(box_w * 0.28, box_h * 0.24))))
+            min_fs = 10
 
     line_ratio = 1.24 if is_bubble else 1.18
 
@@ -455,37 +511,94 @@ def solve_layout(
     )
 
 
+def _rect_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int], gap: int = 8) -> bool:
+    return not (
+        a[2] + gap <= b[0]
+        or b[2] + gap <= a[0]
+        or a[3] + gap <= b[1]
+        or b[3] + gap <= a[1]
+    )
+
+
 def adapt_regions_for_readability(
     regions: Sequence[TextRegionItem],
     img_w: int,
     img_h: int,
 ) -> list[TextRegionItem]:
     """
-    Prevent translated Vietnamese text from being crushed inside narrow vertical Japanese boxes.
-    Widens tall-narrow floating regions and tight bubble boxes while staying inside image bounds.
+    Prevent translated Vietnamese text from being crushed OR overlapping adjacent regions:
+    1. Widens tall-narrow floating regions only into conflict-free horizontal space.
+    2. Separates any remaining floating/floating or floating/bubble overlaps cleanly inside safe margins.
+    3. Harmonizes outlier floating font sizes alongside speech bubbles on the same page.
     """
+    margin_x = max(10, int(round(img_w * 0.015)))
+    margin_y = max(10, int(round(img_h * 0.015)))
+    gap = 8
     min_readable = max(13, min(16, int(round(min(img_w, img_h) * 0.015))))
-    adapted: list[TextRegionItem] = []
 
-    for reg in regions:
-        copy = reg.model_copy()
+    def clamp_box(b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        bw = min(max(24, b[2] - b[0]), max(24, img_w - 2 * margin_x))
+        bh = min(max(20, b[3] - b[1]), max(20, img_h - 2 * margin_y))
+        x1 = max(margin_x, min(img_w - margin_x - bw, b[0]))
+        y1 = max(margin_y, min(img_h - margin_y - bh, b[1]))
+        return (x1, y1, x1 + bw, y1 + bh)
+
+    adapted = [reg.model_copy() for reg in regions]
+    # Sanitize text before sizing/rendering so CJK brackets never skew measurements or render tofu
+    for copy in adapted:
+        if copy.translated_text:
+            copy.translated_text = sanitize_render_text(copy.translated_text)
+
+    active_boxes = [
+        (idx, (copy.bubble_bbox or copy.text_bbox))
+        for idx, copy in enumerate(adapted)
+        if not (copy.is_sfx and not (copy.translated_text or "").strip())
+        and (copy.translated_text or copy.source_text or "").strip()
+    ]
+
+    # Step 1: Neighbor-aware floating widening & tight-bubble expansion
+    for idx, copy in enumerate(adapted):
         if copy.is_sfx and not (copy.translated_text or "").strip():
-            adapted.append(copy)
             continue
         text = (copy.translated_text or copy.source_text or "").strip()
         if not text:
-            adapted.append(copy)
             continue
 
         if copy.kind == "floating":
-            x1, y1, x2, y2 = copy.text_bbox
+            x1, y1, x2, y2 = clamp_box(copy.text_bbox)
             bw, bh = x2 - x1, y2 - y1
+            # Compute available free left/right span bounded by vertically overlapping neighbors
+            free_left = margin_x
+            free_right = img_w - margin_x
+            for o_idx, ob in active_boxes:
+                if o_idx == idx:
+                    continue
+                if ob[3] + gap <= y1 or y2 + gap <= ob[1]:
+                    continue
+                ocx = (ob[0] + ob[2]) * 0.5
+                cx = (x1 + x2) * 0.5
+                if ob[2] <= x1 + 6 or ocx < cx:
+                    free_left = max(free_left, ob[2] + gap)
+                if ob[0] >= x2 - 6 or ocx >= cx:
+                    free_right = min(free_right, ob[0] - gap)
+
             if bw < max(130, int(img_w * 0.14)) and bh > bw * 1.35:
                 cx = (x1 + x2) * 0.5
-                target_w = max(bw, min(int(img_w * 0.34), max(165, int(math.sqrt(len(text) * 190)))))
-                nx1 = max(6, min(img_w - target_w - 6, int(round(cx - target_w * 0.5))))
-                nx2 = min(img_w - 6, nx1 + target_w)
-                copy.text_bbox = (nx1, y1, nx2, max(y2, min(img_h - 6, y1 + max(bh, 48))))
+                desired_w = max(bw, min(int(img_w * 0.34), max(165, int(math.sqrt(len(text) * 185)))))
+                avail_span = free_right - free_left
+                if avail_span >= max(bw, 110):
+                    eff_w = min(desired_w, avail_span)
+                    nx1 = max(free_left, min(free_right - eff_w, int(round(cx - eff_w * 0.5))))
+                    nx2 = min(free_right, nx1 + eff_w)
+                else:
+                    # Neighbor sits immediately adjacent: stay clamped outside neighbor + margin
+                    eff_w = min(desired_w, max(bw, int(img_w * 0.26)))
+                    nx1 = max(margin_x, min(img_w - margin_x - eff_w, int(round(cx - eff_w * 0.5))))
+                    nx2 = min(img_w - margin_x, nx1 + eff_w)
+                ny2 = max(y2, min(img_h - margin_y, y1 + max(bh, 48)))
+                copy.text_bbox = clamp_box((nx1, y1, nx2, ny2))
+            else:
+                copy.text_bbox = clamp_box((x1, y1, x2, y2))
         else:
             layout = solve_layout(copy, canvas_size=(img_w, img_h))
             if layout.font_size < min_readable or layout.overflowed:
@@ -494,15 +607,79 @@ def adapt_regions_for_readability(
                 target_w = max(bw, min(int(img_w * 0.24), max(125, int(bw * 1.45))))
                 target_h = max(bh, min(int(img_h * 0.22), int(bh * 1.15)))
                 cx, cy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
-                nx1 = max(6, min(img_w - target_w - 6, int(round(cx - target_w * 0.5))))
-                ny1 = max(6, min(img_h - target_h - 6, int(round(cy - target_h * 0.5))))
-                new_box = (nx1, ny1, min(img_w - 6, nx1 + target_w), min(img_h - 6, ny1 + target_h))
+                nx1 = max(margin_x, min(img_w - target_w - margin_x, int(round(cx - target_w * 0.5))))
+                ny1 = max(margin_y, min(img_h - target_h - margin_y, int(round(cy - target_h * 0.5))))
+                new_box = clamp_box((nx1, ny1, nx1 + target_w, ny1 + target_h))
                 copy.text_bbox = new_box
                 if copy.bubble_bbox is not None:
                     copy.bubble_bbox = new_box
-                    # Clear old narrow contour so typesetter uses the widened bounding ellipse
                     copy.bubble_contour = None
-        adapted.append(copy)
+
+    # Step 2: Iterative overlap resolution moving ONLY floating boxes (anchors keep real speech balloons fixed)
+    floating_indices = [
+        i
+        for i, c in enumerate(adapted)
+        if c.kind == "floating"
+        and not (c.is_sfx and not (c.translated_text or "").strip())
+        and (c.translated_text or c.source_text or "").strip()
+    ]
+    all_render_indices = [
+        i
+        for i, c in enumerate(adapted)
+        if not (c.is_sfx and not (c.translated_text or "").strip())
+        and (c.translated_text or c.source_text or "").strip()
+    ]
+
+    for _ in range(20):
+        moved = False
+        for i in floating_indices:
+            a = adapted[i].text_bbox
+            for j in all_render_indices:
+                if i == j:
+                    continue
+                b = adapted[j].bubble_bbox or adapted[j].text_bbox
+                if not _rect_overlap(a, b, gap=gap):
+                    continue
+                moved = True
+                ox = min(a[2] + gap, b[2] + gap) - max(a[0], b[0])
+                oy = min(a[3] + gap, b[3] + gap) - max(a[1], b[1])
+                acx, acy = (a[0] + a[2]) * 0.5, (a[1] + a[3]) * 0.5
+                bcx, bcy = (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5
+                if oy <= ox * 1.15:
+                    dir_y = -1 if acy <= bcy else 1
+                    shift = int(math.ceil(oy * (0.6 if adapted[j].kind == "floating" else 1.0)))
+                    a = clamp_box((a[0], a[1] + dir_y * shift, a[2], a[3] + dir_y * shift))
+                    adapted[i].text_bbox = a
+                else:
+                    dir_x = -1 if acx <= bcx else 1
+                    shift = int(math.ceil(ox * (0.6 if adapted[j].kind == "floating" else 1.0)))
+                    a = clamp_box((a[0] + dir_x * shift, a[1], a[2] + dir_x * shift, a[3]))
+                    adapted[i].text_bbox = a
+        if not moved:
+            break
+
+    # Step 3: Re-check overflow & tame excessive outlier floating font sizes relative to page bubbles
+    bubble_sizes = [
+        solve_layout(c, canvas_size=(img_w, img_h)).font_size
+        for c in adapted
+        if c.kind == "bubble" and (c.translated_text or c.source_text or "").strip()
+    ]
+    ref_fs = (
+        sorted(bubble_sizes)[len(bubble_sizes) // 2]
+        if bubble_sizes
+        else max(15, min(22, int(round(min(img_w, img_h) * 0.020))))
+    )
+    max_float_fs = max(20, min(28, int(round(ref_fs * 1.4))))
+    for copy in adapted:
+        if copy.kind != "floating" or copy.font_size is not None:
+            continue
+        if copy.is_sfx and not (copy.translated_text or "").strip():
+            continue
+        if not (copy.translated_text or copy.source_text or "").strip():
+            continue
+        lay = solve_layout(copy, canvas_size=(img_w, img_h))
+        if lay.font_size > max_float_fs:
+            copy.font_size = float(max_float_fs)
 
     return adapted
 
@@ -538,13 +715,21 @@ def render_text_regions(canvas_rgba: Image.Image, regions: Sequence[TextRegionIt
             else None
         )
 
+        # Clamp line centers inside page safe margin so glyphs & strokes never clip at left/right border
+        edge_safe = max(6.0, w * 0.008) + stroke_px + 2.0
+        clamped_lines: list[LinePlacement] = []
+        for lp in layout.lines:
+            half_w = lp.width * 0.5
+            safe_cx = min(max(lp.center_x, edge_safe + half_w), max(edge_safe + half_w, w - edge_safe - half_w))
+            clamped_lines.append(LinePlacement(text=lp.text, center_x=safe_cx, top_y=lp.top_y, width=lp.width))
+
         # Compute tight bounding patch around the lines + stroke padding
         size_hi = layout.font_size * scale
         pad = int(math.ceil(stroke_px * 2 + layout.font_size * 0.65))
-        min_x = min(lp.center_x - lp.width * 0.5 for lp in layout.lines) - pad
-        max_x = max(lp.center_x + lp.width * 0.5 for lp in layout.lines) + pad
-        min_y = min(lp.top_y for lp in layout.lines) - pad
-        max_y = max(lp.top_y + layout.font_size * 1.35 for lp in layout.lines) + pad
+        min_x = min(lp.center_x - lp.width * 0.5 for lp in clamped_lines) - pad
+        max_x = max(lp.center_x + lp.width * 0.5 for lp in clamped_lines) + pad
+        min_y = min(lp.top_y for lp in clamped_lines) - pad
+        max_y = max(lp.top_y + layout.font_size * 1.35 for lp in clamped_lines) + pad
 
         px1 = max(0, int(math.floor(min_x)))
         py1 = max(0, int(math.floor(min_y)))
@@ -560,7 +745,7 @@ def render_text_regions(canvas_rgba: Image.Image, regions: Sequence[TextRegionIt
         primary_hi = _load_font(layout.font_path, size_hi)
         base_ascent, _ = primary_hi.getmetrics()
 
-        for lp in layout.lines:
+        for lp in clamped_lines:
             runs = _split_font_runs(lp.text, layout.font_path, size_hi)
             run_widths = [
                 _measure_text_width(_load_font(fp, size_hi), chunk) for fp, chunk in runs
