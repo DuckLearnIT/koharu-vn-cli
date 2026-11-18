@@ -60,6 +60,7 @@ class SlashSpec:
 
 SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/translate", "<đường_dẫn|.zip> [--resume]", "Dịch truyện tranh / file .zip / .cbz (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
+    SlashSpec("/retranslate", "<đường_dẫn|.zip>", "Tái dịch ảnh/zip tải từ Drive (bỏ qua ảnh đã dịch, chỉ dịch lại ảnh chưa dịch)"),
     SlashSpec("/compose", "<đường_dẫn> [--resume]", "Tự sáng tác thoại cho Artist CG không lời"),
     SlashSpec("/resume", "[đường_dẫn]", "Chạy tiếp tác vụ bị dừng/lỗi từ trang chưa xong (bỏ qua trang đã dịch)"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
@@ -209,6 +210,16 @@ def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
     """
     path_str, rem = extract_path_and_remainder(text)
     low = rem.lower() if path_str else text.lower()
+
+    if any(k in low for k in ("tái dịch", "tai dich", "retranslate", "dịch lại", "chưa dịch")):
+        hint = re.sub(
+            r"\b(hãy|giúp|tôi|tái dịch|tai dich|dịch lại|chưa dịch|retranslate|cho|ảnh|thư mục)\b",
+            " ",
+            rem,
+            flags=re.IGNORECASE,
+        )
+        hint = re.sub(r"\s+", " ", hint).strip(" ,.-:")
+        return "retranslate", path_str, {"prompt": hint}
 
     if any(k in low for k in ("rerender", "render lại", "vẽ lại")):
         return "rerender", path_str, {"prompt": rem}
@@ -415,13 +426,15 @@ class RunJobModal(ModalScreen[tuple[str, str, str] | None]):
 
     def compose(self) -> ComposeResult:
         title = (
-            "Chạy Pipeline Dịch Truyện"
+            "Tái Dịch Ảnh Tải Từ Drive (Bỏ qua ảnh đã dịch)"
+            if self.mode == "retranslate"
+            else "Chạy Pipeline Dịch Truyện"
             if self.mode == "translate"
             else f"Sáng Tác Thoại Artist CG (style: {self.style_name})"
         )
         hint = (
             "Gợi ý xưng hô / bối cảnh (vd: anh - em, kiếm hiệp):"
-            if self.mode == "translate"
+            if self.mode in {"translate", "retranslate"}
             else "Gợi ý cốt truyện / tính cách nhân vật (vd: trêu chọc, ngọt ngào):"
         )
         with Vertical(id="modal-card"):
@@ -1358,6 +1371,8 @@ class KoharuTUI(App[None]):
         action, path_str, extra = parse_natural_intent(raw)
         if action == "translate" and path_str:
             self._launch_translate(Path(path_str), extra.get("prompt") or "")
+        elif action == "retranslate" and path_str:
+            self._launch_retranslate(Path(path_str), extra.get("prompt") or "")
         elif action == "compose" and path_str:
             if extra.get("style") is not None:
                 self.cfg.compose_style = extra["style"]
@@ -1375,6 +1390,8 @@ class KoharuTUI(App[None]):
         def _after(choice: str | None) -> None:
             if choice == "translate":
                 self._launch_translate(target, hint)
+            elif choice == "retranslate":
+                self._launch_retranslate(target, hint)
             elif choice == "compose":
                 self._launch_compose(target, hint)
             elif choice == "rerender":
@@ -1382,6 +1399,7 @@ class KoharuTUI(App[None]):
 
         opts = [
             ("translate", "Dịch truyện (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
+            ("retranslate", "Tái dịch ảnh tải từ Drive (bỏ qua trang đã dịch, sửa trang chưa dịch)"),
             ("compose", f"Sáng tác thoại Artist CG không lời (kiểu: {self.cfg.compose_style.value})"),
             ("rerender", "Render lại từ .koharu_cache/*.koharu.json (0 giây API)"),
         ]
@@ -1525,6 +1543,15 @@ class KoharuTUI(App[None]):
                     RunJobModal("translate", "", self.cfg.custom_prompt, initial_tags=self.cfg.tags),
                     lambda res: self._launch_translate(Path(res[0]), res[1], res[2], resume=resume_flag) if res else None,
                 )
+        elif cmd == "/retranslate":
+            p_str, hint = split_cmd_and_hint(rest)
+            if p_str:
+                self._launch_retranslate(Path(p_str), hint)
+            else:
+                self.push_screen(
+                    RunJobModal("retranslate", "", self.cfg.custom_prompt, initial_tags=self.cfg.tags),
+                    lambda res: self._launch_retranslate(Path(res[0]), res[1], res[2]) if res else None,
+                )
         elif cmd == "/compose":
             resume_flag = "--resume" in rest
             cleaned_rest = rest.replace("--resume", "").strip()
@@ -1543,6 +1570,8 @@ class KoharuTUI(App[None]):
                 self._log_ai("Chưa có tác vụ trước đó. Hãy chạy `/translate <đường_dẫn> --resume`.", style="yellow")
             elif self.cfg.last_job_mode == "compose":
                 self._launch_compose(Path(target_str), hint, resume=True)
+            elif self.cfg.last_job_mode == "retranslate":
+                self._launch_translate(Path(target_str), hint, resume=True, retranslate_untranslated=True)
             else:
                 self._launch_translate(Path(target_str), hint, resume=True)
         elif cmd == "/rerender":
@@ -2163,7 +2192,13 @@ class KoharuTUI(App[None]):
         )
 
     def _launch_translate(
-        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+        self,
+        input_path: Path,
+        extra_prompt: str = "",
+        extra_tags: str = "",
+        *,
+        resume: bool = False,
+        retranslate_untranslated: bool = False,
     ) -> None:
         if not self._require_job_idle_and_key(needs_llm=True):
             return
@@ -2171,9 +2206,26 @@ class KoharuTUI(App[None]):
             self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
             return
         self.cfg.last_input_path = str(input_path)
-        self.cfg.last_job_mode = "translate"
+        self.cfg.last_job_mode = "retranslate" if retranslate_untranslated else "translate"
         save_config(self.cfg)
-        self._start_translate(input_path, extra_prompt, extra_tags, resume=resume)
+        self._start_translate(
+            input_path,
+            extra_prompt,
+            extra_tags,
+            resume=resume,
+            retranslate_untranslated=retranslate_untranslated,
+        )
+
+    def _launch_retranslate(
+        self, input_path: Path, extra_prompt: str = "", extra_tags: str = ""
+    ) -> None:
+        self._launch_translate(
+            input_path,
+            extra_prompt,
+            extra_tags,
+            resume=False,
+            retranslate_untranslated=True,
+        )
 
     def _launch_compose(
         self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
@@ -2195,10 +2247,20 @@ class KoharuTUI(App[None]):
 
     @work(thread=True)
     def _start_translate(
-        self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
+        self,
+        input_path: Path,
+        extra_prompt: str = "",
+        extra_tags: str = "",
+        *,
+        resume: bool = False,
+        retranslate_untranslated: bool = False,
     ) -> None:
         self.cancel_event.clear()
-        mode_lbl = "Tiếp tục dịch" if resume else "Dịch truyện"
+        mode_lbl = (
+            "Tái dịch trang chưa dịch"
+            if retranslate_untranslated
+            else ("Tiếp tục dịch" if resume else "Dịch truyện")
+        )
         self.call_from_thread(self._set_job_ui, True, f"{mode_lbl}: {input_path.name}", 2.0)
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
@@ -2217,6 +2279,7 @@ class KoharuTUI(App[None]):
                 prompt=merged_prompt,
                 story=self.cfg.story_context or None,
                 tags=eff_tags,
+                story_pass=not retranslate_untranslated,
                 font=self.cfg.font,
                 conf=self.cfg.conf_thresh,
                 accurate_detector=self.cfg.accurate_detector,
@@ -2224,6 +2287,7 @@ class KoharuTUI(App[None]):
                 output_format=self.cfg.output_format,
                 sequential_names=self.cfg.sequential_names,
                 vision_translate=self.cfg.vision_translate,
+                retranslate_untranslated=retranslate_untranslated,
                 skip_sfx=self.cfg.skip_sfx,
                 use_gpu=self.cfg.use_gpu,
                 resume=resume,
@@ -2239,10 +2303,10 @@ class KoharuTUI(App[None]):
             )
             self.call_from_thread(
                 self._log_ai,
-                f"[bold green]Hoàn tất dịch {len(docs)} trang![/bold green] Lưu tại: [cyan]{out_dir}[/cyan] (gõ `/open` để mở)",
+                f"[bold green]Hoàn tất {'tái dịch' if retranslate_untranslated else 'dịch'} {len(docs)} trang![/bold green] Lưu tại: [cyan]{out_dir}[/cyan] (gõ `/open` để mở)",
             )
             self._notify_result(
-                "Koharu-VN · Dịch xong!",
+                "Koharu-VN · Tái dịch xong!" if retranslate_untranslated else "Koharu-VN · Dịch xong!",
                 f"Đã hoàn tất {len(docs)} trang -> {out_dir.name}",
             )
         except PipelineCancelledError:

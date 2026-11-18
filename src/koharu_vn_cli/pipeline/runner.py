@@ -29,6 +29,7 @@ from koharu_vn_cli.pipeline.detector import (
     active_ort_provider_label,
 )
 from koharu_vn_cli.pipeline.gemini_client import (
+    _CJK_KANA_RE,
     DEEPSEEK_BASE_URL,
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
@@ -630,6 +631,48 @@ def _load_or_build_story_bible(
     return bible
 
 
+_LATIN_ALPHA_RE = re.compile(r"[A-Za-z]")
+
+
+def classify_retranslate_regions(
+    region_items: list[TextRegionItem],
+    ocr_texts: dict[int, str],
+    *,
+    skip_sfx: bool = True,
+) -> set[int]:
+    """
+    Identify which detected regions on an exported page still contain untranslated
+    Japanese/Korean/Chinese text vs already-typeset Vietnamese dialogue or pure SFX.
+    """
+    stats: list[tuple[TextRegionItem, str, int, int, bool]] = []
+    page_has_latin = False
+
+    for reg in region_items:
+        txt = (ocr_texts.get(reg.id, "") or reg.source_text or "").strip()
+        latin_n = len(_LATIN_ALPHA_RE.findall(txt))
+        cjk_n = len(_CJK_KANA_RE.findall(txt))
+        is_pure_sfx = bool(skip_sfx and reg.kind == "floating" and looks_like_floating_sfx(txt))
+        if latin_n >= 3 and latin_n > cjk_n:
+            page_has_latin = True
+        stats.append((reg, txt, latin_n, cjk_n, is_pure_sfx))
+
+    untranslated_ids: set[int] = set()
+    for reg, txt, latin_n, cjk_n, is_pure_sfx in stats:
+        if is_pure_sfx or cjk_n == 0:
+            continue
+        if latin_n >= 2 and latin_n >= cjk_n:
+            continue
+        # On a page where other bubbles already rendered Vietnamese, require >= 3 CJK/Kana
+        # glyphs with 0 Latin letters so tiny dark-bg Vietnamese interjections ("Ưm...") aren't misflagged.
+        if page_has_latin:
+            if cjk_n >= 3 and latin_n == 0:
+                untranslated_ids.add(reg.id)
+        else:
+            if cjk_n >= 1 and latin_n <= 1:
+                untranslated_ids.add(reg.id)
+    return untranslated_ids
+
+
 def run_translate_pipeline(
     input_path: Path,
     *,
@@ -647,6 +690,7 @@ def run_translate_pipeline(
     tags: str | None = None,
     story_pass: bool = True,
     vision_translate: bool = True,
+    retranslate_untranslated: bool = False,
     skip_sfx: bool = True,
     use_gpu: bool = True,
     font: str | None = None,
@@ -672,7 +716,8 @@ def run_translate_pipeline(
         if not images:
             raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
 
-        out_dir = output or input_path.parent / f"{base_name}_vn"
+        default_suffix = "_fixed" if retranslate_untranslated else "_vn"
+        out_dir = output or input_path.parent / f"{base_name}{default_suffix}"
         cache_dir = out_dir / ".koharu_cache"
         out_dir.mkdir(parents=True, exist_ok=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -754,11 +799,19 @@ def run_translate_pipeline(
         if isinstance(cache, ModelCache):
             detector = cache.get_detector(accurate=accurate_detector, use_gpu=use_gpu)
             inpainter = cache.get_inpainter(use_gpu=use_gpu)
-            ocr_engine = cache.get_ocr(use_gpu=use_gpu) if not vision_translate else None
+            ocr_engine = (
+                cache.get_ocr(use_gpu=use_gpu)
+                if (not vision_translate or retranslate_untranslated)
+                else None
+            )
         else:
             detector = cache.get_detector(accurate=accurate_detector)
             inpainter = cache.get_inpainter()
-            ocr_engine = cache.get_ocr() if not vision_translate else None
+            ocr_engine = (
+                cache.get_ocr()
+                if (not vision_translate or retranslate_untranslated)
+                else None
+            )
 
         det_dev = active_ort_provider_label(getattr(detector, "_rtdetr", None))
         inp_dev = active_ort_provider_label(getattr(inpainter, "_lama", None))
@@ -1070,6 +1123,84 @@ def run_translate_pipeline(
                             )
                             for reg_idx, reg in enumerate(detected, start=1)
                         ]
+
+                        if retranslate_untranslated:
+                            eng_rt = ocr_engine or _ensure_ocr_engine()
+                            if eng_rt is not None:
+                                _emit_step(
+                                    idx,
+                                    img_path.name,
+                                    "check",
+                                    f"Đang kiểm tra {len(region_items)} khung thoại đã dịch chưa...",
+                                )
+                                with gpu_lock:
+                                    rt_ocr_texts = eng_rt.recognize_regions(rgb, region_items)
+                                for reg_it in region_items:
+                                    raw_rt = (rt_ocr_texts.get(reg_it.id, "") or "").strip()
+                                    if raw_rt:
+                                        reg_it.source_text = raw_rt
+                                untranslated_ids = classify_retranslate_regions(
+                                    region_items, rt_ocr_texts, skip_sfx=skip_sfx
+                                )
+                                if not untranslated_ids:
+                                    save_image(Image.fromarray(rgb), out_img_path)
+                                    doc = PageDocument(
+                                        image_path=str(img_path.resolve()),
+                                        cleaned_image_path=str(out_img_path.resolve()),
+                                        width=w,
+                                        height=h,
+                                        mode="translate",
+                                        source_language=lang,
+                                        regions=[],
+                                    )
+                                    with state_lock:
+                                        docs_by_idx[idx] = doc
+                                    _emit_step(
+                                        idx,
+                                        img_path.name,
+                                        "skip_retranslate",
+                                        "Đã dịch Tiếng Việt sẵn — bỏ qua & giữ nguyên ảnh!",
+                                    )
+                                    _emit_page_done(idx, img_path.name, doc, out_img_path)
+                                    continue
+
+                                skipped_cnt = len(region_items) - len(untranslated_ids)
+                                region_items = [r for r in region_items if r.id in untranslated_ids]
+                                _emit_step(
+                                    idx,
+                                    img_path.name,
+                                    "retranslate",
+                                    (
+                                        f"Phát hiện {len(region_items)} khung chưa dịch (giữ nguyên {skipped_cnt} khung đã dịch) — chuẩn bị tái dịch!"
+                                        if skipped_cnt > 0
+                                        else f"Trang chưa dịch ({len(region_items)} khung) — chuẩn bị tái dịch!"
+                                    ),
+                                )
+                                if not vision_translate:
+                                    filtered_ocr = {r.id: rt_ocr_texts.get(r.id, "") for r in region_items}
+                                    ok_enc, seg_buf = cv2.imencode(".png", seg_mask)
+                                    seg_bytes = seg_buf.tobytes() if ok_enc else b""
+                                    pending_ocr_pages.append(
+                                        (
+                                            idx,
+                                            img_path,
+                                            out_img_path,
+                                            json_path,
+                                            clean_path,
+                                            w,
+                                            h,
+                                            seg_bytes,
+                                            detected,
+                                            region_items,
+                                            filtered_ocr,
+                                        )
+                                    )
+                                    if len(pending_ocr_pages) >= 4:
+                                        batch = _PreparedOcrBatch(scene_id=sc.scene_id, pages=pending_ocr_pages)
+                                        pending_ocr_pages = []
+                                        if not _q_put(translate_queue, batch, abort_event, hooks):
+                                            return
+                                    continue
 
                         if not vision_translate and ocr_engine is not None:
                             _emit_step(
@@ -1626,6 +1757,77 @@ def run_translate_pipeline(
             base_name=base_name,
         )
         return out_dir, docs
+
+
+def run_retranslate_pipeline(
+    input_path: Path,
+    *,
+    output: Path | None = None,
+    lang: str = "auto",
+    api_key: str | None = None,
+    api_keys: list[str] | None = None,
+    base_url: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    fallback_model: str | None = None,
+    story_model: str | None = None,
+    story_fallback_model: str | None = None,
+    prompt: str | None = None,
+    story: str | None = None,
+    tags: str | None = None,
+    story_pass: bool = False,
+    vision_translate: bool = True,
+    skip_sfx: bool = True,
+    use_gpu: bool = True,
+    font: str | None = None,
+    conf: float = 0.34,
+    accurate_detector: bool = True,
+    save_cbz: bool = False,
+    output_format: str = "original",
+    sequential_names: bool = False,
+    skip_blocked: bool = True,
+    resume: bool = False,
+    clean_cache: bool = True,
+    max_workers: int = 0,
+    model_cache: ModelCache | None = None,
+    hooks: PipelineHooks | None = None,
+) -> tuple[Path, list[PageDocument]]:
+    """
+    Re-translate an already-exported comic folder or archive (e.g. downloaded from Google Drive):
+    automatically skips pages/bubbles already rendered in Vietnamese and only translates,
+    inpaints, and typesets remaining untranslated Japanese/Korean/Chinese pages/regions.
+    """
+    return run_translate_pipeline(
+        input_path,
+        output=output,
+        lang=lang,
+        api_key=api_key,
+        api_keys=api_keys,
+        base_url=base_url,
+        model=model,
+        fallback_model=fallback_model,
+        story_model=story_model,
+        story_fallback_model=story_fallback_model,
+        prompt=prompt,
+        story=story,
+        tags=tags,
+        story_pass=story_pass,
+        vision_translate=vision_translate,
+        retranslate_untranslated=True,
+        skip_sfx=skip_sfx,
+        use_gpu=use_gpu,
+        font=font,
+        conf=conf,
+        accurate_detector=accurate_detector,
+        save_cbz=save_cbz,
+        output_format=output_format,
+        sequential_names=sequential_names,
+        skip_blocked=skip_blocked,
+        resume=resume,
+        clean_cache=clean_cache,
+        max_workers=max_workers,
+        model_cache=model_cache,
+        hooks=hooks,
+    )
 
 
 def run_compose_pipeline(

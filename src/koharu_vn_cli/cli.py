@@ -179,37 +179,37 @@ def _cli_confirm_story_bible(
         progress.start()
 
 
-@app.command()
-def translate(
-    input_path: Path = typer.Argument(..., help="Ảnh, thư mục truyện, hoặc file .zip/.cbz cần dịch."),
-    output: Optional[Path] = typer.Option(None, "-o", "--output", help="Thư mục lưu ảnh đã dịch."),
-    lang: str = typer.Option("auto", "--lang", help="Ngôn ngữ gốc: auto | ja | ko | zh | en."),
-    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="Gemini API key (hoặc ~/.koharu-vn/config.json)."),
-    base_url: Optional[str] = typer.Option(None, "--base-url", help="Endpoint OpenAI-compatible tùy chọn (vd: http://127.0.0.1:8317/v1)."),
-    model: Optional[str] = typer.Option(None, "--model", help="Model PHỤ (nhanh) để dịch từng trang hoặc sáng tác thoại."),
-    fallback_model: Optional[str] = typer.Option(None, "--fallback-model", help="Model fallback cho PHỤ khi hết quota."),
-    story_model: Optional[str] = typer.Option(None, "--story-model", help="Model CHÍNH (mạnh) cho Pass 1 phân tích full cốt truyện, nhân vật & tình huống."),
-    story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback cho CHÍNH khi bị prohibit (thử 1 lượt rồi bỏ qua Pass 1)."),
-    prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô thêm cho người dịch."),
-    story: Optional[str] = typer.Option(None, "--story", help="Cốt truyện/nhân vật/lore (nhập chữ hoặc đường dẫn file .txt/.md)."),
-    tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại (vd: 'vanilla, romance' hoặc 'NTR, angst')."),
-    story_pass: bool = typer.Option(True, "--story-pass/--no-story-pass", help="Quét trước toàn bộ chương (Pass 1) để khóa nhân vật, xưng hô & cốt truyện."),
-    font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt (mali-bold, pangolin, patrick-hand, bangers, hoặc đường dẫn .ttf)."),
-    conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại (0.2 - 0.8)."),
-    accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Dùng model detector FP32 (168MB, chuẩn cao) hoặc --fast-detector INT8 (43MB)."),
-    save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz sau khi dịch xong."),
-    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
-    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
-    review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi dịch."),
-    vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Pass 2 dùng Vision gửi ảnh (mặc định) hoặc --no-vision để OCR cục bộ + model con dịch text-only."),
-    skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
-    gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
-    clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi dịch xong 100% (mặc định: bật)."),
-    notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi dịch xong hoặc gặp lỗi (mặc định: bật)."),
-    workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song (0 = tự động theo số API key)."),
-    resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
+def _execute_translate_cli(
+    input_path: Path,
+    *,
+    output: Optional[Path],
+    lang: str,
+    api_key: Optional[str],
+    base_url: Optional[str],
+    model: Optional[str],
+    fallback_model: Optional[str],
+    story_model: Optional[str],
+    story_fallback: Optional[str],
+    prompt: Optional[str],
+    story: Optional[str],
+    tags: Optional[str],
+    story_pass: bool,
+    font: Optional[str],
+    conf: float,
+    accurate_detector: bool,
+    save_cbz: bool,
+    output_format: Optional[str],
+    seq_names: Optional[bool],
+    review_chars: bool,
+    vision: Optional[bool],
+    skip_sfx: Optional[bool],
+    gpu: Optional[bool],
+    clean_cache: Optional[bool],
+    notify: Optional[bool],
+    workers: Optional[int],
+    resume: bool,
+    retranslate_untranslated: bool = False,
 ) -> None:
-    """Dịch truyện tranh (Nhật, Hàn, Trung, Anh -> Tiếng Việt) sửa triệt để lỗi cỡ chữ, viền & đè chữ."""
     cfg = load_config()
     eff_key, eff_keys, eff_url, eff_model = _resolve_auth(api_key, base_url, model)
     eff_format = output_format or cfg.output_format
@@ -220,6 +220,9 @@ def translate(
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
     eff_notify = cfg.notify if notify is None else notify
     eff_workers = cfg.workers if workers is None else max(0, min(workers, 16))
+    job_title = "Đang tái dịch trang chưa dịch..." if retranslate_untranslated else "Đang dịch truyện..."
+    err_notif_title = "Koharu-VN · Lỗi tái dịch" if retranslate_untranslated else "Koharu-VN · Lỗi dịch truyện"
+    done_notif_title = "Koharu-VN · Tái dịch xong!" if retranslate_untranslated else "Koharu-VN · Dịch xong!"
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -227,7 +230,7 @@ def translate(
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Đang dịch truyện...", total=None)
+        task = progress.add_task(job_title, total=None)
         completed_pages = 0
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
@@ -268,6 +271,7 @@ def translate(
                 output_format=eff_format,
                 sequential_names=eff_seq,
                 vision_translate=eff_vision,
+                retranslate_untranslated=retranslate_untranslated,
                 skip_sfx=eff_skip_sfx,
                 use_gpu=eff_gpu,
                 resume=resume,
@@ -283,7 +287,7 @@ def translate(
         except (FileNotFoundError, ValueError) as exc:
             console.bell()
             send_desktop_notification(
-                "Koharu-VN · Lỗi dịch truyện",
+                err_notif_title,
                 str(exc),
                 is_error=True,
                 enabled=eff_notify,
@@ -293,7 +297,7 @@ def translate(
         except Exception as exc:
             console.bell()
             send_desktop_notification(
-                "Koharu-VN · Lỗi dịch truyện",
+                err_notif_title,
                 str(exc),
                 is_error=True,
                 enabled=eff_notify,
@@ -302,7 +306,7 @@ def translate(
 
     console.bell()
     send_desktop_notification(
-        "Koharu-VN · Dịch xong!",
+        done_notif_title,
         f"Đã hoàn tất {len(docs)} trang -> {out_dir.name}",
         enabled=eff_notify,
     )
@@ -311,6 +315,130 @@ def translate(
         console.print(f"[dim]Mẹo: Chỉnh thoại trong {out_dir / '.koharu_cache'}/*.koharu.json rồi chạy `koharu-vn rerender {out_dir}` (0 giây API).[/dim]")
     else:
         console.print("[dim]Đã tự dọn sạch `.koharu_cache` sau khi hoàn tất 100%.[/dim]")
+
+
+@app.command()
+def translate(
+    input_path: Path = typer.Argument(..., help="Ảnh, thư mục truyện, hoặc file .zip/.cbz cần dịch."),
+    output: Optional[Path] = typer.Option(None, "-o", "--output", help="Thư mục lưu ảnh đã dịch."),
+    lang: str = typer.Option("auto", "--lang", help="Ngôn ngữ gốc: auto | ja | ko | zh | en."),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="Gemini API key (hoặc ~/.koharu-vn/config.json)."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="Endpoint OpenAI-compatible tùy chọn (vd: http://127.0.0.1:8317/v1)."),
+    model: Optional[str] = typer.Option(None, "--model", help="Model PHỤ (nhanh) để dịch từng trang hoặc sáng tác thoại."),
+    fallback_model: Optional[str] = typer.Option(None, "--fallback-model", help="Model fallback cho PHỤ khi hết quota."),
+    story_model: Optional[str] = typer.Option(None, "--story-model", help="Model CHÍNH (mạnh) cho Pass 1 phân tích full cốt truyện, nhân vật & tình huống."),
+    story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback cho CHÍNH khi bị prohibit (thử 1 lượt rồi bỏ qua Pass 1)."),
+    prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô thêm cho người dịch."),
+    story: Optional[str] = typer.Option(None, "--story", help="Cốt truyện/nhân vật/lore (nhập chữ hoặc đường dẫn file .txt/.md)."),
+    tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại (vd: 'vanilla, romance' hoặc 'NTR, angst')."),
+    story_pass: bool = typer.Option(True, "--story-pass/--no-story-pass", help="Quét trước toàn bộ chương (Pass 1) để khóa nhân vật, xưng hô & cốt truyện."),
+    font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt (mali-bold, pangolin, patrick-hand, bangers, hoặc đường dẫn .ttf)."),
+    conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại (0.2 - 0.8)."),
+    accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Dùng model detector FP32 (168MB, chuẩn cao) hoặc --fast-detector INT8 (43MB)."),
+    save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz sau khi dịch xong."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp (max quality 100) | original | png | jpg."),
+    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
+    review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi dịch."),
+    vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Pass 2 dùng Vision gửi ảnh (mặc định) hoặc --no-vision để OCR cục bộ + model con dịch text-only."),
+    skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
+    gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
+    clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi dịch xong 100% (mặc định: bật)."),
+    notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi dịch xong hoặc gặp lỗi (mặc định: bật)."),
+    workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song (0 = tự động theo số API key)."),
+    resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
+) -> None:
+    """Dịch truyện tranh (Nhật, Hàn, Trung, Anh -> Tiếng Việt) sửa triệt để lỗi cỡ chữ, viền & đè chữ."""
+    _execute_translate_cli(
+        input_path,
+        output=output,
+        lang=lang,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        fallback_model=fallback_model,
+        story_model=story_model,
+        story_fallback=story_fallback,
+        prompt=prompt,
+        story=story,
+        tags=tags,
+        story_pass=story_pass,
+        font=font,
+        conf=conf,
+        accurate_detector=accurate_detector,
+        save_cbz=save_cbz,
+        output_format=output_format,
+        seq_names=seq_names,
+        review_chars=review_chars,
+        vision=vision,
+        skip_sfx=skip_sfx,
+        gpu=gpu,
+        clean_cache=clean_cache,
+        notify=notify,
+        workers=workers,
+        resume=resume,
+        retranslate_untranslated=False,
+    )
+
+
+@app.command()
+def retranslate(
+    input_path: Path = typer.Argument(..., help="Thư mục/ảnh/file .zip đã xuất tải từ Drive về (bỏ qua ảnh đã dịch, chỉ dịch lại ảnh chưa dịch)."),
+    output: Optional[Path] = typer.Option(None, "-o", "--output", help="Thư mục lưu bộ ảnh đã sửa (mặc định: <tên>_fixed)."),
+    lang: str = typer.Option("auto", "--lang", help="Ngôn ngữ gốc: auto | ja | ko | zh | en."),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="API key Gemini / DeepSeek."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="Endpoint OpenAI-compatible tùy chọn."),
+    model: Optional[str] = typer.Option(None, "--model", help="Model dịch lại (vd: gemini-3.8-flash hoặc deepseek-chat)."),
+    fallback_model: Optional[str] = typer.Option(None, "--fallback-model", help="Model fallback khi hết quota."),
+    story_model: Optional[str] = typer.Option(None, "--story-model", help="Model phụ/chính fallback."),
+    story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback khi bị prohibit."),
+    prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô thêm."),
+    story: Optional[str] = typer.Option(None, "--story", help="Cốt truyện/nhân vật/lore (chữ hoặc file .txt/.md)."),
+    tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại (vd: 'vanilla, romance')."),
+    story_pass: bool = typer.Option(False, "--story-pass/--no-story-pass", help="Có chạy Pass 1 Story Bible trước khi tái dịch không (mặc định: tắt để quét nhanh)."),
+    font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt."),
+    conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại."),
+    accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Dùng detector FP32 chuẩn cao hoặc INT8."),
+    save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz sau khi hoàn tất."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp | original | png | jpg."),
+    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự."),
+    vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Dùng Vision hay OCR cục bộ (--no-vision)."),
+    skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua SFX trên tranh."),
+    gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy ONNX trên GPU/CPU."),
+    clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa .koharu_cache sau khi hoàn tất."),
+    notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi xong/lỗi."),
+    workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API song song."),
+) -> None:
+    """Tái dịch ảnh/zip tải từ Google Drive: tự bỏ qua trang đã dịch Tiếng Việt, chỉ dịch + inpaint + chèn chữ vào trang bị sót."""
+    _execute_translate_cli(
+        input_path,
+        output=output,
+        lang=lang,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        fallback_model=fallback_model,
+        story_model=story_model,
+        story_fallback=story_fallback,
+        prompt=prompt,
+        story=story,
+        tags=tags,
+        story_pass=story_pass,
+        font=font,
+        conf=conf,
+        accurate_detector=accurate_detector,
+        save_cbz=save_cbz,
+        output_format=output_format,
+        seq_names=seq_names,
+        review_chars=False,
+        vision=vision,
+        skip_sfx=skip_sfx,
+        gpu=gpu,
+        clean_cache=clean_cache,
+        notify=notify,
+        workers=workers,
+        resume=False,
+        retranslate_untranslated=True,
+    )
 
 
 @app.command()
@@ -538,7 +666,7 @@ def models(
             console.print(mt)
 
 
-_SUBCOMMANDS = {"translate", "compose", "rerender", "rename", "models", "ui"}
+_SUBCOMMANDS = {"translate", "retranslate", "compose", "rerender", "rename", "models", "ui"}
 
 
 def _clean_cli_drop_arg(raw: str) -> str:

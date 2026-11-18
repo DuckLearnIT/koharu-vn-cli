@@ -2482,6 +2482,149 @@ def test_vision_prohibit_ocr_fallback_chain_and_untranslated_page_recovery(
         assert not np.array_equal(out_arr, clean_arr)
 
 
+def test_retranslate_drive_skips_vietnamese_and_fixes_untranslated(tmp_path: Path, monkeypatch) -> None:
+    """Verify /retranslate skips already-translated Vietnamese pages/bubbles and fixes untranslated ones."""
+    from koharu_vn_cli import cli
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import classify_retranslate_regions, run_retranslate_pipeline
+    from koharu_vn_cli.tui import parse_natural_intent
+
+    # Unit-check classifier directly: Vietnamese Latin skipped, pure floating SFX skipped, CJK caught
+    regs_cls = [
+        TextRegionItem(id=1, kind="bubble", text_bbox=(10, 10, 80, 50)),
+        TextRegionItem(id=2, kind="bubble", text_bbox=(10, 60, 80, 100)),
+        TextRegionItem(id=3, kind="floating", text_bbox=(10, 110, 80, 150)),
+        TextRegionItem(id=4, kind="bubble", text_bbox=(10, 160, 80, 200)),
+    ]
+    cls_res = classify_retranslate_regions(
+        regs_cls,
+        {
+            1: "suNe.cuA",       # simulated MangaOCR output on Vietnamese bubble
+            2: "いや......",      # short dark-bg Vietnamese interjection misread as 2 kana on VI page
+            3: "ドキッ",          # pure floating SFX
+            4: "本当に出すの?",    # genuinely missed Japanese bubble (cjk >= 3, latin == 0)
+        },
+        skip_sfx=True,
+    )
+    assert cls_res == {4}
+
+    # Natural Vietnamese intent detection
+    act, p_str, opts = parse_natural_intent('tái dịch "C:/tmp/drive_dl.zip" xưng hô anh - em')
+    assert act == "retranslate" and p_str == "C:/tmp/drive_dl.zip" and "anh - em" in opts["prompt"]
+
+    drive_dir = tmp_path / "from_drive"
+    drive_dir.mkdir()
+    # Page 1: already translated Vietnamese (with distinctive marker corner pixel)
+    img1 = np.full((240, 240, 3), 245, dtype=np.uint8)
+    img1[0:10, 0:10] = (12, 34, 56)
+    Image.fromarray(img1).save(drive_dir / "001.png")
+
+    # Page 2: untranslated Japanese page blocked previously
+    img2 = np.full((240, 240, 3), 255, dtype=np.uint8)
+    img2[50:90, 50:140] = (15, 15, 15)
+    Image.fromarray(img2).save(drive_dir / "002.png")
+
+    # Page 3: partial page -> bubble 1 already Vietnamese (top), bubble 2 still Japanese (bottom)
+    img3 = np.full((240, 240, 3), 255, dtype=np.uint8)
+    img3[20:55, 40:140] = (30, 120, 200)   # already-rendered bubble 1 marker
+    img3[145:185, 50:140] = (15, 15, 15)   # untranslated Japanese ink in bubble 2
+    Image.fromarray(img3).save(drive_dir / "003.png")
+
+    inpainted_masks: list[tuple[int, int]] = []
+    llm_calls: list[tuple[str, int]] = []
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            # Detect by marker pixel in img3[25, 45]
+            if tuple(rgb[25, 45]) == (30, 120, 200):
+                mask[20:55, 40:140] = 255
+                mask[145:185, 50:140] = 255
+                return [
+                    DetectedRegion((40, 20, 140, 55), (30, 15, 150, 60), None, True, False, 0.95),
+                    DetectedRegion((50, 145, 140, 185), (40, 135, 150, 195), None, True, False, 0.95),
+                ], mask
+            mask[50:90, 50:140] = 255
+            return [DetectedRegion((40, 40, 150, 110), (30, 30, 160, 120), None, True, False, 0.95)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            inpainted_masks.append((int(np.count_nonzero(mask[:100, :])), int(np.count_nonzero(mask[100:, :]))))
+            out = rgb.copy()
+            out[mask > 127] = (255, 255, 255)
+            return out
+
+    class FakeOcr:
+        def recognize_regions(self, rgb, regions):
+            if tuple(rgb[5, 5]) == (12, 34, 56):
+                return {r.id: "Suongqua...dungma!" for r in regions}  # Page 1 already Vietnamese
+            if tuple(rgb[25, 45]) == (30, 120, 200):
+                return {1: "Anhyeuemma", 2: "本当に出すの?"}          # Page 3 partial
+            return {1: "やめて…"}                                       # Page 2 untranslated
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            return FakeOcr()
+
+    def fake_ocr_call(self, system_prompt, user_prompt, images, temperature=0.3):
+        llm_calls.append((self.model, len(images)))
+        if "[Trang 2]" in user_prompt and "[Trang 3]" in user_prompt:
+            return {
+                "pages": [
+                    {"page": 2, "page_summary": "p2", "items": [{"id": 1, "source_text": "やめて…", "vietnamese": "Đừng mà…"}]},
+                    {"page": 3, "page_summary": "p3", "items": [{"id": 2, "source_text": "本当に出すの?", "vietnamese": "Bắn vào trong thật hả?"}]},
+                ]
+            }
+        return {
+            "page_summary": "single",
+            "items": [
+                {
+                    "id": 1 if "やめて" in user_prompt else 2,
+                    "source_text": "やめて…" if "やめて" in user_prompt else "本当に出すの?",
+                    "vietnamese": "Đừng mà…" if "やめて" in user_prompt else "Bắn vào trong thật hả?",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_ocr_call)
+
+    out_dir, docs = run_retranslate_pipeline(
+        drive_dir,
+        model="deepseek-chat",
+        api_key="sk-fake-deepseek",
+        output_format="png",
+        clean_cache=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+
+    assert out_dir == drive_dir.parent / "from_drive_fixed"
+    assert len(docs) == 3
+    # Page 1 skipped: exact marker pixels untouched, zero LLM vision calls
+    out1 = np.array(Image.open(out_dir / "001.png").convert("RGB"))
+    assert np.array_equal(out1, img1)
+    assert docs[0].regions == []
+    # Only Page 2 & Page 3 reached the LLM (text-only 0 images) and inpainter (2 calls, not 3!)
+    assert len(inpainted_masks) == 2
+    assert all(img_cnt == 0 for _, img_cnt in llm_calls)
+    # Page 3 only inpainted bottom bubble #2 (0 top mask pixels), leaving bubble #1 (30, 120, 200) untouched!
+    assert inpainted_masks[1][0] == 0 and inpainted_masks[1][1] > 0
+    out3 = np.array(Image.open(out_dir / "003.png").convert("RGB"))
+    assert tuple(out3[25, 45]) == (30, 120, 200)
+    assert docs[1].regions[0].translated_text == "Đừng mà…"
+    assert docs[2].regions[0].id == 2 and docs[2].regions[0].translated_text == "Bắn vào trong thật hả?"
+
+    # CLI `retranslate` command parses cleanly with help
+    res_help = CliRunner().invoke(cli.app, ["retranslate", "--help"])
+    assert res_help.exit_code == 0 and "Google Drive" in res_help.stdout
+
+
 
 
 
