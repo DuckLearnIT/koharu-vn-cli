@@ -77,7 +77,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
     SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
-    SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật sau Pass 1 (tự xác nhận sau 60s)"),
+    SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật sau Pass 1 (tự xác nhận sau 10s)"),
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
     SlashSpec("/cache", "[clean|keep]", "Tự xóa .koharu_cache sau khi dịch xong 100% (mặc định: tự xóa)"),
@@ -627,7 +627,7 @@ class StoryBibleReviewModal(ModalScreen[StoryBible | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Giữ nguyên")]
 
-    def __init__(self, bible: StoryBible, *, timeout_seconds: float = 60.0) -> None:
+    def __init__(self, bible: StoryBible, *, timeout_seconds: float = 10.0) -> None:
         super().__init__()
         self.bible = bible
         self._timeout_seconds = max(0, int(round(timeout_seconds)))
@@ -963,7 +963,7 @@ class KoharuTUI(App[None]):
         self._popup_mode: str = ""  # "slash" | "path" | ""
         self._popup_items: list[tuple[str, str]] = []  # (insert_text, kind)
         self._popup_navigated = False
-        self._review_timeout_seconds: float = 60.0
+        self._review_timeout_seconds: float = 10.0
 
     def compose(self) -> ComposeResult:
         yield Static("", id="topbar", markup=True)

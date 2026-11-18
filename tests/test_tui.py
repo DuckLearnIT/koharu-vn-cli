@@ -208,13 +208,13 @@ def test_tui_zip_drop_intent_and_review_timeout_and_notify(tmp_path: Path, monke
     assert "Koharu &lt;Test&gt;" in ps_src
     assert "Lỗi &amp; timeout &gt; 60s" in ps_src
 
-    # 3. StoryBibleReviewModal defaults to 60s idle timeout & auto-confirms when idle
+    # 3. StoryBibleReviewModal defaults to 10s idle timeout & auto-confirms when idle
     bible = StoryBible(
         source_game="Blue Archive",
         characters=[CharacterProfile(name="Hoshino", appearance="tóc hồng", pronoun_rules="tớ - cậu")],
     )
     default_modal = StoryBibleReviewModal(bible)
-    assert default_modal._timeout_seconds == 60
+    assert default_modal._timeout_seconds == 10
 
     results: list[StoryBible | None] = []
     timed_out_flag: list[bool] = []

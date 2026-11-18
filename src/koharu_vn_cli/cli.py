@@ -75,7 +75,7 @@ def _cli_prompt_with_timeout(
     prompt_text: str,
     default: str = "",
     *,
-    timeout_seconds: float = 60.0,
+    timeout_seconds: float = 10.0,
 ) -> tuple[str, bool]:
     """Read interactive CLI input with inactivity timeout; returns `(value, timed_out)`."""
     if timeout_seconds <= 0 or not sys.stdin or not sys.stdin.isatty():
@@ -134,9 +134,9 @@ def _cli_confirm_story_bible(
     bible: StoryBible,
     progress: Progress,
     *,
-    timeout_seconds: float = 60.0,
+    timeout_seconds: float = 10.0,
 ) -> StoryBible:
-    """Allow terminal user to inspect & fix detected game/character names (auto-confirms after 60s idle)."""
+    """Allow terminal user to inspect & fix detected game/character names (auto-confirms after 10s idle)."""
     progress.stop()
     try:
         console.print("\n[bold magenta]=== Kiểm tra Game & Nhân vật (Pass 1) ===[/bold magenta]")
@@ -150,7 +150,7 @@ def _cli_confirm_story_bible(
             timeout_seconds=timeout_seconds,
         )
         if timed_out:
-            console.print("[yellow]⏱ Hết 60s không phản hồi -> tự động xác nhận & tiếp tục![/yellow]")
+            console.print(f"[yellow]⏱ Hết {int(timeout_seconds)}s không phản hồi -> tự động xác nhận & tiếp tục![/yellow]")
             return bible
 
         updated_chars: list[CharacterProfile] = []
@@ -160,7 +160,7 @@ def _cli_confirm_story_bible(
                 f"    Tên nhân vật #{idx}", default=ch.name, timeout_seconds=timeout_seconds
             )
             if t1:
-                console.print("[yellow]⏱ Hết 60s không phản hồi -> tự động xác nhận các mục còn lại![/yellow]")
+                console.print(f"[yellow]⏱ Hết {int(timeout_seconds)}s không phản hồi -> tự động xác nhận các mục còn lại![/yellow]")
                 updated_chars.extend(bible.characters[idx - 1 :])
                 return bible.model_copy(update={"source_game": new_game.strip(), "characters": updated_chars})
             new_pron, t2 = _cli_prompt_with_timeout(
@@ -169,7 +169,7 @@ def _cli_confirm_story_bible(
             if t2:
                 updated_chars.append(ch.model_copy(update={"name": new_name.strip() or ch.name}))
                 updated_chars.extend(bible.characters[idx:])
-                console.print("[yellow]⏱ Hết 60s không phản hồi -> tự động xác nhận các mục còn lại![/yellow]")
+                console.print(f"[yellow]⏱ Hết {int(timeout_seconds)}s không phản hồi -> tự động xác nhận các mục còn lại![/yellow]")
                 return bible.model_copy(update={"source_game": new_game.strip(), "characters": updated_chars})
             updated_chars.append(
                 ch.model_copy(update={"name": new_name.strip() or ch.name, "pronoun_rules": new_pron.strip()})
