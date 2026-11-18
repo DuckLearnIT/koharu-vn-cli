@@ -58,9 +58,20 @@ class SlashSpec:
     desc: str
 
 
+@dataclass
+class QueuedJob:
+    mode: str  # "translate" | "retranslate" | "compose" | "rerender" | "rename"
+    input_path: Path
+    prompt: str = ""
+    tags: str = ""
+    resume: bool = False
+    in_place: bool = False
+
+
 SLASH_COMMANDS: tuple[SlashSpec, ...] = (
-    SlashSpec("/translate", "<đường_dẫn|.zip> [--resume]", "Dịch truyện tranh / file .zip / .cbz (Nhật/Hàn/Trung/Anh → Tiếng Việt)"),
+    SlashSpec("/translate", "<đường_dẫn|.zip> [--resume]", "Dịch truyện tranh / file .zip / .cbz (tự xếp queue nếu đang chạy)"),
     SlashSpec("/retranslate", "<đường_dẫn|.zip>", "Tái dịch ảnh/zip tải từ Drive (bỏ qua ảnh đã dịch, chỉ dịch lại ảnh chưa dịch)"),
+    SlashSpec("/queue", "<đường_dẫn... | list | clear | start | remove N>", "Hàng đợi dịch liên tục nhiều tác phẩm kế tiếp nhau"),
     SlashSpec("/compose", "<đường_dẫn> [--resume]", "Tự sáng tác thoại cho Artist CG không lời"),
     SlashSpec("/resume", "[đường_dẫn]", "Chạy tiếp tác vụ bị dừng/lỗi từ trang chưa xong (bỏ qua trang đã dịch)"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
@@ -201,6 +212,25 @@ def extract_path_and_remainder(text: str) -> tuple[str | None, str]:
             return str(Path(cand).expanduser()), rem
 
     return None, cleaned
+
+
+def extract_multiple_paths(raw: str) -> list[str]:
+    """Extract 1 or more drag-and-drop / quoted / Windows paths from a single `/queue` command line."""
+    remaining = raw.strip()
+    found: list[str] = []
+    seen: set[str] = set()
+    while remaining:
+        p, next_rem = extract_path_and_remainder(remaining)
+        if not p:
+            break
+        norm = str(p)
+        if norm not in seen:
+            seen.add(norm)
+            found.append(norm)
+        if next_rem == remaining:
+            break
+        remaining = next_rem.strip()
+    return found
 
 
 def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
@@ -924,6 +954,7 @@ class KoharuTUI(App[None]):
         self.model_cache = ModelCache()
         self.cancel_event = threading.Event()
         self.is_running_job = False
+        self.job_queue: list[QueuedJob] = []
         self._job_started_at: float = 0.0
         self._spinner_idx: int = 0
         self._last_job_status: str = "Đang rảnh"
@@ -1045,9 +1076,15 @@ class KoharuTUI(App[None]):
         out_str = self.cfg.last_output_dir or "Chưa có"
         if len(out_str) > 32:
             out_str = "..." + out_str[-29:]
+        q_lbl = (
+            f"[bold cyan]{len(self.job_queue)} tác phẩm[/bold cyan] (kế: {self.job_queue[0].input_path.name[:22]})"
+            if self.job_queue
+            else "[dim]trống[/dim]"
+        )
         self.query_one("#sb-resources", Static).update(
             f"ONNX Mask: {'[green]Đã cache[/green]' if ctd_cached else '[yellow]Tự tải khi chạy[/yellow]'}\n"
             f"Fonts: [green]{len(available_fonts())} font Việt[/green]\n"
+            f"Hàng đợi: {q_lbl}\n"
             f"Config: [dim]~/.koharu-vn/config.json[/dim]\n"
             f"Output gần nhất:\n[cyan]{out_str}[/cyan]"
         )
@@ -1056,9 +1093,10 @@ class KoharuTUI(App[None]):
         if self.is_running_job:
             spin = self._SPINNER_FRAMES[self._spinner_idx % len(self._SPINNER_FRAMES)]
             elapsed = self._format_elapsed()
-            job_txt = f"[yellow]{spin} Đang chạy ({elapsed}) — Esc để hủy[/yellow]"
+            q_hint = f" · Hàng đợi: {len(self.job_queue)}" if self.job_queue else ""
+            job_txt = f"[yellow]{spin} Đang chạy ({elapsed}){q_hint} — Esc để hủy[/yellow]"
         else:
-            job_txt = "[green]Sẵn sàng[/green]"
+            job_txt = f"[green]Sẵn sàng[/green]{f' · Queue: {len(self.job_queue)}' if self.job_queue else ''}"
         status_strip.update(
             f"{job_txt}  │  Gõ [bold]/[/bold] xem lệnh  •  [bold]@[/bold] duyệt file  •  [bold]F2[/bold] đổi kiểu CG  •  [bold]Ctrl+P[/bold] bảng lệnh"
         )
@@ -1552,6 +1590,8 @@ class KoharuTUI(App[None]):
                     RunJobModal("retranslate", "", self.cfg.custom_prompt, initial_tags=self.cfg.tags),
                     lambda res: self._launch_retranslate(Path(res[0]), res[1], res[2]) if res else None,
                 )
+        elif cmd in {"/queue", "/q"}:
+            self._handle_queue_command(rest)
         elif cmd == "/compose":
             resume_flag = "--resume" in rest
             cleaned_rest = rest.replace("--resume", "").strip()
@@ -2047,10 +2087,7 @@ class KoharuTUI(App[None]):
 
     # -------------------- Background Workers --------------------
 
-    def _require_job_idle_and_key(self, needs_llm: bool = True) -> bool:
-        if self.is_running_job:
-            self._log_ai("Đang có một tác vụ chạy. Nhấn `Esc` nếu muốn hủy trước khi chạy mới.", style="yellow")
-            return False
+    def _ensure_llm_ready(self, needs_llm: bool = True) -> bool:
         if needs_llm and not self.cfg.effective_api_key() and not self.cfg.base_url:
             self._log_ai(
                 "Chưa có `GEMINI_API_KEY`! Mở hộp thoại `/key` để dán API key (hoặc base URL proxy) trước nhé.",
@@ -2061,6 +2098,139 @@ class KoharuTUI(App[None]):
             self.push_screen(KeySetupModal(saved_raw, saved_ds, self.cfg.base_url), self._on_key_saved)
             return False
         return True
+
+    def _require_job_idle_and_key(self, needs_llm: bool = True) -> bool:
+        if self.is_running_job:
+            self._log_ai("Đang có một tác vụ chạy. Nhấn `Esc` nếu muốn hủy trước khi chạy mới.", style="yellow")
+            return False
+        return self._ensure_llm_ready(needs_llm=needs_llm)
+
+    def _enqueue_job(self, job: QueuedJob) -> None:
+        self.job_queue.append(job)
+        self._refresh_chrome()
+        mode_names = {
+            "translate": "Dịch",
+            "retranslate": "Tái dịch",
+            "compose": "Sáng tác CG",
+            "rerender": "Rerender",
+            "rename": "Đổi tên WebP",
+        }
+        lbl = mode_names.get(job.mode, job.mode)
+        self._log_ai(
+            f"📥 [bold cyan]Đã thêm vào hàng đợi (#{len(self.job_queue)})[/bold cyan]: "
+            f"[bold]{job.input_path.name}[/bold] ({lbl}) — sẽ tự động chạy khi tác phẩm hiện tại xong.",
+        )
+
+    def _dispatch_job_spec(self, job: QueuedJob) -> None:
+        if job.mode == "translate":
+            self._launch_translate(job.input_path, job.prompt, job.tags, resume=job.resume)
+        elif job.mode == "retranslate":
+            self._launch_retranslate(job.input_path, job.prompt, job.tags)
+        elif job.mode == "compose":
+            self._launch_compose(job.input_path, job.prompt, job.tags, resume=job.resume)
+        elif job.mode == "rerender":
+            self._launch_rerender(job.input_path)
+        elif job.mode == "rename":
+            self._launch_rename(job.input_path, in_place=job.in_place)
+
+    def _on_worker_finished(self, *, cancelled: bool = False) -> None:
+        if cancelled:
+            if self.job_queue:
+                self._log_ai(
+                    f"⏸ Đã tạm dừng hàng đợi (còn [bold]{len(self.job_queue)}[/bold] tác phẩm chờ). "
+                    "Gõ `/queue start` để chạy tiếp hoặc `/queue clear` để xóa.",
+                    style="yellow",
+                )
+            self._refresh_chrome()
+            return
+        if self.job_queue and not self.is_running_job:
+            next_job = self.job_queue.pop(0)
+            self._refresh_chrome()
+            self._log_ai(
+                f"▶ [bold cyan]Hàng đợi: Tự động chuyển sang tác phẩm tiếp theo[/bold cyan] "
+                f"[bold]{next_job.input_path.name}[/bold] (còn {len(self.job_queue)} chờ)..."
+            )
+            self._dispatch_job_spec(next_job)
+
+    def _show_queue_table(self) -> None:
+        if not self.job_queue:
+            self._log_ai(
+                "Hàng đợi đang trống. Kéo thả nhiều thư mục/file `.zip` hoặc dùng `/queue <đường_dẫn_1> <đường_dẫn_2>` (hoặc chạy `/translate` khi đang dịch tác phẩm khác để tự xếp hàng).",
+                style="dim",
+            )
+            return
+        tbl = Table(title=f"Hàng đợi ({len(self.job_queue)} tác phẩm)", box=box.ROUNDED, expand=True)
+        tbl.add_column("#", style="cyan", width=4)
+        tbl.add_column("Chế độ", style="magenta", width=13)
+        tbl.add_column("Tác phẩm", style="bold white")
+        tbl.add_column("Ghi chú", style="dim")
+        for idx, j in enumerate(self.job_queue, start=1):
+            tbl.add_row(str(idx), j.mode, str(j.input_path), j.prompt or "-")
+        self.query_one("#stream", RichLog).write(tbl)
+
+    def _handle_queue_command(self, rest: str) -> None:
+        arg = rest.strip()
+        low = arg.lower()
+        if not arg or low == "list":
+            self._show_queue_table()
+            return
+        if low in {"clear", "reset"}:
+            cnt = len(self.job_queue)
+            self.job_queue.clear()
+            self._refresh_chrome()
+            self._log_ai(f"Đã xóa {cnt} tác phẩm khỏi hàng đợi.")
+            return
+        if low in {"start", "run", "next"}:
+            if self.is_running_job:
+                self._log_ai("Tác phẩm hiện tại đang chạy; hàng đợi sẽ tự động chạy tiếp khi xong.", style="cyan")
+            elif not self.job_queue:
+                self._log_ai("Hàng đợi đang trống.", style="yellow")
+            else:
+                self._on_worker_finished(cancelled=False)
+            return
+        m_rm = re.match(r"^(?:remove|rm|del|delete)\s+(\d+)$", low)
+        if m_rm:
+            pos = int(m_rm.group(1))
+            if 1 <= pos <= len(self.job_queue):
+                removed = self.job_queue.pop(pos - 1)
+                self._refresh_chrome()
+                self._log_ai(f"Đã gỡ #{pos} ([bold]{removed.input_path.name}[/bold]) khỏi hàng đợi.")
+            else:
+                self._log_ai(f"Không có mục #{pos} trong hàng đợi.", style="yellow")
+            return
+
+        mode = "translate"
+        cleaned = arg
+        for flag, mname in (
+            ("--retranslate", "retranslate"),
+            ("--compose", "compose"),
+            ("--rerender", "rerender"),
+            ("--rename", "rename"),
+        ):
+            if flag in cleaned:
+                mode = mname
+                cleaned = cleaned.replace(flag, " ").strip()
+                break
+
+        paths = extract_multiple_paths(cleaned)
+        if not paths:
+            self._log_ai("Không tìm thấy đường dẫn hợp lệ cho `/queue`. Ví dụ: `/queue D:\\truyen1.zip D:\\truyen2.zip`", style="yellow")
+            return
+        if mode in {"translate", "retranslate", "compose"} and not self._ensure_llm_ready(needs_llm=True):
+            return
+
+        added = 0
+        for p_str in paths:
+            p_obj = Path(p_str)
+            if not p_obj.exists():
+                self._log_ai(f"Bỏ qua đường dẫn không tồn tại: [red]{p_obj}[/red]", style="yellow")
+                continue
+            job = QueuedJob(mode=mode, input_path=p_obj, tags=self.cfg.tags)
+            if not self.is_running_job and added == 0 and not self.job_queue:
+                self._dispatch_job_spec(job)
+            else:
+                self._enqueue_job(job)
+            added += 1
 
     _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
@@ -2200,10 +2370,21 @@ class KoharuTUI(App[None]):
         resume: bool = False,
         retranslate_untranslated: bool = False,
     ) -> None:
-        if not self._require_job_idle_and_key(needs_llm=True):
+        if not self._ensure_llm_ready(needs_llm=True):
             return
         if not input_path.exists():
             self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            return
+        if self.is_running_job:
+            self._enqueue_job(
+                QueuedJob(
+                    mode="retranslate" if retranslate_untranslated else "translate",
+                    input_path=input_path,
+                    prompt=extra_prompt,
+                    tags=extra_tags,
+                    resume=resume,
+                )
+            )
             return
         self.cfg.last_input_path = str(input_path)
         self.cfg.last_job_mode = "retranslate" if retranslate_untranslated else "translate"
@@ -2230,10 +2411,21 @@ class KoharuTUI(App[None]):
     def _launch_compose(
         self, input_path: Path, extra_prompt: str = "", extra_tags: str = "", *, resume: bool = False
     ) -> None:
-        if not self._require_job_idle_and_key(needs_llm=True):
+        if not self._ensure_llm_ready(needs_llm=True):
             return
         if not input_path.exists():
             self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            return
+        if self.is_running_job:
+            self._enqueue_job(
+                QueuedJob(
+                    mode="compose",
+                    input_path=input_path,
+                    prompt=extra_prompt,
+                    tags=extra_tags,
+                    resume=resume,
+                )
+            )
             return
         self.cfg.last_input_path = str(input_path)
         self.cfg.last_job_mode = "compose"
@@ -2241,7 +2433,8 @@ class KoharuTUI(App[None]):
         self._start_compose(input_path, extra_prompt, extra_tags, resume=resume)
 
     def _launch_rerender(self, output_dir: Path) -> None:
-        if not self._require_job_idle_and_key(needs_llm=False):
+        if self.is_running_job:
+            self._enqueue_job(QueuedJob(mode="rerender", input_path=output_dir))
             return
         self._start_rerender(output_dir)
 
@@ -2265,6 +2458,7 @@ class KoharuTUI(App[None]):
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
 
+        was_cancelled = False
         try:
             out_dir, docs = run_translate_pipeline(
                 input_path,
@@ -2310,6 +2504,7 @@ class KoharuTUI(App[None]):
                 f"Đã hoàn tất {len(docs)} trang -> {out_dir.name}",
             )
         except PipelineCancelledError:
+            was_cancelled = True
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
             self.call_from_thread(self._log_ai, "Tác vụ đã được hủy theo yêu cầu. Gõ `/resume` để chạy tiếp.", "yellow")
         except Exception as exc:
@@ -2320,6 +2515,8 @@ class KoharuTUI(App[None]):
                 "red",
             )
             self._notify_result("Koharu-VN · Lỗi dịch truyện", str(exc), is_error=True)
+        finally:
+            self.call_from_thread(self._on_worker_finished, cancelled=was_cancelled)
 
     @work(thread=True)
     def _start_compose(
@@ -2333,6 +2530,7 @@ class KoharuTUI(App[None]):
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
 
+        was_cancelled = False
         try:
             out_dir, docs = run_compose_pipeline(
                 input_path,
@@ -2370,6 +2568,7 @@ class KoharuTUI(App[None]):
                 f"Đã hoàn tất {len(docs)} ảnh CG -> {out_dir.name}",
             )
         except PipelineCancelledError:
+            was_cancelled = True
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
             self.call_from_thread(self._log_ai, "Tác vụ đã được hủy. Gõ `/resume` để chạy tiếp.", "yellow")
         except Exception as exc:
@@ -2380,13 +2579,15 @@ class KoharuTUI(App[None]):
                 "red",
             )
             self._notify_result("Koharu-VN · Lỗi sáng tác CG", str(exc), is_error=True)
+        finally:
+            self.call_from_thread(self._on_worker_finished, cancelled=was_cancelled)
 
     def _launch_rename(self, input_path: Path, in_place: bool = False) -> None:
-        if self.is_running_job:
-            self._log_ai("Đang có tác vụ khác chạy. Hãy chờ xong hoặc nhấn ESC để hủy.", style="yellow")
-            return
         if not input_path.exists():
             self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            return
+        if self.is_running_job:
+            self._enqueue_job(QueuedJob(mode="rename", input_path=input_path, in_place=in_place))
             return
         self._start_rename(input_path, in_place=in_place)
 
@@ -2394,6 +2595,7 @@ class KoharuTUI(App[None]):
     def _start_rename(self, input_path: Path, in_place: bool = False) -> None:
         self.cancel_event.clear()
         self.call_from_thread(self._set_job_ui, True, f"Đổi tên & nén WebP 100%: {input_path.name}", 10.0)
+        was_cancelled = False
         try:
             out_dir, files = pack_images_to_webp(
                 input_path,
@@ -2408,15 +2610,21 @@ class KoharuTUI(App[None]):
                 f"[bold green]Đã đổi tên 001..{len(files):03d}.webp (max quality 100)![/bold green] Lưu tại: [cyan]{out_dir}[/cyan]",
             )
             self._notify_result("Koharu-VN · Đổi tên WebP xong!", f"{len(files)} ảnh -> {out_dir.name}")
+        except PipelineCancelledError:
+            was_cancelled = True
+            self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(self._log_ai, f"Lỗi khi đổi tên & chuyển WebP: [red]{exc}[/red]", "red")
             self._notify_result("Koharu-VN · Lỗi đóng gói WebP", str(exc), is_error=True)
+        finally:
+            self.call_from_thread(self._on_worker_finished, cancelled=was_cancelled)
 
     @work(thread=True)
     def _start_rerender(self, output_dir: Path) -> None:
         self.cancel_event.clear()
         self.call_from_thread(self._set_job_ui, True, f"Rerender: {output_dir.name}", 10.0)
+        was_cancelled = False
         try:
             docs = run_rerender_pipeline(
                 output_dir,
@@ -2431,10 +2639,15 @@ class KoharuTUI(App[None]):
                 f"[bold green]Đã render lại {len(docs)} trang (0 giây API)![/bold green] Tại: [cyan]{output_dir}[/cyan]",
             )
             self._notify_result("Koharu-VN · Rerender xong!", f"{len(docs)} trang tại {output_dir.name}")
+        except PipelineCancelledError:
+            was_cancelled = True
+            self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(self._log_ai, f"Lỗi khi rerender: [red]{exc}[/red]", "red")
             self._notify_result("Koharu-VN · Lỗi rerender", str(exc), is_error=True)
+        finally:
+            self.call_from_thread(self._on_worker_finished, cancelled=was_cancelled)
 
     @work(thread=True)
     def _warmup_models_worker(self) -> None:

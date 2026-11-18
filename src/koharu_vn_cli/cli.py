@@ -666,7 +666,81 @@ def models(
             console.print(mt)
 
 
-_SUBCOMMANDS = {"translate", "retranslate", "compose", "rerender", "rename", "models", "ui"}
+@app.command()
+def queue(
+    paths: list[Path] = typer.Argument(..., help="Danh sách nhiều thư mục hoặc file .zip/.cbz cần dịch liên tiếp."),
+    retranslate: bool = typer.Option(False, "--retranslate", help="Dùng chế độ tái dịch (bỏ qua ảnh đã có chữ Việt, chỉ dịch ảnh lỗi/chưa dịch)."),
+    lang: str = typer.Option("auto", "--lang", help="Ngôn ngữ gốc: auto | ja | ko | zh | en."),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="API key Gemini / DeepSeek."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="Endpoint OpenAI-compatible tùy chọn."),
+    model: Optional[str] = typer.Option(None, "--model", help="Model PHỤ (nhanh) dịch từng trang."),
+    fallback_model: Optional[str] = typer.Option(None, "--fallback-model", help="Model fallback cho PHỤ khi hết quota."),
+    story_model: Optional[str] = typer.Option(None, "--story-model", help="Model CHÍNH (mạnh) cho Pass 1."),
+    story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback cho CHÍNH khi bị prohibit."),
+    prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô chung cho cả hàng chờ."),
+    tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại chung cho hàng chờ."),
+    story_pass: bool = typer.Option(True, "--story-pass/--no-story-pass", help="Quét cốt truyện Pass 1 trước khi dịch."),
+    font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt."),
+    conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại (0.2 - 0.8)."),
+    accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Chọn model detector FP32 hoặc INT8."),
+    save_cbz: bool = typer.Option(False, "--save-cbz", help="Đóng gói thêm file .cbz sau mỗi tác phẩm."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: webp | original | png | jpg."),
+    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự."),
+    vision: Optional[bool] = typer.Option(None, "--vision/--no-vision", help="Dùng Vision hay OCR cục bộ + model text."),
+    skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX."),
+    gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy ONNX/OCR trên GPU hay CPU."),
+    clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa .koharu_cache sau mỗi tác phẩm."),
+    notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows sau mỗi tác phẩm."),
+    workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song."),
+    resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
+) -> None:
+    """Dịch liên tiếp nhiều tác phẩm trong hàng chờ từ đầu đến cuối."""
+    valid_paths = [p for p in paths if p.exists()]
+    missing = [p for p in paths if not p.exists()]
+    for m in missing:
+        console.print(f"[yellow]Bỏ qua đường dẫn không tồn tại: {m}[/yellow]")
+    if not valid_paths:
+        console.print("[red]Không có tác phẩm hợp lệ nào trong hàng chờ.[/red]")
+        raise typer.Exit(code=1)
+
+    total = len(valid_paths)
+    console.print(f"[bold cyan]Hàng chờ gồm {total} tác phẩm — sẽ chạy tuần tự từng bộ.[/bold cyan]")
+    for idx, p in enumerate(valid_paths, start=1):
+        console.print(f"\n[bold magenta]>>> Hàng chờ [{idx}/{total}]: {p.name}[/bold magenta]")
+        _execute_translate_cli(
+            p,
+            output=None,
+            lang=lang,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            fallback_model=fallback_model,
+            story_model=story_model,
+            story_fallback=story_fallback,
+            prompt=prompt,
+            story=None,
+            tags=tags,
+            story_pass=False if retranslate else story_pass,
+            font=font,
+            conf=conf,
+            accurate_detector=accurate_detector,
+            save_cbz=save_cbz,
+            output_format=output_format,
+            seq_names=seq_names,
+            review_chars=False,
+            vision=vision,
+            skip_sfx=skip_sfx,
+            gpu=gpu,
+            clean_cache=clean_cache,
+            notify=notify,
+            workers=workers,
+            resume=resume,
+            retranslate_untranslated=retranslate,
+        )
+    console.print(f"\n[bold green]✓ Đã hoàn tất toàn bộ {total}/{total} tác phẩm trong hàng chờ![/bold green]")
+
+
+_SUBCOMMANDS = {"translate", "retranslate", "queue", "compose", "rerender", "rename", "models", "ui"}
 
 
 def _clean_cli_drop_arg(raw: str) -> str:

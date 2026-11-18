@@ -949,13 +949,14 @@ def run_translate_pipeline(
         ) -> list[TextRegionItem]:
             fixed: list[TextRegionItem] = []
             for item in items:
-                if skip_sfx and item.kind == "floating" and looks_like_floating_sfx(item.source_text):
+                eff_src = ((ocr_texts or {}).get(item.id, "") or item.source_text or "").strip()
+                if skip_sfx and item.kind == "floating" and looks_like_floating_sfx(eff_src):
                     item = item.model_copy(update={"is_sfx": True, "translated_text": ""})
                 if skip_sfx and item.is_sfx:
                     fixed.append(item.model_copy(update={"translated_text": ""}))
                     continue
                 if region_needs_translation(item):
-                    src_key = normalize_source_key((ocr_texts or {}).get(item.id, "") or item.source_text)
+                    src_key = normalize_source_key(eff_src)
                     cached_vn = mem_snapshot.get(src_key, "")
                     if cached_vn:
                         item = item.model_copy(update={"translated_text": cached_vn})

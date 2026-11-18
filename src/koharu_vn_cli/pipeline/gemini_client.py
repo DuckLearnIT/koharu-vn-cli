@@ -456,12 +456,15 @@ def _format_tags_block(tags: str | None) -> str:
 
 _CJK_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 _KANA_HANGUL_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af]")
-_PURE_KATAKANA_RE = re.compile(r"^[\u30a0-\u30ffーッンヴ]+$")
+_PURE_KATAKANA_RE = re.compile(r"^[\u3040-\u30ffーッンヴ]+$")
 _SFX_STEMS_RE = re.compile(
     r"^(?:"
     r"ドキ|ドク|ビク|ピタ|ツル|ニュル|ヌル|ヌチ|グチュ|グチョ|ズチュ|ズボ|ジュポ|ピチャ|"
     r"ドピュ|ビュル|ペチ|パチ|パキ|バキ|ガタ|カチ|ギシ|ゴゴ|ザワ|ゾク|シク|キラ|"
-    r"ド[ンー]|バ[ンー]|パ[ンー]|ポ[ンヨ]|ギ[ュヤ]|ズ[ンボ]"
+    r"どき|どく|びく|ぴた|つる|にゅる|ぬる|ぬち|ぐちゅ|ぐちょ|ずちゅ|ずぼ|じゅぽ|ぴちゃ|"
+    r"どぴゅ|びゅる|ぺち|ぱち|ぱき|ばき|がた|かち|ぎし|ごご|ざわ|ぞく|しく|きら|ぽよん|ずっぽ|"
+    r"ド[ンー]|バ[ンー]|パ[ンー]|ポ[ンヨ]|ギ[ュヤ]|ズ[ンボ]|"
+    r"ど[んー]|ば[んー]|ぱ[んー]|ぽ[んよ]|ぎ[ゅや]|ず[んぼ]"
     r")",
 )
 _VN_TEXT_KEYS = ("vietnamese", "vi", "viet", "translated", "translated_text", "translation", "text_vi", "text")
@@ -478,8 +481,8 @@ def _parse_bool_flag(val: Any) -> bool:
 
 def looks_like_floating_sfx(text: str) -> bool:
     """Return True only when non-bubble OCR text is unambiguously a sound-effect glyph."""
-    cleaned = re.sub(r"[\s\u3000!！?？…・〜~\-ー]+", "", (text or "").strip())
-    if not cleaned or len(cleaned) > 10:
+    cleaned = re.sub(r"[\s\u3000!！?？…・〜~\-ー♡♥]+", "", (text or "").strip())
+    if not cleaned or len(cleaned) > 16:
         return False
     if not _PURE_KATAKANA_RE.match(cleaned):
         return False
@@ -1336,11 +1339,10 @@ class VisionLLMClient:
                     else:
                         copy.is_sfx = False
                 else:
-                    if is_pure_floating_sfx:
-                        copy.is_sfx = True
-                    elif raw_is_sfx and not vn:
-                        copy.is_sfx = True
-                    elif raw_is_sfx and len(norm_src) <= 4 and not bubble_has_spoken:
+                    # For non-bubble floating text, preserve SFX detection whenever either the LLM
+                    # flagged `is_sfx: true` OR local glyph analysis confirms pure SFX, so SFX is
+                    # never accidentally inpainted or overwritten with translated text.
+                    if is_pure_floating_sfx or raw_is_sfx:
                         copy.is_sfx = True
                     else:
                         copy.is_sfx = False

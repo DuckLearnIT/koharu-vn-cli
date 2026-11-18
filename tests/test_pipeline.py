@@ -2627,6 +2627,164 @@ def test_retranslate_drive_skips_vietnamese_and_fixes_untranslated(tmp_path: Pat
     assert res_help.exit_code == 0 and "Google Drive" in res_help.stdout
 
 
+def test_sfx_never_inpainted_or_translated_and_tui_cli_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Floating SFX must never be translated or inpainted when skip_sfx=True, and TUI/CLI queue runs jobs sequentially."""
+    from typer.testing import CliRunner
+
+    from koharu_vn_cli import cli
+    from koharu_vn_cli.pipeline.gemini_client import (
+        TextRegionItem,
+        VisionLLMClient,
+        looks_like_floating_sfx,
+    )
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+    from koharu_vn_cli.tui import KoharuTUI
+
+    # 1) Katakana + Hiragana SFX recognition without matching actual dialogue
+    assert looks_like_floating_sfx("ぐちゅぐちゅッ♡") is True
+    assert looks_like_floating_sfx("ドクッドクッ!!") is True
+    assert looks_like_floating_sfx("ビクンビクンッ") is True
+    assert looks_like_floating_sfx("先輩…だめですっ") is False
+    assert looks_like_floating_sfx("これ以上はやめて") is False
+
+    # 2) _merge_translated_regions preserves is_sfx=True & clears vietnamese when model returned both
+    base_regions = [
+        TextRegionItem(id=1, kind="bubble", text_bbox=(20, 20, 120, 80), source_text="やめろ"),
+        TextRegionItem(id=2, kind="floating", text_bbox=(30, 120, 160, 180), source_text="どきどきッ"),
+        TextRegionItem(id=3, kind="floating", text_bbox=(30, 190, 160, 240), source_text="ぐちゅぐちゅッ♡"),
+    ]
+    raw_items = [
+        {"id": 1, "is_sfx": False, "source": "やめろ", "vietnamese": "Dừng lại"},
+        {"id": 2, "is_sfx": True, "source": "どきどきッ", "vietnamese": "Thình thịch"},
+        {"id": 3, "is_sfx": False, "source": "ぐちゅぐちゅッ♡", "vietnamese": "Nhóp nhép"},
+    ]
+    merged_skip = VisionLLMClient._merge_translated_regions(base_regions, raw_items, skip_sfx=True)
+    assert merged_skip[0].is_sfx is False and merged_skip[0].translated_text == "Dừng lại"
+    assert merged_skip[1].is_sfx is True and merged_skip[1].translated_text == ""
+    assert merged_skip[2].is_sfx is True and merged_skip[2].translated_text == ""
+
+    # 3) End-to-end mini pipeline: floating SFX region leaves canvas pixels untouched and mask excludes it
+    manga_dir = tmp_path / "sfx_check"
+    manga_dir.mkdir()
+    img_arr = np.full((240, 200, 3), 255, dtype=np.uint8)
+    # Paint distinctive SFX ink pixels inside floating box (2) so any accidental inpaint is immediately detected
+    img_arr[140:160, 60:110] = (200, 30, 40)
+    Image.fromarray(img_arr).save(manga_dir / "001.png")
+
+    class FakeDetector:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            mask[25:75, 25:135] = 255
+            mask[135:175, 45:145] = 255
+            return [
+                DetectedRegion((20, 20, 140, 80), (15, 15, 145, 85), None, True, False, 0.95),
+                DetectedRegion((40, 130, 150, 180), None, None, False, False, 0.90),
+            ], mask
+
+    inpaint_masks: list[tuple[int, int]] = []
+
+    class FakeInpainter:
+        def inpaint(self, rgb, mask):
+            inpaint_masks.append((int((mask[20:80, 20:140] > 0).sum()), int((mask[130:180, 40:150] > 0).sum())))
+            out = rgb.copy()
+            out[mask > 127] = (255, 255, 255)
+            return out
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDetector()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInpainter()
+
+        def get_ocr(self, use_gpu=True):
+            return None
+
+    def fake_translate_call(self, system_prompt, user_prompt, images=None, temperature=0.25):
+        # Deliberately return non-empty vietnamese alongside is_sfx=True to verify hard SFX guard
+        return {
+            "page_summary": "ok",
+            "items": [
+                {"id": 1, "is_sfx": False, "source": "やめろ", "vietnamese": "Dừng lại!"},
+                {"id": 2, "is_sfx": True, "source": "ドクッ", "vietnamese": "Thình thịch!"},
+            ],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fake_translate_call)
+    out_dir, docs = run_translate_pipeline(
+        manga_dir,
+        output=tmp_path / "sfx_out",
+        api_key="sk-fake",
+        model="gemini-3.8-flash",
+        story_pass=False,
+        skip_sfx=True,
+        vision_translate=True,
+        clean_cache=False,
+        output_format="png",
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(inpaint_masks) == 1
+    assert inpaint_masks[0][0] > 0  # Bubble was masked/inpainted
+    assert inpaint_masks[0][1] == 0  # Floating SFX received zero mask pixels
+    out_pixels = np.array(Image.open(out_dir / "001.png").convert("RGB"))
+    assert tuple(out_pixels[150, 80]) == (200, 30, 40)
+    sfx_reg = next(r for r in docs[0].regions if r.id == 2)
+    assert sfx_reg.is_sfx is True and sfx_reg.translated_text == ""
+
+    # 4) TUI queue: auto-enqueue while running, multi-path /queue, remove, cancel-pause, auto-advance, clear
+    app = KoharuTUI()
+    monkeypatch.setattr(app, "_refresh_chrome", lambda: None)
+    monkeypatch.setattr(app, "_log_ai", lambda *a, **kw: None)
+    monkeypatch.setattr(app, "_ensure_llm_ready", lambda needs_llm=True: True)
+    dispatched: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        app,
+        "_start_translate",
+        lambda input_path, prompt="", tags="", **kw: dispatched.append(("translate", str(input_path))),
+    )
+
+    p1 = tmp_path / "vol1"
+    p2 = tmp_path / "vol2"
+    p3 = tmp_path / "vol3"
+    for p in (p1, p2, p3):
+        p.mkdir()
+
+    app.is_running_job = True
+    app._launch_translate(p1, "giữ tên riêng")
+    app._handle_queue_command(f'"{p2}" "{p3}"')
+    assert [j.input_path for j in app.job_queue] == [p1, p2, p3]
+
+    app._handle_queue_command("remove 2")
+    assert [j.input_path for j in app.job_queue] == [p1, p3]
+
+    # Esc cancellation leaves remaining queue paused instead of launching next item
+    app.is_running_job = False
+    app._on_worker_finished(cancelled=True)
+    assert dispatched == [] and [j.input_path for j in app.job_queue] == [p1, p3]
+
+    # Normal finish pops & dispatches the head item automatically
+    app._on_worker_finished(cancelled=False)
+    assert dispatched == [("translate", str(p1))]
+    assert [j.input_path for j in app.job_queue] == [p3]
+
+    app._handle_queue_command("clear")
+    assert app.job_queue == []
+
+    # 5) CLI `queue` runs all provided paths sequentially
+    cli_calls: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "_execute_translate_cli",
+        lambda input_path, **kw: cli_calls.append(Path(input_path)),
+    )
+    res_q = CliRunner().invoke(cli.app, ["queue", str(p1), str(p2), "--no-notify"])
+    assert res_q.exit_code == 0
+    assert cli_calls == [p1, p2]
+
+
+
 
 
 
