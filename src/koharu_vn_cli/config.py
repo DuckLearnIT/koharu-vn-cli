@@ -76,6 +76,7 @@ class AppConfig(BaseModel):
     vision_translate: bool = True
     skip_sfx: bool = True
     clean_cache: bool = True
+    delete_source_zip: bool = True
     use_gpu: bool = True
     notify: bool = True
     workers: int = Field(default=0, ge=0, le=16)

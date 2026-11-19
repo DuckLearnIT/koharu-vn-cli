@@ -82,6 +82,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
     SlashSpec("/cache", "[clean|keep]", "Tự xóa .koharu_cache sau khi dịch xong 100% (mặc định: tự xóa)"),
+    SlashSpec("/delete-zip", "[on|off]", "Tự xóa file .zip gốc sau khi xác minh 100% ảnh xuất có chữ dịch mới (mặc định: bật)"),
     SlashSpec("/notify", "[on|off]", "Gửi thông báo Windows khi dịch xong hoặc gặp lỗi (mặc định: bật)"),
     SlashSpec("/workers", "[số|auto]", "Số luồng API dịch song song N, N+1... (auto = theo số API key)"),
     SlashSpec("/gpu", "[on|off]", "Bật/tắt tăng tốc GPU (CUDA) cho Detector, LaMa Inpaint & OCR"),
@@ -1125,6 +1126,7 @@ class KoharuTUI(App[None]):
             f"Font: [white]{self.cfg.font or 'auto (animeace3/pangolin)'}[/white]\n"
             f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
             f"Cache: [cyan]{'Tự xóa khi xong 100%' if self.cfg.clean_cache else 'Giữ .koharu_cache'}[/cyan]\n"
+            f"Xóa ZIP gốc: [cyan]{'Tự xóa (xác minh 100%)' if self.cfg.delete_source_zip else 'Giữ lại'}[/cyan]\n"
             f"Thông báo: [cyan]{'Bật (xong/lỗi)' if self.cfg.notify else 'Tắt'}[/cyan]\n"
             f"Luồng dịch: [cyan]{workers_lbl}[/cyan]\n"
             f"Prompt: [dim]{(self.cfg.custom_prompt[:46] + '...') if len(self.cfg.custom_prompt) > 46 else (self.cfg.custom_prompt or 'không')}[/dim]"
@@ -1805,6 +1807,22 @@ class KoharuTUI(App[None]):
                 self._log_ai(
                     "Cache: [bold yellow]GIỮ LẠI[/bold yellow] — giữ `.koharu_cache` để `/rerender` hoặc chỉnh sửa thoại sau."
                 )
+        elif cmd == "/delete-zip":
+            val = rest.strip().lower()
+            if val in {"on", "1", "true", "yes", "delete", "clean"}:
+                self.cfg.delete_source_zip = True
+            elif val in {"off", "0", "false", "no", "keep"}:
+                self.cfg.delete_source_zip = False
+            else:
+                self.cfg.delete_source_zip = not self.cfg.delete_source_zip
+            save_config(self.cfg)
+            self._refresh_chrome()
+            if self.cfg.delete_source_zip:
+                self._log_ai(
+                    "Xóa ZIP gốc: [bold cyan]BẬT[/bold cyan] — chỉ tự xóa đúng file `.zip` gốc sau khi xác minh 100% ảnh xuất hợp lệ & có chữ dịch mới trên hình."
+                )
+            else:
+                self._log_ai("Xóa ZIP gốc: [bold yellow]TẮT[/bold yellow] — luôn giữ lại file `.zip` gốc sau khi dịch.")
         elif cmd == "/notify":
             val = rest.strip().lower()
             if val in {"on", "1", "true", "yes"}:
@@ -2579,6 +2597,7 @@ class KoharuTUI(App[None]):
                 use_gpu=self.cfg.use_gpu,
                 resume=resume,
                 clean_cache=self.cfg.clean_cache,
+                delete_source_zip=self.cfg.delete_source_zip,
                 max_workers=self.cfg.workers,
                 model_cache=self.model_cache,
                 hooks=self._build_hooks(),
@@ -2657,6 +2676,7 @@ class KoharuTUI(App[None]):
                 page_range=page_range or None,
                 resume=resume,
                 clean_cache=self.cfg.clean_cache,
+                delete_source_zip=self.cfg.delete_source_zip,
                 hooks=self._build_hooks(),
             )
             self.cfg.last_output_dir = str(out_dir)

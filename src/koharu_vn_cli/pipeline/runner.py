@@ -503,6 +503,156 @@ def _q_get(
     return False, None
 
 
+@dataclass(frozen=True)
+class _SourceZipFingerprint:
+    path: Path
+    size: int
+    mtime_ns: int
+
+
+def _capture_source_zip_fingerprint(input_path: Path) -> _SourceZipFingerprint | None:
+    """Capture exact identity of an input `.zip` archive before extraction so we never delete the wrong file."""
+    try:
+        if input_path.is_symlink():
+            return None
+        resolved = input_path.resolve()
+        if not resolved.is_file() or resolved.suffix.lower() != ".zip":
+            return None
+        if not zipfile.is_zipfile(resolved):
+            return None
+        st = resolved.stat()
+        return _SourceZipFingerprint(path=resolved, size=st.st_size, mtime_ns=st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _image_has_rendered_text_diff(
+    final_img: Image.Image,
+    raw_rgb: np.ndarray,
+    clean_rgb: np.ndarray | None = None,
+) -> bool:
+    """Confirm new translated text pixels were actually drawn onto the rendered page."""
+    final_rgb = np.asarray(final_img.convert("RGB"))
+    if final_rgb.shape != raw_rgb.shape:
+        return False
+    if int(np.count_nonzero(np.any(final_rgb != raw_rgb, axis=-1))) <= 0:
+        return False
+    if clean_rgb is not None and final_rgb.shape == clean_rgb.shape:
+        if int(np.count_nonzero(np.any(final_rgb != clean_rgb, axis=-1))) <= 0:
+            return False
+    return True
+
+
+def _maybe_delete_source_zip(
+    fingerprint: _SourceZipFingerprint | None,
+    *,
+    delete_source_zip: bool,
+    out_dir: Path,
+    cbz_path: Path | None,
+    total: int,
+    docs_by_idx: dict[int, PageDocument],
+    out_paths_by_idx: dict[int, Path],
+    rendered_verified_by_idx: dict[int, bool],
+    skip_sfx: bool,
+    base_name: str,
+    hooks: PipelineHooks,
+    allow_delete: bool = True,
+) -> bool:
+    """
+    Strictly verify 100% completion, output readability, and actual rendered translated text pixels
+    before deleting ONLY the exact fingerprinted input `.zip` file.
+    """
+    if not delete_source_zip or fingerprint is None:
+        return False
+
+    def _keep(reason: str) -> bool:
+        hooks.emit_step(
+            len(docs_by_idx),
+            max(1, total),
+            base_name,
+            "keep_zip",
+            f"Giữ nguyên file zip gốc ({fingerprint.path.name}): {reason}.",
+        )
+        return False
+
+    if not allow_delete:
+        return _keep("chỉ xử lý một phần phạm vi trang")
+    if total <= 0 or len(docs_by_idx) != total or len(out_paths_by_idx) != total:
+        return _keep(f"mới hoàn tất {len(docs_by_idx)}/{total} trang")
+
+    src_zip = fingerprint.path
+    resolved_out = out_dir.resolve()
+    if src_zip == resolved_out or src_zip.is_relative_to(resolved_out):
+        return _keep("đường dẫn zip nằm trong thư mục output")
+    if cbz_path is not None and src_zip == cbz_path.resolve():
+        return _keep("trùng đường dẫn file CBZ xuất ra")
+
+    try:
+        if src_zip.is_symlink() or not src_zip.is_file() or src_zip.suffix.lower() != ".zip":
+            return _keep("không còn là file .zip hợp lệ")
+        if not zipfile.is_zipfile(src_zip):
+            return _keep("không xác nhận được định dạng zip")
+        st = src_zip.stat()
+        if st.st_size != fingerprint.size or st.st_mtime_ns != fingerprint.mtime_ns:
+            return _keep("file zip gốc đã thay đổi trong lúc chạy")
+    except OSError as exc:
+        return _keep(f"không thể kiểm tra file zip ({exc})")
+
+    verified_text_pages = 0
+    total_translated_regions = 0
+    for idx in range(1, total + 1):
+        doc = docs_by_idx.get(idx)
+        out_p = out_paths_by_idx.get(idx)
+        if doc is None or out_p is None:
+            return _keep(f"thiếu dữ liệu trang {idx}")
+        try:
+            resolved_p = out_p.resolve()
+            if not resolved_p.is_file() or not resolved_p.is_relative_to(resolved_out):
+                return _keep(f"không thấy file ảnh xuất trang {idx} trong thư mục đích")
+            if resolved_p.stat().st_size < 128:
+                return _keep(f"ảnh xuất trang {idx} quá nhỏ/rỗng")
+            with Image.open(resolved_p) as im:
+                im_w, im_h = im.size
+                im.load()
+            if im_w != doc.width or im_h != doc.height:
+                return _keep(f"kích thước ảnh xuất trang {idx} không khớp")
+        except Exception:
+            return _keep(f"ảnh xuất trang {idx} bị lỗi không đọc được")
+
+        if any(region_needs_translation(r) for r in doc.regions):
+            return _keep(f"trang {idx} vẫn còn khung thoại chưa dịch")
+
+        rendered_regs = [
+            r for r in doc.regions
+            if not (skip_sfx and r.is_sfx) and (r.translated_text or "").strip()
+        ]
+        if rendered_regs:
+            total_translated_regions += len(rendered_regs)
+            if not rendered_verified_by_idx.get(idx, False):
+                return _keep(f"chưa xác minh được chữ dịch mới vẽ lên ảnh trang {idx}")
+            verified_text_pages += 1
+
+    if verified_text_pages < 1 or total_translated_regions < 1:
+        return _keep("chưa xác minh được trang nào có bản dịch chữ mới trên ảnh")
+
+    try:
+        src_zip.unlink()
+    except OSError as exc:
+        return _keep(f"không xóa được file ({exc})")
+
+    hooks.emit_step(
+        total,
+        total,
+        base_name,
+        "delete_zip",
+        (
+            f"🗑 Đã xác minh 100% ({total}/{total} ảnh hợp lệ, {verified_text_pages} trang có chữ dịch mới trên hình) "
+            f"-> tự động xóa file zip gốc: {src_zip.name}"
+        ),
+    )
+    return True
+
+
 def _cleanup_cache_dir(
     cache_dir: Path,
     *,
@@ -757,6 +907,7 @@ def run_translate_pipeline(
     skip_blocked: bool = True,
     resume: bool = False,
     clean_cache: bool = True,
+    delete_source_zip: bool = False,
     max_workers: int = 0,
     model_cache: ModelCache | None = None,
     hooks: PipelineHooks | None = None,
@@ -765,6 +916,7 @@ def run_translate_pipeline(
     hooks = hooks or PipelineHooks()
     cache = model_cache or ModelCache()
     hooks_lock = threading.Lock()
+    source_zip_fp = _capture_source_zip_fingerprint(input_path) if delete_source_zip else None
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         images, base_name = collect_inputs(input_path, Path(tmp_dir))
@@ -909,6 +1061,8 @@ def run_translate_pipeline(
         )
 
         docs_by_idx: dict[int, PageDocument] = {}
+        out_paths_by_idx: dict[int, Path] = {}
+        rendered_verified_by_idx: dict[int, bool] = {}
         seq_pad = max(3, len(str(total)))
         stem_counts = Counter(p.stem for p in images)
         translation_memory: dict[str, str] = {}
@@ -1122,11 +1276,21 @@ def run_translate_pipeline(
                                 json_path.read_text(encoding="utf-8")
                             )
                             if not any(region_needs_translation(r) for r in prev_doc.regions):
+                                resumed_verified = False
+                                if source_zip_fp is not None:
+                                    try:
+                                        resumed_verified = _image_has_rendered_text_diff(
+                                            Image.open(out_img_path), load_rgb(img_path)
+                                        )
+                                    except Exception:
+                                        resumed_verified = False
                                 with state_lock:
                                     _remember_translations(prev_doc.regions)
                                     if prev_doc.page_summary:
                                         scene_summaries_by_page[sc.scene_id][idx] = prev_doc.page_summary
                                     docs_by_idx[idx] = prev_doc
+                                    out_paths_by_idx[idx] = out_img_path
+                                    rendered_verified_by_idx[idx] = resumed_verified
                                 _emit_step(idx, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
                                 _emit_page_done(idx, img_path.name, prev_doc, out_img_path)
                                 continue
@@ -1156,6 +1320,7 @@ def run_translate_pipeline(
                             )
                             with state_lock:
                                 docs_by_idx[idx] = doc
+                                out_paths_by_idx[idx] = out_img_path
                             _emit_step(idx, img_path.name, "empty", "Không có khung thoại, giữ nguyên ảnh gốc")
                             _emit_page_done(idx, img_path.name, doc, out_img_path)
                             continue
@@ -1211,6 +1376,7 @@ def run_translate_pipeline(
                                     )
                                     with state_lock:
                                         docs_by_idx[idx] = doc
+                                        out_paths_by_idx[idx] = out_img_path
                                     _emit_step(
                                         idx,
                                         img_path.name,
@@ -1768,9 +1934,12 @@ def run_translate_pipeline(
                     rtask.json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
 
                     final_img = render_document(clean_rgb, doc)
+                    rendered_ok = _image_has_rendered_text_diff(final_img, rtask.rgb, clean_rgb)
                     save_image(final_img, rtask.out_img_path)
                     with state_lock:
                         docs_by_idx[rtask.idx] = doc
+                        out_paths_by_idx[rtask.idx] = rtask.out_img_path
+                        rendered_verified_by_idx[rtask.idx] = rendered_ok
                     _emit_page_done(rtask.idx, rtask.img_path.name, doc, rtask.out_img_path)
             except BaseException as exc:
                 _record_error(exc)
@@ -1802,8 +1971,9 @@ def run_translate_pipeline(
         docs = [docs_by_idx[i] for i in sorted(docs_by_idx)]
 
         _write_reader_metadata(out_dir, story_bible, tags)
-        if save_cbz:
-            package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
+        cbz_out_path = out_dir.parent / f"{out_dir.name}.cbz" if save_cbz else None
+        if cbz_out_path is not None:
+            package_cbz(out_dir, cbz_out_path)
         _cleanup_cache_dir(
             cache_dir,
             total=total,
@@ -1811,6 +1981,19 @@ def run_translate_pipeline(
             clean_cache=clean_cache,
             hooks=hooks,
             base_name=base_name,
+        )
+        _maybe_delete_source_zip(
+            source_zip_fp,
+            delete_source_zip=delete_source_zip,
+            out_dir=out_dir,
+            cbz_path=cbz_out_path,
+            total=total,
+            docs_by_idx=docs_by_idx,
+            out_paths_by_idx=out_paths_by_idx,
+            rendered_verified_by_idx=rendered_verified_by_idx,
+            skip_sfx=skip_sfx,
+            base_name=base_name,
+            hooks=hooks,
         )
         return out_dir, docs
 
@@ -1843,6 +2026,7 @@ def run_retranslate_pipeline(
     skip_blocked: bool = True,
     resume: bool = False,
     clean_cache: bool = True,
+    delete_source_zip: bool = False,
     max_workers: int = 0,
     model_cache: ModelCache | None = None,
     hooks: PipelineHooks | None = None,
@@ -1880,6 +2064,7 @@ def run_retranslate_pipeline(
         skip_blocked=skip_blocked,
         resume=resume,
         clean_cache=clean_cache,
+        delete_source_zip=delete_source_zip,
         max_workers=max_workers,
         model_cache=model_cache,
         hooks=hooks,
@@ -1911,10 +2096,12 @@ def run_compose_pipeline(
     skip_blocked: bool = True,
     resume: bool = False,
     clean_cache: bool = True,
+    delete_source_zip: bool = False,
     hooks: PipelineHooks | None = None,
 ) -> tuple[Path, list[PageDocument]]:
     """Run Artist CG dialogue composition pipeline end-to-end (supports selective `page_range` like `'1-20'`)."""
     hooks = hooks or PipelineHooks()
+    source_zip_fp = _capture_source_zip_fingerprint(input_path) if delete_source_zip else None
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         all_images, base_name = collect_inputs(input_path, Path(tmp_dir))
@@ -2018,6 +2205,9 @@ def run_compose_pipeline(
 
         previous_summaries: list[str] = []
         docs: list[PageDocument] = []
+        docs_by_idx: dict[int, PageDocument] = {}
+        out_paths_by_idx: dict[int, Path] = {}
+        rendered_verified_by_idx: dict[int, bool] = {}
 
         # Fast 1-sheet batch composition when there are multiple CG pages (up to 36 per sheet)
         sheet_results: dict[int, tuple[list[TextRegionItem], str]] = {}
@@ -2076,6 +2266,15 @@ def run_compose_pipeline(
                 if prev_doc.page_summary:
                     previous_summaries.append(prev_doc.page_summary)
                 docs.append(prev_doc)
+                docs_by_idx[idx] = prev_doc
+                out_paths_by_idx[idx] = out_img_path
+                if source_zip_fp is not None:
+                    try:
+                        rendered_verified_by_idx[idx] = _image_has_rendered_text_diff(
+                            Image.open(out_img_path), load_rgb(img_path)
+                        )
+                    except Exception:
+                        rendered_verified_by_idx[idx] = False
                 hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua ảnh đã sáng tác (--resume)")
                 hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
                 continue
@@ -2140,13 +2339,18 @@ def run_compose_pipeline(
             json_path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
 
             final_img = render_document(rgb, doc)
+            rendered_ok = _image_has_rendered_text_diff(final_img, rgb)
             save_image(final_img, out_img_path)
             docs.append(doc)
+            docs_by_idx[idx] = doc
+            out_paths_by_idx[idx] = out_img_path
+            rendered_verified_by_idx[idx] = rendered_ok
             hooks.emit_page_done(idx, total, img_path.name, doc, out_img_path)
 
         _write_reader_metadata(out_dir, story_bible, tags)
-        if save_cbz:
-            package_cbz(out_dir, out_dir.parent / f"{out_dir.name}.cbz")
+        cbz_out_path = out_dir.parent / f"{out_dir.name}.cbz" if save_cbz else None
+        if cbz_out_path is not None:
+            package_cbz(out_dir, cbz_out_path)
         _cleanup_cache_dir(
             cache_dir,
             total=total,
@@ -2154,6 +2358,20 @@ def run_compose_pipeline(
             clean_cache=clean_cache,
             hooks=hooks,
             base_name=base_name,
+        )
+        _maybe_delete_source_zip(
+            source_zip_fp,
+            delete_source_zip=delete_source_zip,
+            out_dir=out_dir,
+            cbz_path=cbz_out_path,
+            total=total,
+            docs_by_idx=docs_by_idx,
+            out_paths_by_idx=out_paths_by_idx,
+            rendered_verified_by_idx=rendered_verified_by_idx,
+            skip_sfx=False,
+            base_name=base_name,
+            hooks=hooks,
+            allow_delete=(not eff_range),
         )
         return out_dir, docs
 

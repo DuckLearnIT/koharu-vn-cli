@@ -205,9 +205,10 @@ def _execute_translate_cli(
     skip_sfx: Optional[bool],
     gpu: Optional[bool],
     clean_cache: Optional[bool],
-    notify: Optional[bool],
-    workers: Optional[int],
-    resume: bool,
+    delete_zip: Optional[bool] = None,
+    notify: Optional[bool] = None,
+    workers: Optional[int] = None,
+    resume: bool = False,
     retranslate_untranslated: bool = False,
 ) -> None:
     cfg = load_config()
@@ -218,6 +219,7 @@ def _execute_translate_cli(
     eff_skip_sfx = cfg.skip_sfx if skip_sfx is None else skip_sfx
     eff_gpu = cfg.use_gpu if gpu is None else gpu
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
+    eff_delete_zip = cfg.delete_source_zip if delete_zip is None else delete_zip
     eff_notify = cfg.notify if notify is None else notify
     eff_workers = cfg.workers if workers is None else max(0, min(workers, 16))
     job_title = "Đang tái dịch trang chưa dịch..." if retranslate_untranslated else "Đang dịch truyện..."
@@ -276,6 +278,7 @@ def _execute_translate_cli(
                 use_gpu=eff_gpu,
                 resume=resume,
                 clean_cache=eff_clean_cache,
+                delete_source_zip=eff_delete_zip,
                 max_workers=eff_workers,
                 hooks=PipelineHooks(
                     on_step=on_step,
@@ -343,6 +346,7 @@ def translate(
     skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX để tránh rối tranh (mặc định: bật)."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy Detector + LaMa Inpaint + OCR trên GPU (mặc định: tự động GPU CUDA/DirectML nếu có)."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi dịch xong 100% (mặc định: bật)."),
+    delete_zip: Optional[bool] = typer.Option(None, "--delete-zip/--keep-zip", help="Tự động xóa file .zip gốc sau khi xác minh 100% ảnh xuất có chữ dịch mới (mặc định: bật)."),
     notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi dịch xong hoặc gặp lỗi (mặc định: bật)."),
     workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song (0 = tự động theo số API key)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
@@ -373,6 +377,7 @@ def translate(
         skip_sfx=skip_sfx,
         gpu=gpu,
         clean_cache=clean_cache,
+        delete_zip=delete_zip,
         notify=notify,
         workers=workers,
         resume=resume,
@@ -405,6 +410,7 @@ def retranslate(
     skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua SFX trên tranh."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy ONNX trên GPU/CPU."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa .koharu_cache sau khi hoàn tất."),
+    delete_zip: Optional[bool] = typer.Option(None, "--delete-zip/--keep-zip", help="Tự động xóa file .zip gốc sau khi xác minh 100% ảnh xuất có chữ dịch mới."),
     notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi xong/lỗi."),
     workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API song song."),
 ) -> None:
@@ -434,6 +440,7 @@ def retranslate(
         skip_sfx=skip_sfx,
         gpu=gpu,
         clean_cache=clean_cache,
+        delete_zip=delete_zip,
         notify=notify,
         workers=workers,
         resume=False,
@@ -468,6 +475,7 @@ def compose(
     seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
     review_chars: bool = typer.Option(False, "--review-chars", help="Dừng sau Pass 1 để kiểm tra & sửa tên game/nhân vật trước khi sáng tác."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa thư mục .koharu_cache sau khi sáng tác xong 100% (mặc định: bật)."),
+    delete_zip: Optional[bool] = typer.Option(None, "--delete-zip/--keep-zip", help="Tự động xóa file .zip gốc sau khi sáng tác 100% ảnh (không xóa khi chỉ chọn --pages một phần)."),
     notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows khi sáng tác xong hoặc gặp lỗi (mặc định: bật)."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua ảnh đã sáng tác sẵn trong thư mục đích."),
 ) -> None:
@@ -477,6 +485,7 @@ def compose(
     eff_format = output_format or cfg.output_format
     eff_seq = cfg.sequential_names if seq_names is None else seq_names
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
+    eff_delete_zip = cfg.delete_source_zip if delete_zip is None else delete_zip
     eff_notify = cfg.notify if notify is None else notify
     with Progress(
         SpinnerColumn(),
@@ -527,6 +536,7 @@ def compose(
                 page_range=pages,
                 resume=resume,
                 clean_cache=eff_clean_cache,
+                delete_source_zip=eff_delete_zip,
                 hooks=PipelineHooks(
                     on_step=on_step,
                     on_page_done=on_page_done,
@@ -692,6 +702,7 @@ def queue(
     skip_sfx: Optional[bool] = typer.Option(None, "--skip-sfx/--keep-sfx", help="Bỏ qua không dịch & không inpaint vào SFX."),
     gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Chạy ONNX/OCR trên GPU hay CPU."),
     clean_cache: Optional[bool] = typer.Option(None, "--clean-cache/--keep-cache", help="Tự động xóa .koharu_cache sau mỗi tác phẩm."),
+    delete_zip: Optional[bool] = typer.Option(None, "--delete-zip/--keep-zip", help="Tự động xóa file .zip gốc sau khi xác minh 100% ảnh xuất có chữ dịch mới."),
     notify: Optional[bool] = typer.Option(None, "--notify/--no-notify", help="Gửi thông báo Windows sau mỗi tác phẩm."),
     workers: Optional[int] = typer.Option(None, "-w", "--workers", help="Số luồng API dịch song song."),
     resume: bool = typer.Option(False, "--resume", help="Bỏ qua các trang đã dịch sẵn trong thư mục đích."),
@@ -734,6 +745,7 @@ def queue(
             skip_sfx=skip_sfx,
             gpu=gpu,
             clean_cache=clean_cache,
+            delete_zip=delete_zip,
             notify=notify,
             workers=workers,
             resume=resume,

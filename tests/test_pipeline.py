@@ -3069,6 +3069,197 @@ def test_compose_density_low_high_enforcement_and_visual_grounding(
     assert all(len(sheet_res[p][0]) >= 5 for p in range(1, 9))
 
 
+def test_auto_delete_source_zip_strict_verification_and_safety(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only delete the exact source `.zip` once 100% of pages succeed with verified rendered Vietnamese text pixels."""
+    import io as _io
+    import zipfile
+
+    from typer.testing import CliRunner
+
+    from koharu_vn_cli import cli
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError, VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import run_compose_pipeline, run_translate_pipeline
+    from koharu_vn_cli.tui import KoharuTUI
+
+    def _make_zip(zpath: Path, count: int = 2) -> None:
+        with zipfile.ZipFile(zpath, "w") as zf:
+            for i in range(1, count + 1):
+                buf = _io.BytesIO()
+                img = np.full((220, 200, 3), 245, dtype=np.uint8)
+                img[30:90, 30:170] = (255, 255, 255)
+                img[50:65, 60:140] = (20, 20, 20)
+                Image.fromarray(img).save(buf, format="PNG")
+                zf.writestr(f"{i:03d}.png", buf.getvalue())
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            mask[45:75, 50:150] = 255
+            return [DetectedRegion((30, 30, 170, 90), (25, 25, 175, 95), None, True, False, 0.95)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            out = rgb.copy()
+            out[mask > 127] = (255, 255, 255)
+            return out
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            return None
+
+    # 1) Full verified translation deletes ONLY target zip, never sibling zip or output images
+    target_zip = tmp_path / "target_comic.zip"
+    sibling_zip = tmp_path / "other_comic.zip"
+    _make_zip(target_zip, count=2)
+    _make_zip(sibling_zip, count=1)
+
+    monkeypatch.setattr(
+        VisionLLMClient,
+        "_call_json",
+        lambda self, *a, **kw: {
+            "page_summary": "ok",
+            "items": [{"id": 1, "is_sfx": False, "source": "やめろ", "vietnamese": "Dừng lại ngay!"}],
+        },
+    )
+    out_dir, docs = run_translate_pipeline(
+        target_zip,
+        api_key="sk-fake",
+        story_pass=False,
+        output_format="png",
+        delete_source_zip=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs) == 2
+    assert not target_zip.exists()  # Exact source zip deleted after 100% verified text rendering!
+    assert sibling_zip.exists()  # Unrelated zip untouched!
+    assert (out_dir / "001.png").is_file() and (out_dir / "002.png").is_file()
+
+    # 2) If any page is blocked/skipped -> MUST KEEP source zip!
+    blocked_zip = tmp_path / "blocked_comic.zip"
+    _make_zip(blocked_zip, count=2)
+    call_n = 0
+
+    def fail_second_page(self, *a, **kw):
+        nonlocal call_n
+        call_n += 1
+        if call_n == 2:
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+        return {
+            "page_summary": "ok",
+            "items": [{"id": 1, "is_sfx": False, "source": "やめろ", "vietnamese": "Dừng lại!"}],
+        }
+
+    monkeypatch.setattr(VisionLLMClient, "_call_json", fail_second_page)
+    run_translate_pipeline(
+        blocked_zip,
+        api_key="sk-fake",
+        story_pass=False,
+        output_format="png",
+        delete_source_zip=True,
+        skip_blocked=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert blocked_zip.exists()
+
+    # 3) If zero text regions detected / zero translated text drawn -> MUST KEEP source zip!
+    empty_zip = tmp_path / "empty_comic.zip"
+    _make_zip(empty_zip, count=1)
+
+    class EmptyDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            return [], np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+    class EmptyCache(FakeCache):
+        def get_detector(self, accurate=True, use_gpu=True):
+            return EmptyDet()
+
+    run_translate_pipeline(
+        empty_zip,
+        api_key="sk-fake",
+        story_pass=False,
+        output_format="png",
+        delete_source_zip=True,
+        model_cache=EmptyCache(),  # type: ignore[arg-type]
+    )
+    assert empty_zip.exists()
+
+    # 4) Partial `--pages` compose on a `.zip` MUST NOT delete the `.zip`!
+    partial_zip = tmp_path / "partial_cg.zip"
+    _make_zip(partial_zip, count=3)
+    monkeypatch.setattr(
+        VisionLLMClient,
+        "_compose_cg_sheet_batch",
+        lambda self, image_paths, image_sizes, page_numbers, total_pages, **kw: {
+            p: (
+                [
+                    TextRegionItem(
+                        id=1,
+                        kind="bubble",
+                        bubble_style=BubbleStyle.WHITE_OVAL,
+                        text_bbox=(20, 20, 150, 100),
+                        bubble_bbox=(20, 20, 150, 100),
+                        translated_text="Thoại CG",
+                        draw_bubble=True,
+                    )
+                ],
+                "ok",
+            )
+            for p in page_numbers
+        },
+    )
+    run_compose_pipeline(
+        partial_zip,
+        api_key="sk-fake",
+        story_pass=False,
+        page_range="1-2",
+        output_format="png",
+        delete_source_zip=True,
+    )
+    assert partial_zip.exists()
+
+    # 5) Folder input is NEVER deleted even with delete_source_zip=True
+    folder_in = tmp_path / "raw_folder"
+    folder_in.mkdir()
+    Image.new("RGB", (200, 220), (240, 240, 240)).save(folder_in / "001.png")
+    monkeypatch.setattr(
+        VisionLLMClient,
+        "_call_json",
+        lambda self, *a, **kw: {
+            "page_summary": "ok",
+            "items": [{"id": 1, "is_sfx": False, "source": "やめろ", "vietnamese": "Dừng lại!"}],
+        },
+    )
+    run_translate_pipeline(
+        folder_in,
+        api_key="sk-fake",
+        story_pass=False,
+        output_format="png",
+        delete_source_zip=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert folder_in.is_dir() and (folder_in / "001.png").is_file()
+
+    # 6) CLI `--delete-zip/--keep-zip` & TUI `/delete-zip` toggle
+    res_help = CliRunner().invoke(cli.app, ["translate", "--help"])
+    assert res_help.exit_code == 0 and "--delete-zip" in res_help.stdout
+    app = KoharuTUI()
+    monkeypatch.setattr(app, "_refresh_chrome", lambda: None)
+    monkeypatch.setattr(app, "_log_ai", lambda *a, **kw: None)
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda cfg: None)
+    app.dispatch_command("/delete-zip off")
+    assert app.cfg.delete_source_zip is False
+    app.dispatch_command("/delete-zip on")
+    assert app.cfg.delete_source_zip is True
+
+
 
 
 
