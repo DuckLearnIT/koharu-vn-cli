@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from rich import box
+from rich.markup import escape as escape_markup
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -392,10 +393,10 @@ class PickerModal(ModalScreen[str | None]):
         opts: list[Option] = []
         for val, desc in self.choices:
             marker = "● " if val == self.current else "  "
-            opts.append(Option(f"{marker}[bold]{val}[/bold]  —  {desc}", id=val))
+            opts.append(Option(f"{marker}[bold]{escape_markup(val)}[/bold]  —  {escape_markup(desc)}", id=val))
         with Vertical(id="modal-card"):
-            yield Label(self.title_text, id="modal-title")
-            yield Label(self.subtitle_text, id="modal-subtitle")
+            yield Label(self.title_text, id="modal-title", markup=False)
+            yield Label(self.subtitle_text, id="modal-subtitle", markup=False)
             yield OptionList(*opts, id="picker-list")
             yield Label("[dim]↑/↓ Chọn  •  Enter Xác nhận  •  Esc Hủy[/dim]", id="modal-hint")
 
@@ -713,6 +714,7 @@ class StoryBibleReviewModal(ModalScreen[StoryBible | None]):
                     yield Label(
                         f"Nhân vật #{idx + 1} ({ch.appearance or 'chưa rõ ngoại hình'}):",
                         classes="field-label",
+                        markup=False,
                     )
                     with Horizontal(classes="char-row"):
                         yield Input(value=ch.name, placeholder="Tên nhân vật", id=f"rev-name-{idx}")
@@ -1066,6 +1068,13 @@ class KoharuTUI(App[None]):
         if event.size.width < 108 and not self.has_class("sidebar-hidden"):
             self.add_class("sidebar-hidden")
 
+    @staticmethod
+    def _safe_update_static(widget: Static, content: str) -> None:
+        try:
+            widget.update(Text.from_markup(content))
+        except Exception:
+            widget.update(Text(content))
+
     def _refresh_chrome(self) -> None:
         if not self.is_running:
             return
@@ -1075,21 +1084,24 @@ class KoharuTUI(App[None]):
             return
         key_ok = bool(self.cfg.effective_api_key())
         key_badge = (
-            f"[green]● {self.cfg.masked_api_key()}[/green]"
+            f"[green]● {escape_markup(self.cfg.masked_api_key())}[/green]"
             if key_ok
             else ("[cyan]● Proxy[/cyan]" if self.cfg.base_url else "[yellow]○ Chưa có key (/key)[/yellow]")
         )
+        story_model_esc = escape_markup(self.cfg.story_model) if self.cfg.story_model else ""
+        model_esc = escape_markup(self.cfg.model)
         model_badge = (
-            f"Chính: [bold magenta]{self.cfg.story_model}[/bold magenta] → Phụ: [bold]{self.cfg.model}[/bold]"
+            f"Chính: [bold magenta]{story_model_esc}[/bold magenta] → Phụ: [bold]{model_esc}[/bold]"
             if self.cfg.story_model and self.cfg.story_model != self.cfg.model
-            else f"Model: [bold]{self.cfg.model}[/bold]"
+            else f"Model: [bold]{model_esc}[/bold]"
         )
-        topbar.update(
+        self._safe_update_static(
+            topbar,
             f"[bold cyan]◈ KOHARU-VN CLI[/bold cyan] [dim]v{__version__}[/dim]  │  "
             f"{model_badge}  │  "
             f"API: {key_badge}  │  "
-            f"CG Style: [magenta]{self.cfg.compose_style.value}[/magenta]  │  "
-            f"Lang: [cyan]{self.cfg.lang}[/cyan]"
+            f"CG Style: [magenta]{escape_markup(self.cfg.compose_style.value)}[/magenta]  │  "
+            f"Lang: [cyan]{escape_markup(self.cfg.lang)}[/cyan]",
         )
 
         workers_lbl = (
@@ -1104,49 +1116,58 @@ class KoharuTUI(App[None]):
         )
         gem_keys = self.cfg.effective_api_keys(model="gemini-3.8-flash", base_url=self.cfg.base_url or "")
         gem_badge = (
-            f"[green]● {self.cfg.masked_gemini_key()}[/green]"
+            f"[green]● {escape_markup(self.cfg.masked_gemini_key())}[/green]"
             if gem_keys
             else ("[cyan]● Proxy[/cyan]" if self.cfg.base_url else "[dim]chưa đặt[/dim]")
         )
         ds_key_ok = bool(self.cfg.effective_api_keys(model="deepseek-chat"))
-        ds_badge = f"[green]● {self.cfg.masked_deepseek_key()}[/green]" if ds_key_ok else "[dim]chưa đặt[/dim]"
+        ds_badge = f"[green]● {escape_markup(self.cfg.masked_deepseek_key())}[/green]" if ds_key_ok else "[dim]chưa đặt[/dim]"
+        tags_raw = (self.cfg.tags[:30] + "...") if len(self.cfg.tags) > 30 else (self.cfg.tags or "chưa đặt")
+        prompt_raw = (
+            (self.cfg.custom_prompt[:46] + "...")
+            if len(self.cfg.custom_prompt) > 46
+            else (self.cfg.custom_prompt or "không")
+        )
         sb_cfg = self.query_one("#sb-config", Static)
-        sb_cfg.update(
-            f"Model chính: [bold magenta]{self.cfg.story_model or f'chung ({self.cfg.model})'}[/bold magenta]\n"
-            f"Fallback chính: [dim]{self.cfg.story_fallback_model or 'tắt'}[/dim]\n"
-            f"Model phụ: [bold white]{self.cfg.model}[/bold white]\n"
-            f"Fallback phụ: [dim]{self.cfg.fallback_model or 'tắt'}[/dim]\n"
-            f"Endpoint: [dim]{eff_endpoint_label}[/dim]\n"
+        self._safe_update_static(
+            sb_cfg,
+            f"Model chính: [bold magenta]{story_model_esc or f'chung ({model_esc})'}[/bold magenta]\n"
+            f"Fallback chính: [dim]{escape_markup(self.cfg.story_fallback_model) or 'tắt'}[/dim]\n"
+            f"Model phụ: [bold white]{model_esc}[/bold white]\n"
+            f"Fallback phụ: [dim]{escape_markup(self.cfg.fallback_model) or 'tắt'}[/dim]\n"
+            f"Endpoint: [dim]{escape_markup(eff_endpoint_label)}[/dim]\n"
             f"Key Gemini: {gem_badge}\n"
             f"Key DeepSeek: {ds_badge}\n"
-            f"Ngôn ngữ: [cyan]{self.cfg.lang}[/cyan]\n"
-            f"CG Style: [magenta]{self.cfg.compose_style.value}[/magenta]\n"
-            f"Mật độ CG: [cyan]{self.cfg.density}[/cyan]\n"
-            f"Tags: [magenta]{(self.cfg.tags[:30] + '...') if len(self.cfg.tags) > 30 else (self.cfg.tags or 'chưa đặt')}[/magenta]\n"
-            f"Font: [white]{self.cfg.font or 'auto (animeace3/pangolin)'}[/white]\n"
+            f"Ngôn ngữ: [cyan]{escape_markup(self.cfg.lang)}[/cyan]\n"
+            f"CG Style: [magenta]{escape_markup(self.cfg.compose_style.value)}[/magenta]\n"
+            f"Mật độ CG: [cyan]{escape_markup(self.cfg.density)}[/cyan]\n"
+            f"Tags: [magenta]{escape_markup(tags_raw)}[/magenta]\n"
+            f"Font: [white]{escape_markup(self.cfg.font or 'auto (animeace3/pangolin)')}[/white]\n"
             f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
             f"Cache: [cyan]{'Tự xóa khi xong 100%' if self.cfg.clean_cache else 'Giữ .koharu_cache'}[/cyan]\n"
             f"Xóa ZIP gốc: [cyan]{'Tự xóa (xác minh 100%)' if self.cfg.delete_source_zip else 'Giữ lại'}[/cyan]\n"
             f"Thông báo: [cyan]{'Bật (xong/lỗi)' if self.cfg.notify else 'Tắt'}[/cyan]\n"
-            f"Luồng dịch: [cyan]{workers_lbl}[/cyan]\n"
-            f"Prompt: [dim]{(self.cfg.custom_prompt[:46] + '...') if len(self.cfg.custom_prompt) > 46 else (self.cfg.custom_prompt or 'không')}[/dim]"
+            f"Luồng dịch: [cyan]{escape_markup(workers_lbl)}[/cyan]\n"
+            f"Prompt: [dim]{escape_markup(prompt_raw)}[/dim]",
         )
 
         ctd_cached = (Path.home() / ".cache" / "koharu-vn" / "comictextdetector.pt.onnx").is_file()
         out_str = self.cfg.last_output_dir or "Chưa có"
         if len(out_str) > 32:
             out_str = "..." + out_str[-29:]
+        next_name_esc = escape_markup(self.job_queue[0].input_path.name[:22]) if self.job_queue else ""
         q_lbl = (
-            f"[bold cyan]{len(self.job_queue)} tác phẩm[/bold cyan] (kế: {self.job_queue[0].input_path.name[:22]})"
+            f"[bold cyan]{len(self.job_queue)} tác phẩm[/bold cyan] (kế: {next_name_esc})"
             if self.job_queue
             else "[dim]trống[/dim]"
         )
-        self.query_one("#sb-resources", Static).update(
+        self._safe_update_static(
+            self.query_one("#sb-resources", Static),
             f"ONNX Mask: {'[green]Đã cache[/green]' if ctd_cached else '[yellow]Tự tải khi chạy[/yellow]'}\n"
             f"Fonts: [green]{len(available_fonts())} font Việt[/green]\n"
             f"Hàng đợi: {q_lbl}\n"
             f"Config: [dim]~/.koharu-vn/config.json[/dim]\n"
-            f"Output gần nhất:\n[cyan]{out_str}[/cyan]"
+            f"Output gần nhất:\n[cyan]{escape_markup(out_str)}[/cyan]",
         )
 
         status_strip = self.query_one("#status-strip", Static)
@@ -1195,18 +1216,24 @@ class KoharuTUI(App[None]):
             stream = self.query_one("#stream", RichLog)
         except Exception:
             return
-        stream.write(Text.from_markup(f"[cyan]●[/cyan] [{style}]{message}[/{style}]"))
+        try:
+            rendered = Text.from_markup(f"[cyan]●[/cyan] [{style}]{message}[/{style}]")
+        except Exception:
+            rendered = Text.assemble(("● ", "cyan"), (message, style))
+        stream.write(rendered)
 
     def _log_page_table(self, idx: int, total: int, img_name: str, doc: PageDocument, out_path: Path) -> None:
         stream = self.query_one("#stream", RichLog)
+        img_esc = escape_markup(img_name)
+        out_esc = escape_markup(out_path.name)
         if not doc.regions:
             stream.write(
-                Text.from_markup(f"  [dim]└─ [{idx}/{total}] {img_name}: 0 vùng thoại → lưu {out_path.name}[/dim]")
+                Text.from_markup(f"  [dim]└─ [{idx}/{total}] {img_esc}: 0 vùng thoại → lưu {out_esc}[/dim]")
             )
             return
 
         tbl = Table(
-            title=f"[{idx}/{total}] {img_name} ({len(doc.regions)} thoại) → {out_path.name}",
+            title=f"[{idx}/{total}] {img_esc} ({len(doc.regions)} thoại) → {out_esc}",
             box=box.SIMPLE_HEAVY,
             expand=True,
             show_lines=False,
@@ -1224,33 +1251,48 @@ class KoharuTUI(App[None]):
             )
             src_txt = (r.source_text or "").replace("\n", " ")[:48]
             vn_txt = (r.translated_text or "").replace("\n", " ")
-            tbl.add_row(str(r.id), kind_lbl, src_txt or "—", vn_txt)
+            tbl.add_row(str(r.id), kind_lbl, Text(src_txt or "—"), Text(vn_txt))
         stream.write(tbl)
         if doc.page_summary:
-            stream.write(Text.from_markup(f"  [dim italic]Ngữ cảnh trang: {doc.page_summary}[/dim italic]"))
+            stream.write(Text.from_markup(f"  [dim italic]Ngữ cảnh trang: {escape_markup(doc.page_summary)}[/dim italic]"))
 
     def _log_story_bible(self, bible: StoryBible) -> None:
         stream = self.query_one("#stream", RichLog)
         lines: list[str] = []
         if bible.title or bible.genre_and_tone:
-            lines.append(f"[bold cyan]{bible.title or 'Story Bible'}[/bold cyan] [dim]({bible.genre_and_tone})[/dim]")
+            lines.append(
+                f"[bold cyan]{escape_markup(bible.title or 'Story Bible')}[/bold cyan] "
+                f"[dim]({escape_markup(bible.genre_and_tone)})[/dim]"
+            )
         if bible.source_game:
-            lines.append(f"[bold magenta]Game / Series gốc:[/bold magenta] [bold white]{bible.source_game}[/bold white]")
+            lines.append(
+                f"[bold magenta]Game / Series gốc:[/bold magenta] [bold white]{escape_markup(bible.source_game)}[/bold white]"
+            )
         if bible.pre_event_backstory:
-            lines.append(f"[bold yellow]Trước sự kiện ảnh:[/bold yellow] [white]{bible.pre_event_backstory}[/white]")
+            lines.append(
+                f"[bold yellow]Trước sự kiện ảnh:[/bold yellow] [white]{escape_markup(bible.pre_event_backstory)}[/white]"
+            )
         if bible.during_event_plot:
-            lines.append(f"[bold green]Trong sự kiện ảnh:[/bold green] [white]{bible.during_event_plot}[/white]")
+            lines.append(
+                f"[bold green]Trong sự kiện ảnh:[/bold green] [white]{escape_markup(bible.during_event_plot)}[/white]"
+            )
         if bible.full_plot_summary:
-            lines.append(f"[dim]{bible.full_plot_summary}[/dim]")
+            lines.append(f"[dim]{escape_markup(bible.full_plot_summary)}[/dim]")
         if bible.characters:
             lines.append("\n[bold yellow]Nhân vật & Quy tắc xưng hô đã khóa:[/bold yellow]")
             for c in bible.characters:
                 lines.append(
-                    f"  • [bold]{c.name}[/bold] [dim]({c.appearance})[/dim] → [green]{c.pronoun_rules or c.role_and_tone}[/green]"
+                    f"  • [bold]{escape_markup(c.name)}[/bold] [dim]({escape_markup(c.appearance)})[/dim] → "
+                    f"[green]{escape_markup(c.pronoun_rules or c.role_and_tone)}[/green]"
                 )
+        body_markup = "\n".join(lines) or "Đã phân tích ngữ cảnh toàn tập."
+        try:
+            body_text = Text.from_markup(body_markup)
+        except Exception:
+            body_text = Text(body_markup)
         stream.write(
             Panel(
-                Text.from_markup("\n".join(lines) or "Đã phân tích ngữ cảnh toàn tập."),
+                body_text,
                 title="[bold magenta]Pass 1 · Cốt truyện & Nhân vật toàn tập[/bold magenta]",
                 border_style="magenta",
                 box=box.ROUNDED,
@@ -1323,7 +1365,7 @@ class KoharuTUI(App[None]):
             p_str = str(p)
             if " " in p_str:
                 p_str = f'"{p_str}"'
-            popup.add_option(Option(f"[cyan]{kind_tag}[/cyan] {p.name}"))
+            popup.add_option(Option(f"[cyan]{escape_markup(kind_tag)}[/cyan] {escape_markup(p.name)}"))
             self._popup_items.append((p_str + (" " if not p.is_dir() else ""), "path"))
         self._popup_mode = "path"
         self._popup_navigated = False
@@ -1878,7 +1920,7 @@ class KoharuTUI(App[None]):
             else:
                 self._log_ai("Đã chuyển Detector + LaMa Inpaint + OCR sang chạy [bold yellow]CPU[/bold yellow].")
         else:
-            self._log_ai(f"Không rõ lệnh `[bold]{cmd}[/bold]`. Gõ `/help` hoặc `/` để xem các lệnh hỗ trợ.", style="yellow")
+            self._log_ai(f"Không rõ lệnh `[bold]{escape_markup(cmd)}[/bold]`. Gõ `/help` hoặc `/` để xem các lệnh hỗ trợ.", style="yellow")
 
     def _open_picker(self, title: str, subtitle: str, choices: list[tuple[str, str]], current: str, cb) -> None:
         self.push_screen(PickerModal(title, subtitle, choices, current=current), lambda v: cb(v) if v else None)
@@ -2113,28 +2155,28 @@ class KoharuTUI(App[None]):
         self.cfg.custom_prompt = value
         save_config(self.cfg)
         self._refresh_chrome()
-        self._log_ai(f"Đã cập nhật prompt mặc định: [bold]{self.cfg.custom_prompt or '(trống)'}[/bold]")
+        self._log_ai(f"Đã cập nhật prompt mặc định: [bold]{escape_markup(self.cfg.custom_prompt or '(trống)')}[/bold]")
 
     def _set_story_context(self, value: str) -> None:
         self.cfg.story_context = value
         save_config(self.cfg)
         self._refresh_chrome()
-        self._log_ai(f"Đã cập nhật cốt truyện/nhân vật (`/story`): [bold]{self.cfg.story_context or '(trống)'}[/bold]")
+        self._log_ai(f"Đã cập nhật cốt truyện/nhân vật (`/story`): [bold]{escape_markup(self.cfg.story_context or '(trống)')}[/bold]")
 
     def _set_tags(self, value: str) -> None:
         self.cfg.tags = value.strip()
         save_config(self.cfg)
         self._refresh_chrome()
-        self._log_ai(f"Đã cập nhật tag thể loại (`/tags`): [bold magenta]{self.cfg.tags or '(trống)'}[/bold magenta]")
+        self._log_ai(f"Đã cập nhật tag thể loại (`/tags`): [bold magenta]{escape_markup(self.cfg.tags or '(trống)')}[/bold magenta]")
 
     def _set_theme(self, value: str) -> None:
         try:
             self.theme = value
             self.cfg.theme = value
             save_config(self.cfg)
-            self._log_ai(f"Đã đổi theme sang: [bold]{value}[/bold]")
+            self._log_ai(f"Đã đổi theme sang: [bold]{escape_markup(value)}[/bold]")
         except Exception as exc:
-            self._log_ai(f"Không áp dụng được theme '{value}': {exc}", style="red")
+            self._log_ai(f"Không áp dụng được theme '{escape_markup(value)}': {escape_markup(str(exc))}", style="red")
 
     def _on_key_saved(self, result: tuple[str, str, str] | None) -> None:
         if result is None:
@@ -2167,9 +2209,9 @@ class KoharuTUI(App[None]):
                 subprocess.Popen(["open", target])
             else:
                 subprocess.Popen(["xdg-open", target])
-            self._log_ai(f"Đã mở thư mục: [cyan]{target}[/cyan]")
+            self._log_ai(f"Đã mở thư mục: [cyan]{escape_markup(target)}[/cyan]")
         except Exception as exc:
-            self._log_ai(f"Không mở được Explorer: {exc}", style="red")
+            self._log_ai(f"Không mở được Explorer: {escape_markup(str(exc))}", style="red")
 
     def _show_help(self) -> None:
         tbl = Table(title="Danh sách lệnh Koharu-VN CLI", box=box.ROUNDED, expand=True)
@@ -2216,7 +2258,7 @@ class KoharuTUI(App[None]):
         lbl = mode_names.get(job.mode, job.mode)
         self._log_ai(
             f"📥 [bold cyan]Đã thêm vào hàng đợi (#{len(self.job_queue)})[/bold cyan]: "
-            f"[bold]{job.input_path.name}[/bold] ({lbl}) — sẽ tự động chạy khi tác phẩm hiện tại xong.",
+            f"[bold]{escape_markup(job.input_path.name)}[/bold] ({escape_markup(lbl)}) — sẽ tự động chạy khi tác phẩm hiện tại xong.",
         )
 
     def _dispatch_job_spec(self, job: QueuedJob) -> None:
@@ -2252,7 +2294,7 @@ class KoharuTUI(App[None]):
             self._refresh_chrome()
             self._log_ai(
                 f"▶ [bold cyan]Hàng đợi: Tự động chuyển sang tác phẩm tiếp theo[/bold cyan] "
-                f"[bold]{next_job.input_path.name}[/bold] (còn {len(self.job_queue)} chờ)..."
+                f"[bold]{escape_markup(next_job.input_path.name)}[/bold] (còn {len(self.job_queue)} chờ)..."
             )
             self._dispatch_job_spec(next_job)
 
@@ -2269,7 +2311,7 @@ class KoharuTUI(App[None]):
         tbl.add_column("Tác phẩm", style="bold white")
         tbl.add_column("Ghi chú", style="dim")
         for idx, j in enumerate(self.job_queue, start=1):
-            tbl.add_row(str(idx), j.mode, str(j.input_path), j.prompt or "-")
+            tbl.add_row(str(idx), j.mode, Text(str(j.input_path)), Text(j.prompt or "-"))
         self.query_one("#stream", RichLog).write(tbl)
 
     def _handle_queue_command(self, rest: str) -> None:
@@ -2298,7 +2340,7 @@ class KoharuTUI(App[None]):
             if 1 <= pos <= len(self.job_queue):
                 removed = self.job_queue.pop(pos - 1)
                 self._refresh_chrome()
-                self._log_ai(f"Đã gỡ #{pos} ([bold]{removed.input_path.name}[/bold]) khỏi hàng đợi.")
+                self._log_ai(f"Đã gỡ #{pos} ([bold]{escape_markup(removed.input_path.name)}[/bold]) khỏi hàng đợi.")
             else:
                 self._log_ai(f"Không có mục #{pos} trong hàng đợi.", style="yellow")
             return
@@ -2327,7 +2369,7 @@ class KoharuTUI(App[None]):
         for p_str in paths:
             p_obj = Path(p_str)
             if not p_obj.exists():
-                self._log_ai(f"Bỏ qua đường dẫn không tồn tại: [red]{p_obj}[/red]", style="yellow")
+                self._log_ai(f"Bỏ qua đường dẫn không tồn tại: [red]{escape_markup(str(p_obj))}[/red]", style="yellow")
                 continue
             job = QueuedJob(mode=mode, input_path=p_obj, tags=self.cfg.tags)
             if not self.is_running_job and added == 0 and not self.job_queue:
@@ -2351,12 +2393,14 @@ class KoharuTUI(App[None]):
         self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER_FRAMES)
         spin = self._SPINNER_FRAMES[self._spinner_idx]
         elapsed = self._format_elapsed()
-        self.query_one("#sb-job-status", Static).update(
-            f"[yellow]{spin} {elapsed}[/yellow]\n{self._last_job_status}"
+        self._safe_update_static(
+            self.query_one("#sb-job-status", Static),
+            f"[yellow]{spin} {elapsed}[/yellow]\n{self._last_job_status}",
         )
-        self.query_one("#status-strip", Static).update(
+        self._safe_update_static(
+            self.query_one("#status-strip", Static),
             f"[yellow]{spin} Đang chạy ({elapsed}) — Esc để hủy[/yellow]  │  "
-            "Gõ [bold]/[/bold] xem lệnh  •  [bold]@[/bold] duyệt file  •  [bold]F2[/bold] đổi kiểu CG  •  [bold]Ctrl+P[/bold] bảng lệnh"
+            "Gõ [bold]/[/bold] xem lệnh  •  [bold]@[/bold] duyệt file  •  [bold]F2[/bold] đổi kiểu CG  •  [bold]Ctrl+P[/bold] bảng lệnh",
         )
 
     def _set_job_ui(self, running: bool, status_text: str = "Đang rảnh", pct: float = 0.0) -> None:
@@ -2378,9 +2422,9 @@ class KoharuTUI(App[None]):
         if running:
             spin = self._SPINNER_FRAMES[self._spinner_idx % len(self._SPINNER_FRAMES)]
             elapsed = self._format_elapsed()
-            sb_status.update(f"[yellow]{spin} {elapsed}[/yellow]\n{status_text}")
+            self._safe_update_static(sb_status, f"[yellow]{spin} {elapsed}[/yellow]\n{status_text}")
         else:
-            sb_status.update(status_text)
+            self._safe_update_static(sb_status, status_text)
         pb.update(progress=pct)
         self._refresh_chrome()
 
@@ -2427,11 +2471,12 @@ class KoharuTUI(App[None]):
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
             nonlocal max_pct
-            stage_tag = f"[{idx}/{total}] {name}" if idx > 0 else name
+            stage_tag = escape_markup(f"[{idx}/{total}] {name}" if idx > 0 else name)
+            detail_esc = escape_markup(detail)
             if idx <= 0:
                 max_pct = max(max_pct, 5.0)
-            self.call_from_thread(self._set_job_ui, True, f"[cyan]{stage_tag}[/cyan]\n{detail}", max_pct)
-            self.call_from_thread(self._log_ai, f"[dim]{stage_tag}[/dim] · {detail}")
+            self.call_from_thread(self._set_job_ui, True, f"[cyan]{stage_tag}[/cyan]\n{detail_esc}", max_pct)
+            self.call_from_thread(self._log_ai, f"[dim]{stage_tag}[/dim] · {detail_esc}")
 
         def on_page_done(idx: int, total: int, name: str, doc: PageDocument, out_path: Path) -> None:
             nonlocal done_pages, max_pct
@@ -2439,7 +2484,7 @@ class KoharuTUI(App[None]):
             max_pct = max(max_pct, (done_pages / max(1, total)) * 100.0)
             self.call_from_thread(self._log_page_table, idx, total, name, doc, out_path)
             self.call_from_thread(
-                self._set_job_ui, True, f"[green]Xong {done_pages}/{total}[/green]\n{name}", max_pct
+                self._set_job_ui, True, f"[green]Xong {done_pages}/{total}[/green]\n{escape_markup(name)}", max_pct
             )
 
         def on_story_bible(bible: StoryBible) -> None:
@@ -2477,7 +2522,7 @@ class KoharuTUI(App[None]):
         if not self._ensure_llm_ready(needs_llm=True):
             return
         if not input_path.exists():
-            self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            self._log_ai(f"Không tìm thấy đường dẫn: [red]{escape_markup(str(input_path))}[/red]", style="red")
             return
         if self.is_running_job:
             self._enqueue_job(
@@ -2524,7 +2569,7 @@ class KoharuTUI(App[None]):
         if not self._ensure_llm_ready(needs_llm=True):
             return
         if not input_path.exists():
-            self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            self._log_ai(f"Không tìm thấy đường dẫn: [red]{escape_markup(str(input_path))}[/red]", style="red")
             return
         if self.is_running_job:
             self._enqueue_job(
@@ -2565,7 +2610,7 @@ class KoharuTUI(App[None]):
             if retranslate_untranslated
             else ("Tiếp tục dịch" if resume else "Dịch truyện")
         )
-        self.call_from_thread(self._set_job_ui, True, f"{mode_lbl}: {input_path.name}", 2.0)
+        self.call_from_thread(self._set_job_ui, True, f"{mode_lbl}: {escape_markup(input_path.name)}", 2.0)
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
 
@@ -2609,7 +2654,7 @@ class KoharuTUI(App[None]):
             )
             self.call_from_thread(
                 self._log_ai,
-                f"[bold green]Hoàn tất {'tái dịch' if retranslate_untranslated else 'dịch'} {len(docs)} trang![/bold green] Lưu tại: [cyan]{out_dir}[/cyan] (gõ `/open` để mở)",
+                f"[bold green]Hoàn tất {'tái dịch' if retranslate_untranslated else 'dịch'} {len(docs)} trang![/bold green] Lưu tại: [cyan]{escape_markup(str(out_dir))}[/cyan] (gõ `/open` để mở)",
             )
             self._notify_result(
                 "Koharu-VN · Tái dịch xong!" if retranslate_untranslated else "Koharu-VN · Dịch xong!",
@@ -2623,7 +2668,7 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(
                 self._log_ai,
-                f"Lỗi khi dịch truyện: [red]{exc}[/red]\n[dim]Mẹo: Gõ `/resume` để dịch tiếp từ trang đang dừng mà không tốn công dịch lại các trang đã xong.[/dim]",
+                f"Lỗi khi dịch truyện: [red]{escape_markup(str(exc))}[/red]\n[dim]Mẹo: Gõ `/resume` để dịch tiếp từ trang đang dừng mà không tốn công dịch lại các trang đã xong.[/dim]",
                 "red",
             )
             self._notify_result("Koharu-VN · Lỗi dịch truyện", str(exc), is_error=True)
@@ -2648,7 +2693,7 @@ class KoharuTUI(App[None]):
             else f"Sáng tác CG ({self.cfg.compose_style.value}{range_tag})"
         )
         self.call_from_thread(
-            self._set_job_ui, True, f"{mode_lbl}: {input_path.name}", 2.0
+            self._set_job_ui, True, f"{escape_markup(mode_lbl)}: {escape_markup(input_path.name)}", 2.0
         )
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
@@ -2686,7 +2731,7 @@ class KoharuTUI(App[None]):
             )
             self.call_from_thread(
                 self._log_ai,
-                f"[bold green]Hoàn tất sáng tác thoại CG ({self.cfg.compose_style.value})![/bold green] Lưu tại: [cyan]{out_dir}[/cyan]",
+                f"[bold green]Hoàn tất sáng tác thoại CG ({escape_markup(self.cfg.compose_style.value)})![/bold green] Lưu tại: [cyan]{escape_markup(str(out_dir))}[/cyan]",
             )
             self._notify_result(
                 "Koharu-VN · Sáng tác CG xong!",
@@ -2700,7 +2745,7 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
             self.call_from_thread(
                 self._log_ai,
-                f"Lỗi khi sáng tác CG: [red]{exc}[/red]\n[dim]Mẹo: Gõ `/resume` để chạy tiếp từ trang đang dừng.[/dim]",
+                f"Lỗi khi sáng tác CG: [red]{escape_markup(str(exc))}[/red]\n[dim]Mẹo: Gõ `/resume` để chạy tiếp từ trang đang dừng.[/dim]",
                 "red",
             )
             self._notify_result("Koharu-VN · Lỗi sáng tác CG", str(exc), is_error=True)
@@ -2709,7 +2754,7 @@ class KoharuTUI(App[None]):
 
     def _launch_rename(self, input_path: Path, in_place: bool = False) -> None:
         if not input_path.exists():
-            self._log_ai(f"Không tìm thấy đường dẫn: [red]{input_path}[/red]", style="red")
+            self._log_ai(f"Không tìm thấy đường dẫn: [red]{escape_markup(str(input_path))}[/red]", style="red")
             return
         if self.is_running_job:
             self._enqueue_job(QueuedJob(mode="rename", input_path=input_path, in_place=in_place))
@@ -2719,7 +2764,9 @@ class KoharuTUI(App[None]):
     @work(thread=True)
     def _start_rename(self, input_path: Path, in_place: bool = False) -> None:
         self.cancel_event.clear()
-        self.call_from_thread(self._set_job_ui, True, f"Đổi tên & nén WebP 100%: {input_path.name}", 10.0)
+        self.call_from_thread(
+            self._set_job_ui, True, f"Đổi tên & nén WebP 100%: {escape_markup(input_path.name)}", 10.0
+        )
         was_cancelled = False
         try:
             out_dir, files = pack_images_to_webp(
@@ -2732,7 +2779,7 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, f"[green]Xong {len(files)} ảnh WebP![/green]", 100.0)
             self.call_from_thread(
                 self._log_ai,
-                f"[bold green]Đã đổi tên 001..{len(files):03d}.webp (max quality 100)![/bold green] Lưu tại: [cyan]{out_dir}[/cyan]",
+                f"[bold green]Đã đổi tên 001..{len(files):03d}.webp (max quality 100)![/bold green] Lưu tại: [cyan]{escape_markup(str(out_dir))}[/cyan]",
             )
             self._notify_result("Koharu-VN · Đổi tên WebP xong!", f"{len(files)} ảnh -> {out_dir.name}")
         except PipelineCancelledError:
@@ -2740,7 +2787,9 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
-            self.call_from_thread(self._log_ai, f"Lỗi khi đổi tên & chuyển WebP: [red]{exc}[/red]", "red")
+            self.call_from_thread(
+                self._log_ai, f"Lỗi khi đổi tên & chuyển WebP: [red]{escape_markup(str(exc))}[/red]", "red"
+            )
             self._notify_result("Koharu-VN · Lỗi đóng gói WebP", str(exc), is_error=True)
         finally:
             self.call_from_thread(self._on_worker_finished, cancelled=was_cancelled)
@@ -2748,7 +2797,7 @@ class KoharuTUI(App[None]):
     @work(thread=True)
     def _start_rerender(self, output_dir: Path) -> None:
         self.cancel_event.clear()
-        self.call_from_thread(self._set_job_ui, True, f"Rerender: {output_dir.name}", 10.0)
+        self.call_from_thread(self._set_job_ui, True, f"Rerender: {escape_markup(output_dir.name)}", 10.0)
         was_cancelled = False
         try:
             docs = run_rerender_pipeline(
@@ -2761,7 +2810,7 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, f"[green]Rerender {len(docs)} trang![/green]", 100.0)
             self.call_from_thread(
                 self._log_ai,
-                f"[bold green]Đã render lại {len(docs)} trang (0 giây API)![/bold green] Tại: [cyan]{output_dir}[/cyan]",
+                f"[bold green]Đã render lại {len(docs)} trang (0 giây API)![/bold green] Tại: [cyan]{escape_markup(str(output_dir))}[/cyan]",
             )
             self._notify_result("Koharu-VN · Rerender xong!", f"{len(docs)} trang tại {output_dir.name}")
         except PipelineCancelledError:
@@ -2769,7 +2818,7 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, "[yellow]Đã hủy[/yellow]", 0.0)
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi[/red]", 0.0)
-            self.call_from_thread(self._log_ai, f"Lỗi khi rerender: [red]{exc}[/red]", "red")
+            self.call_from_thread(self._log_ai, f"Lỗi khi rerender: [red]{escape_markup(str(exc))}[/red]", "red")
             self._notify_result("Koharu-VN · Lỗi rerender", str(exc), is_error=True)
         finally:
             self.call_from_thread(self._on_worker_finished, cancelled=was_cancelled)
@@ -2786,12 +2835,12 @@ class KoharuTUI(App[None]):
             self.call_from_thread(self._set_job_ui, False, "[green]ONNX sẵn sàng![/green]", 100.0)
             self.call_from_thread(
                 self._log_ai,
-                f"[bold green]Đã nạp sẵn 3 model ONNX[/bold green] (Detector={det_dev}, LaMa={inp_dev}) & "
+                f"[bold green]Đã nạp sẵn 3 model ONNX[/bold green] (Detector={escape_markup(det_dev)}, LaMa={escape_markup(inp_dev)}) & "
                 f"{len(available_fonts())} font Tiếng Việt.",
             )
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi model[/red]", 0.0)
-            self.call_from_thread(self._log_ai, f"Lỗi khi kiểm tra ONNX: [red]{exc}[/red]", "red")
+            self.call_from_thread(self._log_ai, f"Lỗi khi kiểm tra ONNX: [red]{escape_markup(str(exc))}[/red]", "red")
 
     @work(thread=True)
     def _run_chat_assistant(self, text: str) -> None:
@@ -2815,10 +2864,10 @@ class KoharuTUI(App[None]):
             summary = f"model={self.cfg.model}, lang={self.cfg.lang}, compose_style={self.cfg.compose_style.value}"
             reply = client.ask_assistant(text, session_summary=summary)
             self.call_from_thread(self._set_job_ui, False, "Sẵn sàng", 0.0)
-            self.call_from_thread(self._log_ai, reply)
+            self.call_from_thread(self._log_ai, escape_markup(reply))
         except Exception as exc:
             self.call_from_thread(self._set_job_ui, False, "[red]Lỗi API[/red]", 0.0)
-            self.call_from_thread(self._log_ai, f"Không gọi được Gemini: [red]{exc}[/red]", "red")
+            self.call_from_thread(self._log_ai, f"Không gọi được Gemini: [red]{escape_markup(str(exc))}[/red]", "red")
 
 
 def launch_tui(theme: str | None = None) -> None:

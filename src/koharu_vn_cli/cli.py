@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 import typer
 from rich.console import Console
+from rich.markup import escape as escape_markup
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
@@ -236,7 +237,11 @@ def _execute_translate_cli(
         completed_pages = 0
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
-            progress.update(task, total=max(1, total), description=f"[{idx}/{total}] {name}: {detail}")
+            progress.update(
+                task,
+                total=max(1, total),
+                description=f"[{idx}/{total}] {escape_markup(name)}: {escape_markup(detail)}",
+            )
 
         def on_page_done(idx: int, total: int, name: str, doc, out_path: Path) -> None:
             nonlocal completed_pages
@@ -244,10 +249,10 @@ def _execute_translate_cli(
             progress.update(task, total=max(1, total), completed=completed_pages)
 
         def on_story_bible(bible) -> None:
-            game_tag = f" [{bible.source_game}]" if getattr(bible, "source_game", "") else ""
+            game_tag = f" [{escape_markup(bible.source_game)}]" if getattr(bible, "source_game", "") else ""
             progress.console.print(
-                f"[cyan]✓ Pass 1 Story Bible{game_tag}:[/cyan] {bible.title or 'Đã phân tích'} "
-                f"({len(bible.characters)} nhân vật) — [dim]{bible.full_plot_summary[:140]}[/dim]"
+                f"[cyan]✓ Pass 1 Story Bible{game_tag}:[/cyan] {escape_markup(bible.title or 'Đã phân tích')} "
+                f"({len(bible.characters)} nhân vật) — [dim]{escape_markup(bible.full_plot_summary[:140])}[/dim]"
             )
 
         try:
@@ -295,7 +300,7 @@ def _execute_translate_cli(
                 is_error=True,
                 enabled=eff_notify,
             )
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{escape_markup(str(exc))}[/red]")
             raise typer.Exit(1)
         except Exception as exc:
             console.bell()
@@ -313,9 +318,13 @@ def _execute_translate_cli(
         f"Đã hoàn tất {len(docs)} trang -> {out_dir.name}",
         enabled=eff_notify,
     )
-    console.print(f"[bold green]Hoàn tất ({len(docs)} trang)![/bold green] Ảnh kết quả lưu tại: {out_dir}")
+    out_esc = escape_markup(str(out_dir))
+    console.print(f"[bold green]Hoàn tất ({len(docs)} trang)![/bold green] Ảnh kết quả lưu tại: {out_esc}")
     if (out_dir / ".koharu_cache").is_dir():
-        console.print(f"[dim]Mẹo: Chỉnh thoại trong {out_dir / '.koharu_cache'}/*.koharu.json rồi chạy `koharu-vn rerender {out_dir}` (0 giây API).[/dim]")
+        cache_esc = escape_markup(str(out_dir / ".koharu_cache"))
+        console.print(
+            f"[dim]Mẹo: Chỉnh thoại trong {cache_esc}/*.koharu.json rồi chạy `koharu-vn rerender {out_esc}` (0 giây API).[/dim]"
+        )
     else:
         console.print("[dim]Đã tự dọn sạch `.koharu_cache` sau khi hoàn tất 100%.[/dim]")
 
@@ -498,7 +507,11 @@ def compose(
         completed_pages = 0
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
-            progress.update(task, total=max(1, total), description=f"[{idx}/{total}] {name}: {detail}")
+            progress.update(
+                task,
+                total=max(1, total),
+                description=f"[{idx}/{total}] {escape_markup(name)}: {escape_markup(detail)}",
+            )
 
         def on_page_done(idx: int, total: int, name: str, doc, out_path: Path) -> None:
             nonlocal completed_pages
@@ -506,10 +519,10 @@ def compose(
             progress.update(task, total=max(1, total), completed=completed_pages)
 
         def on_story_bible(bible) -> None:
-            game_tag = f" [{bible.source_game}]" if getattr(bible, "source_game", "") else ""
+            game_tag = f" [{escape_markup(bible.source_game)}]" if getattr(bible, "source_game", "") else ""
             progress.console.print(
-                f"[cyan]✓ Pass 1 CG Story Bible{game_tag}:[/cyan] {bible.title or 'Đã phân tích'} "
-                f"({len(bible.characters)} nhân vật) — [dim]{bible.full_plot_summary[:140]}[/dim]"
+                f"[cyan]✓ Pass 1 CG Story Bible{game_tag}:[/cyan] {escape_markup(bible.title or 'Đã phân tích')} "
+                f"({len(bible.characters)} nhân vật) — [dim]{escape_markup(bible.full_plot_summary[:140])}[/dim]"
             )
 
         try:
@@ -552,7 +565,7 @@ def compose(
                 is_error=True,
                 enabled=eff_notify,
             )
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{escape_markup(str(exc))}[/red]")
             raise typer.Exit(1)
         except Exception as exc:
             console.bell()
@@ -570,7 +583,7 @@ def compose(
         f"Đã hoàn tất {len(docs)} ảnh CG -> {out_dir.name}",
         enabled=eff_notify,
     )
-    console.print(f"[bold green]Hoàn tất sáng tác ({len(docs)} ảnh)![/bold green] Lưu tại: {out_dir}")
+    console.print(f"[bold green]Hoàn tất sáng tác ({len(docs)} ảnh)![/bold green] Lưu tại: {escape_markup(str(out_dir))}")
 
 
 @app.command()
@@ -591,10 +604,10 @@ def rerender(
             sequential_names=seq_names,
         )
     except FileNotFoundError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape_markup(str(exc))}[/red]")
         raise typer.Exit(1)
 
-    console.print(f"[bold green]Đã render lại {len(docs)} trang tại {output_dir}![/bold green]")
+    console.print(f"[bold green]Đã render lại {len(docs)} trang tại {escape_markup(str(output_dir))}![/bold green]")
 
 
 @app.command()
@@ -607,10 +620,10 @@ def rename(
     try:
         out_dir, files = pack_images_to_webp(input_path, output=output, in_place=in_place)
     except (FileNotFoundError, ValueError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape_markup(str(exc))}[/red]")
         raise typer.Exit(1)
     console.print(
-        f"[bold green]Đã chuyển {len(files)} ảnh sang WebP (quality=100) & đánh số 001..{len(files):03d}![/bold green] Lưu tại: {out_dir}"
+        f"[bold green]Đã chuyển {len(files)} ảnh sang WebP (quality=100) & đánh số 001..{len(files):03d}![/bold green] Lưu tại: {escape_markup(str(out_dir))}"
     )
 
 
@@ -711,7 +724,7 @@ def queue(
     valid_paths = [p for p in paths if p.exists()]
     missing = [p for p in paths if not p.exists()]
     for m in missing:
-        console.print(f"[yellow]Bỏ qua đường dẫn không tồn tại: {m}[/yellow]")
+        console.print(f"[yellow]Bỏ qua đường dẫn không tồn tại: {escape_markup(str(m))}[/yellow]")
     if not valid_paths:
         console.print("[red]Không có tác phẩm hợp lệ nào trong hàng chờ.[/red]")
         raise typer.Exit(code=1)
@@ -719,7 +732,7 @@ def queue(
     total = len(valid_paths)
     console.print(f"[bold cyan]Hàng chờ gồm {total} tác phẩm — sẽ chạy tuần tự từng bộ.[/bold cyan]")
     for idx, p in enumerate(valid_paths, start=1):
-        console.print(f"\n[bold magenta]>>> Hàng chờ [{idx}/{total}]: {p.name}[/bold magenta]")
+        console.print(f"\n[bold magenta]>>> Hàng chờ [{idx}/{total}]: {escape_markup(p.name)}[/bold magenta]")
         _execute_translate_cli(
             p,
             output=None,

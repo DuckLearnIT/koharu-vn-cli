@@ -258,3 +258,37 @@ def test_tui_zip_drop_intent_and_review_timeout_and_notify(tmp_path: Path, monke
     assert len(notifs) == 1
     assert notifs[0][2] is True and "API broken" in notifs[0][1]
 
+
+def test_tui_queue_and_chrome_handle_square_brackets_in_filenames(tmp_path: Path, monkeypatch) -> None:
+    """Doujinshi filenames like '(C100) [Solar Milk Soft] ...zip' must never raise Rich MarkupError."""
+    zip_a = tmp_path / "(C100) [Solar Milk Soft (Solar Milk)] Barbara Bad End (Genshin Impact).zip"
+    zip_b = tmp_path / "[Circle [Sub]] Chapter [bold] Test.zip"
+    zip_a.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    zip_b.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+    async def scenario() -> None:
+        app = KoharuTUI()
+        app.cfg.api_key = "test-key"
+        app.cfg.last_output_dir = str(tmp_path / "(C100) [Solar Milk Soft] out")
+        app.cfg.custom_prompt = "nhân vật [Barbara] nói nhẹ nhàng"
+        app.cfg.tags = "[Genshin] vanilla"
+
+        async with app.run_test(size=(120, 36)) as pilot:
+            # Pretend a job is already running so /queue enqueues immediately and refreshes sidebar chrome
+            app.is_running_job = True
+            app.dispatch_command(f'/queue "{zip_a}" "{zip_b}"')
+            await pilot.pause(0.05)
+
+            assert len(app.job_queue) == 2
+            # Exercise queue table, status updates, timer tick, malformed markup log, and queue remove
+            app.dispatch_command("/queue list")
+            app._set_job_ui(True, f"Dịch truyện: {zip_a.name}", 25.0)
+            app._tick_job_timer()
+            app._log_ai("Malformed [/dim] [unclosed tag message", style="yellow")
+            app.dispatch_command("/queue remove 1")
+            await pilot.pause(0.05)
+            assert len(app.job_queue) == 1
+
+    asyncio.run(scenario())
+
+
