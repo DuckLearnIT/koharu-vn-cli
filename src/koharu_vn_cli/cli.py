@@ -235,8 +235,12 @@ def _execute_translate_cli(
     ) as progress:
         task = progress.add_task(job_title, total=None)
         completed_pages = 0
+        zip_status_note: tuple[str, str] | None = None
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
+            nonlocal zip_status_note
+            if stage in {"delete_zip", "keep_zip"}:
+                zip_status_note = (stage, detail)
             progress.update(
                 task,
                 total=max(1, total),
@@ -327,6 +331,10 @@ def _execute_translate_cli(
         )
     else:
         console.print("[dim]Đã tự dọn sạch `.koharu_cache` sau khi hoàn tất 100%.[/dim]")
+    if zip_status_note is not None:
+        z_stage, z_msg = zip_status_note
+        z_color = "cyan" if z_stage == "delete_zip" else "yellow"
+        console.print(f"[{z_color}]{escape_markup(z_msg)}[/{z_color}]")
 
 
 @app.command()
@@ -505,8 +513,12 @@ def compose(
     ) as progress:
         task = progress.add_task("AI đang sáng tác thoại CG...", total=None)
         completed_pages = 0
+        zip_status_note: tuple[str, str] | None = None
 
         def on_step(idx: int, total: int, name: str, stage: str, detail: str) -> None:
+            nonlocal zip_status_note
+            if stage in {"delete_zip", "keep_zip"}:
+                zip_status_note = (stage, detail)
             progress.update(
                 task,
                 total=max(1, total),
@@ -584,6 +596,10 @@ def compose(
         enabled=eff_notify,
     )
     console.print(f"[bold green]Hoàn tất sáng tác ({len(docs)} ảnh)![/bold green] Lưu tại: {escape_markup(str(out_dir))}")
+    if zip_status_note is not None:
+        z_stage, z_msg = zip_status_note
+        z_color = "cyan" if z_stage == "delete_zip" else "yellow"
+        console.print(f"[{z_color}]{escape_markup(z_msg)}[/{z_color}]")
 
 
 @app.command()

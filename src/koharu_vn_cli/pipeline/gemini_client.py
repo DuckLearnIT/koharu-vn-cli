@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import math
 import os
 import re
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +74,383 @@ def _is_quota_error(status_code: int, body_text: str) -> bool:
     if status_code in (400, 403) and _QUOTA_BODY_RE.search(body_text or ""):
         return True
     return False
+
+
+def _is_auth_error(status_code: int, body_text: str) -> bool:
+    if status_code in (401, 403) and not _is_quota_error(status_code, body_text):
+        return True
+    if status_code == 400 and re.search(
+        r"API_KEY_INVALID|invalid api key|api key not valid|expired|permission_denied",
+        body_text or "",
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+_DEFAULT_KEY_HEALTH_PATH = Path.home() / ".koharu-vn" / "key_health.json"
+_KEY_HEALTH_RETENTION_SECONDS = 7 * 24 * 3600
+_COOLDOWN_SCHEDULE: dict[str, tuple[float, ...]] = {
+    "auth": (1800.0, 3600.0, 7200.0),
+    "quota": (300.0, 900.0, 1800.0),
+    "transient": (60.0, 180.0, 300.0),
+}
+
+
+@dataclass
+class _KeyStat:
+    use_count: int = 0
+    success_count: int = 0
+    error_count: int = 0
+    consecutive_errors: int = 0
+    last_used_at: float = 0.0
+    last_success_at: float = 0.0
+    last_error_at: float = 0.0
+    cooldown_until: float = 0.0
+    last_error_kind: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "use_count": self.use_count,
+            "success_count": self.success_count,
+            "error_count": self.error_count,
+            "consecutive_errors": self.consecutive_errors,
+            "last_used_at": self.last_used_at,
+            "last_success_at": self.last_success_at,
+            "last_error_at": self.last_error_at,
+            "cooldown_until": self.cooldown_until,
+            "last_error_kind": self.last_error_kind,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> _KeyStat:
+        return cls(
+            use_count=int(raw.get("use_count", 0) or 0),
+            success_count=int(raw.get("success_count", 0) or 0),
+            error_count=int(raw.get("error_count", 0) or 0),
+            consecutive_errors=int(raw.get("consecutive_errors", 0) or 0),
+            last_used_at=float(raw.get("last_used_at", 0.0) or 0.0),
+            last_success_at=float(raw.get("last_success_at", 0.0) or 0.0),
+            last_error_at=float(raw.get("last_error_at", 0.0) or 0.0),
+            cooldown_until=float(raw.get("cooldown_until", 0.0) or 0.0),
+            last_error_kind=str(raw.get("last_error_kind", "") or ""),
+        )
+
+
+def _endpoint_scope(base_url: str | None, model: str) -> str:
+    if base_url:
+        return base_url.strip().rstrip("/").lower()
+    if is_deepseek_model(model):
+        return DEEPSEEK_BASE_URL.lower()
+    return "gemini-official"
+
+
+def _key_hash(namespace: str, api_key: str) -> str:
+    return hashlib.sha256(f"{namespace}::{api_key}".encode("utf-8")).hexdigest()[:24]
+
+
+class SmartKeyHealthTracker:
+    """
+    Thread-safe, persistent API key health & smart rotation scheduler.
+
+    Prioritizes:
+      0) Healthy & never-used keys (e.g., if keys 1..4 previously errored, jump straight to 5, 6, 7...)
+      1) Healthy & previously succeeded keys (least-recently-used + fewest in-flight calls)
+      2) Previously errored keys whose cooldown has already expired
+      3) Keys still in active cooldown (last resort only, soonest-recovering non-auth-dead first)
+    """
+
+    def __init__(self, state_path: Path | None = None, *, persist: bool = True) -> None:
+        self._lock = threading.Lock()
+        self._persist = persist
+        self._state_path = state_path
+        self._stats: dict[str, _KeyStat] = {}
+        self._in_flight: dict[str, int] = {}
+        self._loaded = False
+
+    def _effective_state_path(self) -> Path | None:
+        if not self._persist:
+            return None
+        if self._state_path is not None:
+            return self._state_path
+        env_p = (os.environ.get("KOHARU_KEY_HEALTH_FILE") or "").strip()
+        if env_p:
+            return Path(env_p)
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        return _DEFAULT_KEY_HEALTH_PATH
+
+    def _ensure_loaded_locked(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        path = self._effective_state_path()
+        if path is None or not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            entries = payload.get("entries") if isinstance(payload, dict) else None
+            if not isinstance(entries, dict):
+                return
+            cutoff = time.time() - _KEY_HEALTH_RETENTION_SECONDS
+            for k_id, raw in entries.items():
+                if not isinstance(raw, dict):
+                    continue
+                st = _KeyStat.from_dict(raw)
+                latest_ts = max(st.last_used_at, st.last_success_at, st.last_error_at, st.cooldown_until)
+                if latest_ts <= 0.0 or latest_ts >= cutoff:
+                    self._stats[str(k_id)] = st
+        except Exception:
+            pass
+
+    def _save_locked(self) -> None:
+        path = self._effective_state_path()
+        if path is None:
+            return
+        try:
+            cutoff = time.time() - _KEY_HEALTH_RETENTION_SECONDS
+            pruned = {
+                k_id: st.to_dict()
+                for k_id, st in self._stats.items()
+                if max(st.last_used_at, st.last_success_at, st.last_error_at, st.cooldown_until) >= cutoff
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 1, "entries": pruned}, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def _ids(self, api_key: str, model: str, base_url: str | None) -> tuple[str, str]:
+        ep = _endpoint_scope(base_url, model)
+        model_id = _key_hash(f"m::{ep}::{(model or '').strip().lower()}", api_key)
+        auth_id = _key_hash(f"auth::{ep}", api_key)
+        return model_id, auth_id
+
+    def _eval_rank_locked(
+        self,
+        idx: int,
+        n_keys: int,
+        api_key: str,
+        model: str,
+        base_url: str | None,
+        now: float,
+        preferred_slot: int,
+    ) -> tuple[tuple[Any, ...], bool]:
+        model_id, auth_id = self._ids(api_key, model, base_url)
+        ms = self._stats.get(model_id) or _KeyStat()
+        as_ = self._stats.get(auth_id) or _KeyStat()
+
+        eff_cd = max(ms.cooldown_until, as_.cooldown_until)
+        in_cooldown = now < eff_cd
+        eff_consec = max(ms.consecutive_errors, as_.consecutive_errors)
+        ever_errored = (ms.error_count > 0) or (as_.error_count > 0)
+        is_auth_dead = (
+            (as_.last_error_kind == "auth" and now < as_.cooldown_until)
+            or (ms.last_error_kind == "auth" and now < ms.cooldown_until)
+        )
+        flight = self._in_flight.get(model_id, 0)
+        slot_dist = (idx - (preferred_slot % n_keys)) % n_keys
+
+        if not in_cooldown and not ever_errored and ms.use_count == 0:
+            # Tier 0: fresh, completely unused healthy key!
+            return (0, flight, slot_dist, idx), False
+        if not in_cooldown and eff_consec == 0:
+            # Tier 1: proven healthy key — spread by least-in-flight & least-recently-used
+            return (1, flight, ms.last_used_at, ms.use_count, slot_dist, idx), False
+        if not in_cooldown:
+            # Tier 2: previously errored key whose cooldown has expired
+            return (2, flight, eff_consec, ms.last_error_at, slot_dist, idx), False
+        # Tier 3: currently in active cooldown
+        return (3, 1 if is_auth_dead else 0, eff_cd, eff_consec, flight, slot_dist, idx), True
+
+    def pick_initial_index(
+        self,
+        api_keys: list[str],
+        *,
+        model: str,
+        base_url: str | None,
+        preferred_slot: int = 0,
+    ) -> int:
+        """Select the highest-priority key index without mutating usage counters."""
+        if not api_keys:
+            return 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            now = time.time()
+            n = len(api_keys)
+            best_idx = 0
+            best_rank: tuple[Any, ...] | None = None
+            for i, key in enumerate(api_keys):
+                rank, _ = self._eval_rank_locked(i, n, key, model, base_url, now, preferred_slot)
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_idx = i
+            return best_idx
+
+    def acquire_key(
+        self,
+        api_keys: list[str],
+        *,
+        model: str,
+        base_url: str | None,
+        exclude_indices: set[int] | None = None,
+        preferred_slot: int = 0,
+        skip_cooldown_if_tried: bool = False,
+    ) -> tuple[int | None, int]:
+        """
+        Atomically pick and reserve the best available key index.
+
+        Returns `(chosen_index_or_None, cooled_down_count)`.
+        When `skip_cooldown_if_tried=True` and `exclude_indices` is non-empty, returns `None`
+        instead of hammering keys that are still inside their active error cooldown.
+        """
+        if not api_keys:
+            return None, 0
+        excluded = exclude_indices or set()
+        with self._lock:
+            self._ensure_loaded_locked()
+            now = time.time()
+            n = len(api_keys)
+            cooled_down_total = 0
+            best_idx: int | None = None
+            best_rank: tuple[Any, ...] | None = None
+            best_in_cd = False
+
+            for i, key in enumerate(api_keys):
+                rank, in_cd = self._eval_rank_locked(i, n, key, model, base_url, now, preferred_slot)
+                if in_cd:
+                    cooled_down_total += 1
+                if i in excluded:
+                    continue
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_idx = i
+                    best_in_cd = in_cd
+
+            if best_idx is None:
+                return None, cooled_down_total
+            if skip_cooldown_if_tried and excluded and best_in_cd:
+                return None, cooled_down_total
+
+            chosen_key = api_keys[best_idx]
+            model_id, _ = self._ids(chosen_key, model, base_url)
+            st = self._stats.setdefault(model_id, _KeyStat())
+            st.use_count += 1
+            st.last_used_at = now
+            self._in_flight[model_id] = self._in_flight.get(model_id, 0) + 1
+            self._save_locked()
+            return best_idx, cooled_down_total
+
+    def release_key(self, api_key: str, *, model: str, base_url: str | None) -> None:
+        if not api_key:
+            return
+        with self._lock:
+            model_id, _ = self._ids(api_key, model, base_url)
+            cur = self._in_flight.get(model_id, 0)
+            if cur <= 1:
+                self._in_flight.pop(model_id, None)
+            else:
+                self._in_flight[model_id] = cur - 1
+
+    def record_success(self, api_key: str, *, model: str, base_url: str | None) -> None:
+        if not api_key:
+            return
+        with self._lock:
+            self._ensure_loaded_locked()
+            now = time.time()
+            model_id, auth_id = self._ids(api_key, model, base_url)
+            st = self._stats.setdefault(model_id, _KeyStat())
+            st.success_count += 1
+            st.consecutive_errors = 0
+            st.cooldown_until = 0.0
+            st.last_error_kind = ""
+            st.last_success_at = now
+            if auth_id in self._stats:
+                ast = self._stats[auth_id]
+                ast.consecutive_errors = 0
+                ast.cooldown_until = 0.0
+                ast.last_error_kind = ""
+                ast.last_success_at = now
+            self._save_locked()
+
+    def record_error(
+        self,
+        api_key: str,
+        *,
+        model: str,
+        base_url: str | None,
+        kind: str = "transient",
+        cooldown_override: float | None = None,
+    ) -> float:
+        """Record an error on `api_key`, apply escalating cooldown, and return cooldown seconds."""
+        if not api_key:
+            return 0.0
+        eff_kind = kind if kind in _COOLDOWN_SCHEDULE else "transient"
+        with self._lock:
+            self._ensure_loaded_locked()
+            now = time.time()
+            model_id, auth_id = self._ids(api_key, model, base_url)
+            st = self._stats.setdefault(model_id, _KeyStat())
+            st.error_count += 1
+            st.consecutive_errors += 1
+            st.last_error_at = now
+            st.last_error_kind = eff_kind
+            schedule = _COOLDOWN_SCHEDULE[eff_kind]
+            cd_secs = (
+                float(cooldown_override)
+                if cooldown_override is not None
+                else schedule[min(st.consecutive_errors - 1, len(schedule) - 1)]
+            )
+            st.cooldown_until = max(st.cooldown_until, now + cd_secs)
+
+            if eff_kind == "auth":
+                ast = self._stats.setdefault(auth_id, _KeyStat())
+                ast.error_count += 1
+                ast.consecutive_errors += 1
+                ast.last_error_at = now
+                ast.last_error_kind = "auth"
+                ast.cooldown_until = max(ast.cooldown_until, now + cd_secs)
+
+            self._save_locked()
+            return cd_secs
+
+    def reset_keys(self, api_keys: list[str] | None = None) -> None:
+        """Clear saved health/cooldown state (all keys if `api_keys` is None, else matching keys)."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            if not api_keys:
+                self._stats.clear()
+                self._in_flight.clear()
+            else:
+                # Re-hash is scoped; wipe all entries matching any known provider/model only by clearing all
+                # when user replaces key config so newly fixed keys start fresh immediately.
+                self._stats.clear()
+            self._save_locked()
+
+
+_GLOBAL_KEY_HEALTH = SmartKeyHealthTracker()
+
+
+def get_key_health_tracker() -> SmartKeyHealthTracker:
+    return _GLOBAL_KEY_HEALTH
+
+
+def configure_key_health_tracker(
+    state_path: Path | None = None,
+    *,
+    persist: bool = True,
+    clear: bool = True,
+) -> SmartKeyHealthTracker:
+    """Configure or reset the shared smart API key health tracker (primarily for tests & `/key` updates)."""
+    global _GLOBAL_KEY_HEALTH
+    if clear:
+        _GLOBAL_KEY_HEALTH = SmartKeyHealthTracker(state_path=state_path, persist=persist)
+    else:
+        _GLOBAL_KEY_HEALTH._state_path = state_path
+        _GLOBAL_KEY_HEALTH._persist = persist
+        _GLOBAL_KEY_HEALTH._loaded = False
+    return _GLOBAL_KEY_HEALTH
 
 
 def _pil_to_jpeg_b64(img: Image.Image, max_side: int = 1600, quality: int = 90) -> str:
@@ -479,7 +859,17 @@ _KO_SFX_RE = re.compile(
     r")+$"
 )
 _VN_TEXT_KEYS = ("vietnamese", "vi", "viet", "translated", "translated_text", "translation", "text_vi", "text")
-_PLACEHOLDER_TEXTS = {"", "...", "…", "(trống)", "n/a", "none", "null", "—", "-"}
+_HARD_PLACEHOLDER_TEXTS = {"", "(trống)", "n/a", "none", "null"}
+_ELLIPSIS_PLACEHOLDER_TEXTS = {"...", "…", "—", "-"}
+_PLACEHOLDER_TEXTS = _HARD_PLACEHOLDER_TEXTS | _ELLIPSIS_PLACEHOLDER_TEXTS
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]")
+
+
+def _source_has_substantive_words(source_text: str | None) -> bool:
+    src = (source_text or "").strip()
+    if not src:
+        return False
+    return bool(_CJK_KANA_RE.search(src) or len(_LATIN_WORD_RE.findall(src)) >= 2)
 
 
 def _parse_bool_flag(val: Any) -> bool:
@@ -530,8 +920,10 @@ def region_needs_translation(reg: TextRegionItem) -> bool:
         return False
     src = (reg.source_text or "").strip()
     vn = (reg.translated_text or "").strip()
-    if not vn or vn.lower() in _PLACEHOLDER_TEXTS:
+    if not vn or vn.lower() in _HARD_PLACEHOLDER_TEXTS:
         return True
+    if vn in _ELLIPSIS_PLACEHOLDER_TEXTS:
+        return _source_has_substantive_words(src)
     if _KANA_HANGUL_RE.search(vn):
         return True
     if src and _CJK_KANA_RE.search(src):
@@ -566,14 +958,18 @@ def _parse_int_id(val: Any) -> int | None:
     return int(m.group(0)) if m else None
 
 
-def _extract_vn_from_item(item: dict[str, Any]) -> str:
+def _extract_vn_from_item(item: dict[str, Any], source_text: str = "") -> str:
+    has_words = _source_has_substantive_words(source_text)
     for key in _VN_TEXT_KEYS:
         val = item.get(key)
         if val is None:
             continue
         txt = str(val).strip()
-        if txt and txt.lower() not in _PLACEHOLDER_TEXTS:
-            return txt
+        if not txt or txt.lower() in _HARD_PLACEHOLDER_TEXTS:
+            continue
+        if txt in _ELLIPSIS_PLACEHOLDER_TEXTS and has_words:
+            continue
+        return txt
     return ""
 
 
@@ -589,6 +985,7 @@ class VisionLLMClient:
         base_url: str | None = None,
         timeout: float = 90.0,
         on_status: Callable[[str], None] | None = None,
+        preferred_slot: int = 0,
     ) -> None:
         eff_base_url = base_url.rstrip("/") if base_url else None
         if not eff_base_url and is_deepseek_model(model):
@@ -642,9 +1039,20 @@ class VisionLLMClient:
             except Exception:
                 pass
 
-        self._key_idx = 0
-        self.api_key = self.api_keys[0] if self.api_keys else ""
+        self._preferred_slot = max(0, int(preferred_slot))
         self.model = model
+        self.base_url = eff_base_url
+        if self.api_keys:
+            self._key_idx = get_key_health_tracker().pick_initial_index(
+                self.api_keys,
+                model=self.model,
+                base_url=self.base_url,
+                preferred_slot=self._preferred_slot,
+            )
+            self.api_key = self.api_keys[self._key_idx]
+        else:
+            self._key_idx = 0
+            self.api_key = ""
         self.fallback_models: list[str] = []
         raw_fb = (
             fallback_model
@@ -660,7 +1068,6 @@ class VisionLLMClient:
                 fb_seen.add(fb_clean)
                 self.fallback_models.append(fb_clean)
         self._fallback_idx = 0
-        self.base_url = eff_base_url
         self.timeout = timeout
         self.on_status = on_status
         if not self.api_key and not self.base_url:
@@ -703,21 +1110,43 @@ class VisionLLMClient:
                     self.api_keys = gem_keys
             except Exception:
                 pass
-        self._key_idx = 0
-        self.api_key = self.api_keys[0] if self.api_keys else ""
+        if self.api_keys:
+            self._key_idx = get_key_health_tracker().pick_initial_index(
+                self.api_keys,
+                model=self.model,
+                base_url=self.base_url,
+                preferred_slot=self._preferred_slot,
+            )
+            self.api_key = self.api_keys[self._key_idx]
+        else:
+            self._key_idx = 0
+            self.api_key = ""
         self._emit_status(
             f"⚠ Model '{old_model}' {reason} -> tự động chuyển sang model fallback '{self.model}'!"
         )
         return True
 
-    def _rotate_key(self, reason: str) -> bool:
-        """Advance to the next API key when multiple keys are configured."""
+    def _rotate_key(self, reason: str, *, exclude_indices: set[int] | None = None) -> bool:
+        """Advance to the smartest next healthy/unused API key when multiple keys are configured."""
         if len(self.api_keys) <= 1:
             return False
-        self._key_idx = (self._key_idx + 1) % len(self.api_keys)
+        tracker = get_key_health_tracker()
+        excluded = set(exclude_indices) if exclude_indices is not None else {self._key_idx}
+        next_idx, cooled_down_cnt = tracker.acquire_key(
+            self.api_keys,
+            model=self.model,
+            base_url=self.base_url,
+            exclude_indices=excluded,
+            preferred_slot=self._preferred_slot,
+            skip_cooldown_if_tried=True,
+        )
+        if next_idx is None:
+            return False
+        self._key_idx = next_idx
         self.api_key = self.api_keys[self._key_idx]
+        skip_note = f", né {cooled_down_cnt} key lỗi" if cooled_down_cnt > 0 else ""
         self._emit_status(
-            f"Đổi sang API key #{self._key_idx + 1}/{len(self.api_keys)} ({reason})..."
+            f"Đổi sang API key #{self._key_idx + 1}/{len(self.api_keys)} ({reason}{skip_note})..."
         )
         return True
 
@@ -735,19 +1164,53 @@ class VisionLLMClient:
         images: list[tuple[str, str]],
         temperature: float = 0.3,
     ) -> Any:
-        """Send multimodal prompt + base64 JPEGs and parse JSON response with automatic key & quota-fallback failover."""
+        """Send multimodal prompt + base64 JPEGs and parse JSON response with smart key health & quota-fallback failover."""
         img_kb = max(1, sum(len(b64) for _, b64 in images) * 3 // 4 // 1024) if images else 0
+        tracker = get_key_health_tracker()
         last_err: Exception | None = None
         last_is_quota = False
-        keys_total = max(1, len(self.api_keys))
-        keys_tried = 1
+        tried_indices: set[int] = set()
+        need_acquire = True
+        active_key = ""
+        cooled_down_cnt = 0
         transient_attempt = 0
         max_transient = 3
 
         while True:
+            keys_total = max(1, len(self.api_keys))
+            if self.api_keys and need_acquire:
+                picked_idx, cooled_down_cnt = tracker.acquire_key(
+                    self.api_keys,
+                    model=self.model,
+                    base_url=self.base_url,
+                    exclude_indices=tried_indices,
+                    preferred_slot=self._preferred_slot,
+                    skip_cooldown_if_tried=False,
+                )
+                if picked_idx is None:
+                    tried_indices.clear()
+                    picked_idx, cooled_down_cnt = tracker.acquire_key(
+                        self.api_keys,
+                        model=self.model,
+                        base_url=self.base_url,
+                        exclude_indices=tried_indices,
+                        preferred_slot=self._preferred_slot,
+                        skip_cooldown_if_tried=False,
+                    )
+                if picked_idx is not None:
+                    self._key_idx = picked_idx
+                    self.api_key = self.api_keys[picked_idx]
+                    active_key = self.api_key
+                    tried_indices.add(picked_idx)
+                need_acquire = False
+
             try:
-                if transient_attempt == 0 and keys_tried == 1:
-                    key_tag = f" [key {self._key_idx + 1}/{keys_total}]" if keys_total > 1 else ""
+                if transient_attempt == 0 and len(tried_indices) <= 1:
+                    if keys_total > 1:
+                        skip_tag = f" · né {cooled_down_cnt} key lỗi" if cooled_down_cnt > 0 else ""
+                        key_tag = f" [key {self._key_idx + 1}/{keys_total}{skip_tag}]"
+                    else:
+                        key_tag = ""
                     if images:
                         self._emit_status(
                             f"Đang gửi {len(images)} ảnh (~{img_kb} KB) tới {self.model}{key_tag} (timeout {int(self.timeout)}s)..."
@@ -756,11 +1219,18 @@ class VisionLLMClient:
                         self._emit_status(
                             f"Đang gửi text-only (OCR + Story Bible) tới {self.model}{key_tag} (timeout {int(self.timeout)}s)..."
                         )
-                if self.base_url:
-                    raw = self._call_openai_compatible(system_prompt, user_prompt, images, temperature)
-                else:
-                    raw = self._call_gemini_rest(system_prompt, user_prompt, images, temperature)
-                return _extract_json_block(raw)
+                try:
+                    if self.base_url:
+                        raw = self._call_openai_compatible(system_prompt, user_prompt, images, temperature)
+                    else:
+                        raw = self._call_gemini_rest(system_prompt, user_prompt, images, temperature)
+                finally:
+                    if active_key:
+                        tracker.release_key(active_key, model=self.model, base_url=self.base_url)
+                parsed = _extract_json_block(raw)
+                if active_key:
+                    tracker.record_success(active_key, model=self.model, base_url=self.base_url)
+                return parsed
             except ContentBlockedError:
                 raise
             except httpx.HTTPStatusError as exc:
@@ -768,18 +1238,28 @@ class VisionLLMClient:
                 code = exc.response.status_code
                 body_preview = exc.response.text.strip().replace("\n", " ")[:200]
                 is_quota = _is_quota_error(code, body_preview)
+                is_auth = _is_auth_error(code, body_preview)
                 last_is_quota = is_quota
                 if code == 404:
                     if self._fallback_idx > 0 and self._switch_to_fallback_model("không tồn tại (HTTP 404)"):
-                        keys_tried = 1
+                        tried_indices.clear()
                         transient_attempt = 0
                         last_is_quota = False
+                        need_acquire = True
+                        active_key = ""
                         continue
                     hint = f" (Model '{self.model}' không tồn tại hoặc key chưa mở — bấm F3 hoặc gõ /model để chọn model hỗ trợ)"
                     raise RuntimeError(f"HTTP {code} từ {self.model}: {body_preview}{hint}") from exc
                 if code in (400, 401, 403, 429) or code >= 500 or is_quota:
-                    if keys_tried < keys_total and self._rotate_key(f"HTTP {code}"):
-                        keys_tried += 1
+                    if active_key:
+                        err_kind = "quota" if is_quota else ("auth" if is_auth else "transient")
+                        tracker.record_error(
+                            active_key, model=self.model, base_url=self.base_url, kind=err_kind
+                        )
+                    if len(self.api_keys) > 1 and self._rotate_key(f"HTTP {code}", exclude_indices=tried_indices):
+                        active_key = self.api_key
+                        tried_indices.add(self._key_idx)
+                        need_acquire = False
                         continue
                     if code in (400, 401, 403) and not is_quota:
                         hint = " (API key không hợp lệ hoặc hết quyền — kiểm tra /key)" if code in (401, 403) else ""
@@ -788,17 +1268,25 @@ class VisionLLMClient:
                     if transient_attempt < 1:
                         wait_s = 1.5
                         transient_attempt += 1
+                        tried_indices.clear()
+                        need_acquire = True
+                        active_key = ""
                         self._emit_status(f"API trả HTTP {code} (quota), thử lại nhanh {transient_attempt}/1 sau {wait_s:.1f}s...")
                         time.sleep(wait_s)
                         continue
                     if self._switch_to_fallback_model(f"hết quota (HTTP {code})"):
-                        keys_tried = 1
+                        tried_indices.clear()
                         transient_attempt = 0
                         last_is_quota = False
+                        need_acquire = True
+                        active_key = ""
                         continue
                 if transient_attempt < max_transient:
                     wait_s = 1.5 * (2**transient_attempt)
                     transient_attempt += 1
+                    tried_indices.clear()
+                    need_acquire = True
+                    active_key = ""
                     self._emit_status(f"API trả HTTP {code}, thử lại lần {transient_attempt}/{max_transient} sau {wait_s:.1f}s...")
                     time.sleep(wait_s)
                     continue
@@ -806,12 +1294,24 @@ class VisionLLMClient:
             except (httpx.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
                 last_err = exc
                 last_is_quota = False
-                if isinstance(exc, httpx.HTTPError) and keys_tried < keys_total and self._rotate_key(type(exc).__name__):
-                    keys_tried += 1
-                    continue
+                if isinstance(exc, httpx.HTTPError):
+                    if active_key:
+                        tracker.record_error(
+                            active_key, model=self.model, base_url=self.base_url, kind="transient"
+                        )
+                    if len(self.api_keys) > 1 and self._rotate_key(
+                        type(exc).__name__, exclude_indices=tried_indices
+                    ):
+                        active_key = self.api_key
+                        tried_indices.add(self._key_idx)
+                        need_acquire = False
+                        continue
                 if transient_attempt < max_transient:
                     wait_s = 1.5 * (2**transient_attempt)
                     transient_attempt += 1
+                    tried_indices.clear()
+                    need_acquire = True
+                    active_key = ""
                     detail = str(exc).replace("\n", " ")[:120]
                     self._emit_status(
                         f"Lỗi tạm thời ({type(exc).__name__}: {detail}), thử lại lần {transient_attempt}/{max_transient} sau {wait_s:.1f}s..."
@@ -1342,7 +1842,7 @@ class VisionLLMClient:
                 elif fallback_src:
                     copy.source_text = fallback_src
 
-                vn = _extract_vn_from_item(match)
+                vn = _extract_vn_from_item(match, source_text=copy.source_text)
                 raw_is_sfx = _parse_bool_flag(match.get("is_sfx"))
                 norm_src = normalize_source_key(copy.source_text)
                 is_pure_floating_sfx = looks_like_floating_sfx(copy.source_text)

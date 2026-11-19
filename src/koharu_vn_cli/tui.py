@@ -37,6 +37,7 @@ from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import (
     DEEPSEEK_BASE_URL,
     VisionLLMClient,
+    get_key_health_tracker,
     is_deepseek_endpoint,
     is_deepseek_model,
 )
@@ -1628,6 +1629,7 @@ class KoharuTUI(App[None]):
                     self.cfg.deepseek_api_keys = keys
                     self.cfg.deepseek_api_key = keys[0]
                     save_config(self.cfg)
+                    get_key_health_tracker().reset_keys()
                     self._refresh_chrome()
                     self._log_ai(
                         f"Đã lưu {len(keys)} DeepSeek API key ({self.cfg.masked_deepseek_key()}) — key Gemini cũ vẫn giữ nguyên."
@@ -1636,6 +1638,7 @@ class KoharuTUI(App[None]):
                     self.cfg.api_keys = keys
                     self.cfg.api_key = keys[0] if keys else ""
                     save_config(self.cfg)
+                    get_key_health_tracker().reset_keys()
                     self._refresh_chrome()
                     self._log_ai(f"Đã lưu {len(keys)} Gemini/Proxy API key ({self.cfg.masked_api_key()}).")
             else:
@@ -2190,6 +2193,7 @@ class KoharuTUI(App[None]):
         self.cfg.deepseek_api_key = ds_keys[0] if ds_keys else ""
         self.cfg.base_url = url or None
         save_config(self.cfg)
+        get_key_health_tracker().reset_keys()
         self._refresh_chrome()
         self._log_ai(
             f"Đã lưu cấu hình vào [dim]{CONFIG_FILE}[/dim] "

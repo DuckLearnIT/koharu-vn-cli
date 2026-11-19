@@ -3260,6 +3260,173 @@ def test_auto_delete_source_zip_strict_verification_and_safety(
     assert app.cfg.delete_source_zip is True
 
 
+def test_auto_delete_zip_handles_ellipsis_and_empty_noise_boxes_but_keeps_untranslated_cjk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ellipsis bubbles ('……' -> '...') and empty detector noise boxes must NOT block zip deletion, while untranslated CJK MUST keep it."""
+    import io as _io
+    import zipfile
+
+    from koharu_vn_cli.pipeline.gemini_client import VisionLLMClient
+    from koharu_vn_cli.pipeline.runner import run_translate_pipeline
+
+    def _make_zip(zpath: Path) -> None:
+        with zipfile.ZipFile(zpath, "w") as zf:
+            buf = _io.BytesIO()
+            img = np.full((240, 220, 3), 245, dtype=np.uint8)
+            img[20:70, 20:190] = (255, 255, 255)
+            img[40:52, 50:150] = (20, 20, 20)
+            Image.fromarray(img).save(buf, format="PNG")
+            zf.writestr("001.png", buf.getvalue())
+
+    class ThreeBoxDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            mask[35:55, 45:155] = 255
+            return [
+                DetectedRegion((20, 20, 190, 70), (15, 15, 195, 75), None, True, False, 0.95),
+                DetectedRegion((20, 90, 110, 135), (15, 85, 115, 140), None, True, False, 0.90),
+                DetectedRegion((120, 150, 190, 195), (115, 145, 195, 200), None, True, False, 0.60),
+            ], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            out = rgb.copy()
+            out[mask > 127] = (255, 255, 255)
+            return out
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return ThreeBoxDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+        def get_ocr(self, use_gpu=True):
+            return None
+
+    # 1) Page with real dialogue + '……' -> '...' bubble + empty noise box MUST delete source zip
+    zip_ok = tmp_path / "ellipsis_and_noise.zip"
+    _make_zip(zip_ok)
+    monkeypatch.setattr(
+        VisionLLMClient,
+        "_call_json",
+        lambda self, *a, **kw: {
+            "page_summary": "ok",
+            "items": [
+                {"id": 1, "is_sfx": False, "source_text": "やめろ", "vietnamese": "Dừng lại!"},
+                {"id": 2, "is_sfx": False, "source_text": "……", "vietnamese": "..."},
+                # id=3 omitted / empty false-positive box
+            ],
+        },
+    )
+    out_ok, docs_ok = run_translate_pipeline(
+        zip_ok,
+        api_key="sk-fake",
+        story_pass=False,
+        output_format="png",
+        delete_source_zip=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs_ok) == 1
+    assert docs_ok[0].regions[1].translated_text == "..."
+    assert not zip_ok.exists()
+    assert (out_ok / "001.png").is_file()
+
+    # 2) Page where a genuine Japanese bubble remained untranslated MUST KEEP source zip
+    zip_untrans = tmp_path / "still_japanese.zip"
+    _make_zip(zip_untrans)
+    monkeypatch.setattr(
+        VisionLLMClient,
+        "_call_json",
+        lambda self, *a, **kw: {
+            "page_summary": "partial",
+            "items": [
+                {"id": 1, "is_sfx": False, "source_text": "やめろ", "vietnamese": "Dừng lại!"},
+                {"id": 2, "is_sfx": False, "source_text": "助けて", "vietnamese": "助けて"},
+            ],
+        },
+    )
+    run_translate_pipeline(
+        zip_untrans,
+        api_key="sk-fake",
+        story_pass=False,
+        output_format="png",
+        delete_source_zip=True,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert zip_untrans.exists()
+
+
+def test_smart_api_key_rotation_skips_errored_and_prioritizes_unused_across_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When keys 1..4 fail previously, subsequent calls and fresh sessions MUST jump straight to unused healthy keys 5, 6, 7."""
+    import httpx
+
+    from koharu_vn_cli.pipeline.gemini_client import (
+        VisionLLMClient,
+        configure_key_health_tracker,
+    )
+
+    health_file = tmp_path / "key_health.json"
+    configure_key_health_tracker(state_path=health_file, persist=True, clear=True)
+    try:
+        keys = [f"AIzaFakeKey0000{i}" for i in range(1, 8)]
+        used_in_run1: list[str] = []
+        statuses_run1: list[str] = []
+
+        def fake_rest_run1(self, system_prompt, user_prompt, images, temperature=0.3):
+            used_in_run1.append(self.api_key)
+            req = httpx.Request("POST", "https://example.invalid")
+            if self.api_key in (keys[0], keys[1]):
+                raise httpx.HTTPStatusError("429", request=req, response=httpx.Response(429, request=req, text="RESOURCE_EXHAUSTED"))
+            if self.api_key == keys[2]:
+                raise httpx.HTTPStatusError("403", request=req, response=httpx.Response(403, request=req, text="API_KEY_INVALID"))
+            if self.api_key == keys[3]:
+                raise httpx.HTTPStatusError("503", request=req, response=httpx.Response(503, request=req, text="overloaded"))
+            return '{"ok": true}'
+
+        monkeypatch.setattr(VisionLLMClient, "_call_gemini_rest", fake_rest_run1)
+        c1 = VisionLLMClient(api_keys=keys, model="gemini-3.5-flash-lite", on_status=statuses_run1.append)
+        assert c1._call_json("sys", "usr", []) == {"ok": True}
+        assert used_in_run1 == keys[:5]  # 1,2,3,4 errored -> landed on 5
+
+        # Persisted file must exist and NEVER store raw plaintext API keys
+        assert health_file.is_file()
+        raw_disk = health_file.read_text(encoding="utf-8")
+        for k in keys:
+            assert k not in raw_disk
+
+        # Simulate a brand-new session reloading persisted health from disk
+        configure_key_health_tracker(state_path=health_file, persist=True, clear=True)
+        used_in_run2: list[str] = []
+        statuses_run2: list[str] = []
+
+        def fake_rest_run2(self, system_prompt, user_prompt, images, temperature=0.3):
+            used_in_run2.append(self.api_key)
+            return '{"ok": true}'
+
+        monkeypatch.setattr(VisionLLMClient, "_call_gemini_rest", fake_rest_run2)
+        c2 = VisionLLMClient(api_keys=keys, model="gemini-3.5-flash-lite", on_status=statuses_run2.append)
+        # Initial pick skips errored 1..4 and already-used 5 -> picks unused 6 first!
+        assert c2.api_key == keys[5]
+        assert c2._call_json("sys", "usr", []) == {"ok": True}
+        assert c2._call_json("sys", "usr", []) == {"ok": True}
+        assert c2._call_json("sys", "usr", []) == {"ok": True}
+
+        # Must pick unused 6 -> unused 7 -> LRU healthy 5, NEVER touching errored 1..4!
+        assert used_in_run2 == [keys[5], keys[6], keys[4]]
+        assert any("né 4 key lỗi" in s for s in statuses_run2)
+
+        # Auth-dead key #3 (403) must ALSO be avoided on a different model on the same provider
+        c_other_model = VisionLLMClient(api_keys=[keys[2], keys[6]], model="gemini-4-hydrogen")
+        assert c_other_model.api_key == keys[6]
+    finally:
+        configure_key_health_tracker(state_path=None, persist=True, clear=True)
+
+
+
 
 
 

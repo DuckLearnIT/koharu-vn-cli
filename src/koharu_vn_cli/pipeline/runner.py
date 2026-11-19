@@ -30,6 +30,8 @@ from koharu_vn_cli.pipeline.detector import (
 )
 from koharu_vn_cli.pipeline.gemini_client import (
     _CJK_KANA_RE,
+    _KANA_HANGUL_RE,
+    _PLACEHOLDER_TEXTS,
     DEEPSEEK_BASE_URL,
     DEFAULT_GEMINI_MODEL,
     ContentBlockedError,
@@ -543,6 +545,48 @@ def _image_has_rendered_text_diff(
     return True
 
 
+def _region_blocks_zip_deletion(reg: TextRegionItem, *, skip_sfx: bool) -> bool:
+    """
+    Return True ONLY when a region genuinely contains untranslated foreign dialogue.
+    Ignores skipped SFX, empty detector false-positives (zero source text), and
+    punctuation-only bubbles like '...', '…', '!?', '♡'.
+    """
+    if skip_sfx and reg.is_sfx:
+        return False
+    vn = (reg.translated_text or "").strip()
+    src = (reg.source_text or "").strip()
+    if _KANA_HANGUL_RE.search(vn):
+        return True
+    src_has_cjk = bool(_CJK_KANA_RE.search(src))
+    if src_has_cjk:
+        if not vn or vn.lower() in _PLACEHOLDER_TEXTS:
+            return True
+        if normalize_source_key(vn) == normalize_source_key(src):
+            return True
+        return False
+    src_has_latin_words = len(_LATIN_ALPHA_RE.findall(src)) >= 2
+    if src_has_latin_words and (not vn or vn.lower() in _PLACEHOLDER_TEXTS):
+        return True
+    return False
+
+
+def _unlink_zip_with_retry(src_zip: Path, *, attempts: int = 3, delay_s: float = 0.25) -> None:
+    """Delete exact `.zip` path with brief retry for transient Windows Explorer/Defender locks."""
+    last_exc: OSError | None = None
+    for i in range(max(1, attempts)):
+        try:
+            src_zip.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_exc = exc
+            if i + 1 < attempts:
+                time.sleep(delay_s)
+    if last_exc is not None:
+        raise last_exc
+
+
 def _maybe_delete_source_zip(
     fingerprint: _SourceZipFingerprint | None,
     *,
@@ -619,7 +663,7 @@ def _maybe_delete_source_zip(
         except Exception:
             return _keep(f"ảnh xuất trang {idx} bị lỗi không đọc được")
 
-        if any(region_needs_translation(r) for r in doc.regions):
+        if any(_region_blocks_zip_deletion(r, skip_sfx=skip_sfx) for r in doc.regions):
             return _keep(f"trang {idx} vẫn còn khung thoại chưa dịch")
 
         rendered_regs = [
@@ -636,7 +680,7 @@ def _maybe_delete_source_zip(
         return _keep("chưa xác minh được trang nào có bản dịch chữ mới trên ảnh")
 
     try:
-        src_zip.unlink()
+        _unlink_zip_with_retry(src_zip)
     except OSError as exc:
         return _keep(f"không xóa được file ({exc})")
 
@@ -1076,45 +1120,40 @@ def run_translate_pipeline(
         abort_event = threading.Event()
         first_error: list[BaseException] = []
 
-        def _rotated_keys(w_idx: int) -> list[str] | None:
-            if not key_pool:
-                return None
-            offset = w_idx % len(key_pool)
-            return key_pool[offset:] + key_pool[:offset]
-
         worker_clients: list[tuple[VisionLLMClient, VisionLLMClient, VisionLLMClient | None]] = []
         for w_idx in range(worker_count):
             if w_idx == 0:
                 worker_clients.append((llm, story_llm, story_fallback_llm))
                 continue
-            r_keys = _rotated_keys(w_idx)
-            r_primary = r_keys[0] if r_keys else api_key
             worker_clients.append(
                 (
                     VisionLLMClient(
-                        api_key=r_primary,
-                        api_keys=r_keys,
+                        api_key=api_key,
+                        api_keys=key_pool or None,
                         model=model,
                         fallback_model=eff_fallback,
                         base_url=base_url,
                         on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+                        preferred_slot=w_idx,
                     ),
                     VisionLLMClient(
-                        api_key=r_primary,
-                        api_keys=r_keys,
+                        api_key=api_key,
+                        api_keys=key_pool or None,
                         model=eff_story_model,
                         base_url=base_url,
                         timeout=STORY_MODEL_TIMEOUT,
                         on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+                        preferred_slot=w_idx,
                     ),
                     (
                         VisionLLMClient(
-                            api_key=r_primary,
-                            api_keys=r_keys,
+                            api_key=api_key,
+                            api_keys=key_pool or None,
                             model=eff_story_fallback,
                             base_url=base_url,
                             timeout=STORY_MODEL_TIMEOUT,
                             on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+                            preferred_slot=w_idx,
                         )
                         if eff_story_fallback and eff_story_fallback != eff_story_model
                         else None
@@ -1279,9 +1318,10 @@ def run_translate_pipeline(
                                 resumed_verified = False
                                 if source_zip_fp is not None:
                                     try:
-                                        resumed_verified = _image_has_rendered_text_diff(
-                                            Image.open(out_img_path), load_rgb(img_path)
-                                        )
+                                        with Image.open(out_img_path) as resumed_im:
+                                            resumed_verified = _image_has_rendered_text_diff(
+                                                resumed_im, load_rgb(img_path)
+                                            )
                                     except Exception:
                                         resumed_verified = False
                                 with state_lock:
@@ -1680,8 +1720,8 @@ def run_translate_pipeline(
                             raw_ocr = (missing_ocr.get(mr.id, "") or "").strip()
                             if raw_ocr:
                                 mr.source_text = raw_ocr
-                            elif not (mr.source_text or "").strip() and mr.kind == "floating":
-                                # Floating box with zero OCR text and zero Vision text is non-text noise
+                            elif not (mr.source_text or "").strip() and not (mr.translated_text or "").strip():
+                                # Region where both Vision and local OCR found zero text is a false-positive noise box
                                 mr.is_sfx = True
                         with state_lock:
                             mem_snapshot = dict(translation_memory)
@@ -2270,9 +2310,10 @@ def run_compose_pipeline(
                 out_paths_by_idx[idx] = out_img_path
                 if source_zip_fp is not None:
                     try:
-                        rendered_verified_by_idx[idx] = _image_has_rendered_text_diff(
-                            Image.open(out_img_path), load_rgb(img_path)
-                        )
+                        with Image.open(out_img_path) as resumed_im:
+                            rendered_verified_by_idx[idx] = _image_has_rendered_text_diff(
+                                resumed_im, load_rgb(img_path)
+                            )
                     except Exception:
                         rendered_verified_by_idx[idx] = False
                 hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua ảnh đã sáng tác (--resume)")
