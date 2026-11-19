@@ -762,7 +762,12 @@ def _write_reader_metadata(
     if not parody and not characters and not tag_list:
         return
 
+    display_title = (story_bible.title or "").strip() if story_bible else ""
+    if display_title.lower() in {"story bible", "unknown", "untitled"}:
+        display_title = ""
+
     payload = {
+        "displayTitle": display_title,
         "parody": parody,
         "characters": characters,
         "tags": tag_list[:8],
