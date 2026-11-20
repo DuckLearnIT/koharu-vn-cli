@@ -811,15 +811,38 @@ def _load_or_build_story_bible(
 ) -> StoryBible | None:
     """Shared Pass-1 global story & character analysis across translate and compose pipelines."""
     bible_path = cache_dir / "story_bible.json"
-    if resume and bible_path.is_file():
-        try:
-            bible = StoryBible.model_validate_json(bible_path.read_text(encoding="utf-8"))
-            hooks.emit_story_bible(bible)
-            return bible
-        except Exception:
-            pass
-
+    skipped_flag = cache_dir / "story_pass_skipped.flag"
     resolved_story = resolve_story_text(user_story)
+
+    if resume:
+        if bible_path.is_file():
+            try:
+                bible = StoryBible.model_validate_json(bible_path.read_text(encoding="utf-8"))
+                hooks.emit_step(
+                    0,
+                    len(images),
+                    base_name,
+                    "skip",
+                    "Dùng lại Story Bible đã lưu (--resume) — bỏ qua Pass 1.",
+                )
+                hooks.emit_story_bible(bible)
+                return bible
+            except Exception:
+                pass
+        has_prior_pages = cache_dir.is_dir() and any(
+            p.is_file() and p.suffix == ".json" and p.name not in {"story_bible.json", "memory.json"}
+            for p in cache_dir.iterdir()
+        )
+        if skipped_flag.is_file() or has_prior_pages:
+            hooks.emit_step(
+                0,
+                len(images),
+                base_name,
+                "skip",
+                "Đã có tiến độ dịch trước đó (--resume) — bỏ qua Pass 1, chạy thẳng các trang chưa xong.",
+            )
+            return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
+
     if not enable_story_pass:
         return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
 
@@ -866,6 +889,10 @@ def _load_or_build_story_bible(
                     "warn",
                     f"Fallback chính [{story_fallback_llm.model}] cũng bị chặn/lỗi ({fb_exc}) — bỏ qua Pass 1, tiếp tục dịch từng trang...",
                 )
+                try:
+                    skipped_flag.write_text(str(fb_exc), encoding="utf-8")
+                except Exception:
+                    pass
                 return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
         else:
             hooks.emit_step(
@@ -875,6 +902,10 @@ def _load_or_build_story_bible(
                 "warn",
                 f"Pass 1 bị bộ lọc nội dung chặn ({exc}) — tiếp tục dịch từng trang...",
             )
+            try:
+                skipped_flag.write_text(str(exc), encoding="utf-8")
+            except Exception:
+                pass
             return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
     hooks.emit_story_bible(bible)
     confirmed = hooks.confirm_story_bible(bible)

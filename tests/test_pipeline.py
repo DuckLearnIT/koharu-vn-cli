@@ -3675,3 +3675,74 @@ def test_inpaint_translucent_dark_bubble_erases_edge_white_glyphs_and_tether_pre
     orig_cx = (940 + 1060) * 0.5
     new_cx = (f_out[0] + f_out[2]) * 0.5
     assert abs(new_cx - orig_cx) <= 80.0, f"Floating box flew too far from origin: {orig_cx} -> {new_cx}"
+
+
+def test_resume_skips_pass1_after_prohibit_or_existing_page_cache(tmp_path: Path):
+    """Ensure --resume never re-runs Pass 1 when Pass 1 was blocked previously or pages are already cached."""
+    from koharu_vn_cli.pipeline.gemini_client import ContentBlockedError
+    from koharu_vn_cli.pipeline.runner import PipelineHooks, _load_or_build_story_bible
+
+    img = tmp_path / "001.png"
+    Image.new("RGB", (64, 64), (255, 255, 255)).save(img)
+    cache_dir = tmp_path / ".koharu_cache"
+    cache_dir.mkdir()
+
+    calls = {"n": 0}
+
+    class FakeLLM:
+        model = "gemini-test"
+
+        def build_story_bible(self, *args, **kwargs):
+            calls["n"] += 1
+            raise ContentBlockedError("PROHIBITED_CONTENT")
+
+    # 1. First run: Pass 1 is blocked -> writes story_pass_skipped.flag
+    res1 = _load_or_build_story_bible(
+        FakeLLM(),  # type: ignore[arg-type]
+        [img],
+        cache_dir,
+        "test",
+        mode="translate",
+        user_story=None,
+        prompt=None,
+        enable_story_pass=True,
+        resume=False,
+        hooks=PipelineHooks(),
+    )
+    assert res1 is None
+    assert calls["n"] == 1
+    assert (cache_dir / "story_pass_skipped.flag").is_file()
+
+    # 2. Second run with resume=True: must NOT call build_story_bible again!
+    res2 = _load_or_build_story_bible(
+        FakeLLM(),  # type: ignore[arg-type]
+        [img],
+        cache_dir,
+        "test",
+        mode="translate",
+        user_story=None,
+        prompt=None,
+        enable_story_pass=True,
+        resume=True,
+        hooks=PipelineHooks(),
+    )
+    assert res2 is None
+    assert calls["n"] == 1
+
+    # 3. Even without the skipped flag, if page JSON progress already exists in cache, resume skips Pass 1
+    (cache_dir / "story_pass_skipped.flag").unlink()
+    (cache_dir / "001.json").write_text("{}", encoding="utf-8")
+    res3 = _load_or_build_story_bible(
+        FakeLLM(),  # type: ignore[arg-type]
+        [img],
+        cache_dir,
+        "test",
+        mode="translate",
+        user_story=None,
+        prompt=None,
+        enable_story_pass=True,
+        resume=True,
+        hooks=PipelineHooks(),
+    )
+    assert res3 is None
+    assert calls["n"] == 1
