@@ -3432,3 +3432,185 @@ def test_smart_api_key_rotation_skips_errored_and_prioritizes_unused_across_runs
 
 
 
+
+
+def test_inpaint_erases_vertical_ghost_strokes_inside_narrow_white_oval_bubble():
+    """Reproduces the exact vertical grey-ghost bug on narrow white oval bubbles."""
+    import cv2
+
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.inpaint import HybridInpainter, build_erasure_mask
+
+    h, w = 320, 200
+    # Warm colored artwork background outside the bubble
+    rgb = np.full((h, w, 3), (185, 130, 110), dtype=np.uint8)
+    # Draw crisp white oval speech bubble with thick black border
+    cv2.ellipse(rgb, (100, 160), (48, 125), 0, 0, 360, (255, 255, 255), -1)
+    cv2.ellipse(rgb, (100, 160), (48, 125), 0, 0, 360, (15, 15, 15), 3)
+
+    # Extract true contour of the bubble interior
+    white_mask = (rgb[:, :, 0] > 240).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    approx = cv2.approxPolyDP(max(contours, key=cv2.contourArea), 1.5, True)
+    contour_pts = [(float(p[0][0]), float(p[0][1])) for p in approx]
+
+    # Draw thin vertical Japanese-like column + tails extending 12px beyond tight text_bbox
+    cv2.line(rgb, (100, 52), (100, 268), (22, 22, 22), 2)
+    for y in range(60, 260, 18):
+        cv2.line(rgb, (94, y), (106, y), (25, 25, 25), 2)
+        cv2.circle(rgb, (112, y + 4), 1, (55, 55, 55), -1)  # faint furigana dot
+
+    # Deliberately tight text_bbox + weak/fragmented CTD seg_mask (like real failure case)
+    seg_mask = np.zeros((h, w), dtype=np.uint8)
+    seg_mask[75:245:2, 98:103] = 90
+    reg = DetectedRegion(
+        text_bbox=(92, 70, 110, 250),
+        bubble_bbox=(52, 35, 148, 285),
+        bubble_contour=contour_pts,
+        is_bubble=True,
+        is_dark_bubble=False,
+        confidence=0.92,
+    )
+
+    erasure = build_erasure_mask(rgb, seg_mask, [reg])
+
+    # Create inpainter stub without loading ONNX: flat bubble pass must NOT even invoke LaMa!
+    inp = HybridInpainter.__new__(HybridInpainter)
+    lama_calls = {"n": 0}
+
+    def _fail_if_lama_called(_rgb, _msk):
+        lama_calls["n"] += 1
+        raise AssertionError("LaMa should not be invoked on a spotless flat white speech bubble!")
+
+    inp._run_lama_patch = _fail_if_lama_called  # type: ignore[method-assign]
+    clean = inp.inpaint(rgb, erasure, regions=[reg])
+
+    # Entire safe interior (including tails at y=52..268 & furigana) must be spotless white
+    interior_crop = clean[50:270, 88:116]
+    assert int(interior_crop.min()) >= 245, f"Residual dark ink found: min={interior_crop.min()}"
+    assert lama_calls["n"] == 0
+
+    # Black outline of the bubble must remain intact!
+    left_border_luma = float(clean[160, 51:54].mean())
+    assert left_border_luma < 120.0, f"Bubble outline got damaged: luma={left_border_luma}"
+
+
+def test_detector_multiseed_floodfill_and_bubble_region_merge():
+    """Dense vertical ink splitting a bubble must not trap flood-fill, and duplicate bubble hits must merge."""
+    import cv2
+
+    from koharu_vn_cli.pipeline.detector import (
+        DetectedRegion,
+        _flood_fill_bubble_contour,
+        _merge_overlapping_bubble_regions,
+    )
+
+    h, w = 260, 260
+    rgb = np.full((h, w, 3), (90, 120, 150), dtype=np.uint8)
+    cv2.ellipse(rgb, (130, 130), (75, 95), 0, 0, 360, (255, 255, 255), -1)
+    cv2.ellipse(rgb, (130, 130), (75, 95), 0, 0, 360, (10, 10, 10), 3)
+
+    # Thick vertical ink stripe completely dividing the bubble down the center
+    cv2.rectangle(rgb, (124, 40), (136, 220), (18, 18, 18), -1)
+    tmask = np.zeros((h, w), dtype=np.uint8)
+    tmask[40:220, 123:137] = 180
+
+    bbox, contour, is_dark = _flood_fill_bubble_contour(rgb, tmask, (105, 55, 155, 205), (55, 35, 205, 225))
+    assert bbox is not None
+    assert not is_dark
+    assert (bbox[2] - bbox[0]) >= 135, f"Flood-fill trapped on half-bubble: {bbox}"
+    assert contour is not None and len(contour) >= 4
+
+    r1 = DetectedRegion((70, 60, 120, 190), (55, 35, 205, 225), contour, True, False, 0.88)
+    r2 = DetectedRegion((135, 65, 185, 185), (57, 37, 203, 223), None, True, False, 0.72)
+    merged = _merge_overlapping_bubble_regions([r1, r2])
+    assert len(merged) == 1
+    assert merged[0].text_bbox == (70, 60, 185, 190)
+
+
+def test_typesetter_dense_dialogue_narrow_oval_and_white_narration_rect():
+    """Verify dense dialogue fits without overflow, narrow ovals avoid 1-word staircases, and white rects maximize width."""
+    from koharu_vn_cli.models import TextRegionItem
+    from koharu_vn_cli.pipeline.typesetter import (
+        adapt_regions_for_readability,
+        render_text_regions,
+        solve_layout,
+    )
+
+    # 1. Narrow vertical oval bubble (like the user's screenshot) should group multi-word lines cleanly
+    narrow_reg = TextRegionItem(
+        id=1,
+        kind="bubble",
+        text_bbox=(85, 60, 120, 240),
+        bubble_bbox=(50, 30, 156, 270),
+        translated_text="Quấn lưỡi chặt thêm nữa đi em...",
+    )
+    narrow_lay = solve_layout(narrow_reg, canvas_size=(400, 400))
+    assert not narrow_lay.overflowed
+    assert len(narrow_lay.lines) <= 5, f"Too fragmented into single-word lines: {[l.text for l in narrow_lay.lines]}"
+    assert narrow_lay.font_size >= 13
+
+    # 2. Dense Vietnamese dialogue (~32 words with stacked diacritics) fits cleanly with no overflow
+    dense_text = (
+        "Anh đã bảo em đừng có tự ý hành động một mình nữa rồi mà, "
+        "nếu lúc nãy không có đội hỗ trợ kịp thời tới giải vây thì chắc chắn "
+        "cả hai đứa mình đã gặp rắc rối lớn rồi đấy!"
+    )
+    dense_reg = TextRegionItem(
+        id=2,
+        kind="bubble",
+        text_bbox=(40, 40, 230, 290),
+        bubble_bbox=(30, 25, 240, 305),
+        translated_text=dense_text,
+    )
+    dense_lay = solve_layout(dense_reg, canvas_size=(800, 1100))
+    assert not dense_lay.overflowed, "Dense Vietnamese dialogue should fit cleanly inside bubble"
+    assert dense_lay.font_size >= 12
+    assert 0.85 <= dense_lay.scale_x <= 1.0
+
+    # Render test including condensed scale_x
+    canvas = Image.new("RGBA", (800, 1100), (255, 255, 255, 255))
+    rendered = render_text_regions(canvas, [narrow_reg, dense_reg])
+    assert rendered.size == (800, 1100)
+
+    # 3. White rectangular narration box should be detected as rectangular and fit cleanly at full width (scale_x=1.0)
+    from koharu_vn_cli.pipeline.typesetter import _is_rectangular_contour
+
+    rect_contour = [(40.0, 40.0), (260.0, 40.0), (260.0, 190.0), (40.0, 190.0)]
+    assert _is_rectangular_contour((40, 40, 260, 190), rect_contour)
+    narration_rect = TextRegionItem(
+        id=3,
+        kind="bubble",
+        text_bbox=(50, 50, 250, 180),
+        bubble_bbox=(40, 40, 260, 190),
+        bubble_contour=rect_contour,
+        is_dark_bubble=False,
+        translated_text=dense_text,
+    )
+    narration_oval = narration_rect.model_copy(update={"bubble_contour": None})
+    rect_lay = solve_layout(narration_rect, canvas_size=(800, 1100))
+    oval_lay = solve_layout(narration_oval, canvas_size=(800, 1100))
+    assert not rect_lay.overflowed
+    assert not oval_lay.overflowed
+    assert rect_lay.font_size >= 15
+    assert rect_lay.scale_x == 1.0
+    assert len(rect_lay.lines) <= len(oval_lay.lines)
+
+    # 4. Page-level harmonization tames oversized 1-word bubble next to dense dialogue bubbles
+    short_bubble = TextRegionItem(
+        id=4,
+        kind="bubble",
+        text_bbox=(500, 40, 680, 190),
+        bubble_bbox=(490, 30, 690, 200),
+        translated_text="Ừm...",
+    )
+    dense_b1 = dense_reg.model_copy(update={"id": 10, "bubble_bbox": (30, 30, 230, 290), "text_bbox": (40, 40, 220, 280)})
+    dense_b2 = dense_reg.model_copy(update={"id": 11, "bubble_bbox": (30, 330, 230, 590), "text_bbox": (40, 340, 220, 580)})
+    dense_b3 = dense_reg.model_copy(update={"id": 12, "bubble_bbox": (30, 630, 230, 890), "text_bbox": (40, 640, 220, 880)})
+    raw_short_lay = solve_layout(short_bubble, canvas_size=(800, 1100))
+    dense_ref_lay = solve_layout(dense_b1, canvas_size=(800, 1100))
+    harmonized = adapt_regions_for_readability([dense_b1, dense_b2, dense_b3, short_bubble], 800, 1100)
+    short_out = [r for r in harmonized if r.id == 4][0]
+    short_lay = solve_layout(short_out, canvas_size=(800, 1100))
+    assert short_lay.font_size < raw_short_lay.font_size
+    assert short_lay.font_size <= max(24, int(round(dense_ref_lay.font_size * 1.5)))

@@ -35,6 +35,7 @@ class SolvedLayout:
     line_height: float
     lines: list[LinePlacement]
     overflowed: bool = False
+    scale_x: float = 1.0
 
 
 @lru_cache(maxsize=256)
@@ -158,6 +159,26 @@ def _polygon_chord_at_y(
     return best
 
 
+def _is_rectangular_contour(
+    box: tuple[int, int, int, int],
+    contour: Sequence[tuple[float, float]] | None,
+) -> bool:
+    """Detect rectangular/narration boxes (including white narration frames) via polygon fill ratio."""
+    if not contour or len(contour) < 4:
+        return False
+    bx1, by1, bx2, by2 = box
+    box_area = max(1.0, float((bx2 - bx1) * (by2 - by1)))
+    # Shoelace polygon area
+    n = len(contour)
+    area2 = 0.0
+    for i in range(n):
+        x1, y1 = contour[i]
+        x2, y2 = contour[(i + 1) % n]
+        area2 += x1 * y2 - x2 * y1
+    poly_area = abs(area2) * 0.5
+    return (poly_area / box_area) >= 0.87
+
+
 def _ellipse_chord_at_y(
     box: tuple[int, int, int, int], y: float
 ) -> tuple[float, float] | None:
@@ -244,26 +265,33 @@ def _line_spans_for_block(
     return spans
 
 
+_CLAUSE_BREAK_CHARS = (".", "!", "?", "…", ",", ";", ":", "—", "~", "♡", "♪", '"', ")")
+
+
 def _wrap_paragraph_dp(
     words: list[str],
     widths: list[float],
     font_path: str,
     font_size: int,
     space_w: float,
+    scale_x: float = 1.0,
 ) -> tuple[list[str], float] | None:
     """
     Exact DP word wrapping fitting `words` into exactly `len(widths)` lines,
-    minimizing raggedness and avoiding awkward single-word orphans.
+    minimizing raggedness, rewarding natural Vietnamese clause breaks, and avoiding
+    single-word staircase lines or awkward short orphans.
     """
     n = len(words)
     k = len(widths)
     if k == 0 or n < k:
         return None
 
-    word_ws = [_measure_runs_width(font_path, font_size, w) for w in words]
+    eff_sx = max(0.75, min(1.0, float(scale_x)))
+    word_ws = [_measure_runs_width(font_path, font_size, w) * eff_sx for w in words]
+    eff_space = space_w * eff_sx
 
     def line_width(i: int, j: int) -> float:
-        return sum(word_ws[i:j]) + space_w * max(0, j - i - 1)
+        return sum(word_ws[i:j]) + eff_space * max(0, j - i - 1)
 
     inf = float("inf")
     dp = [[inf] * (n + 1) for _ in range(k + 1)]
@@ -283,9 +311,24 @@ def _wrap_paragraph_dp(
                     break
                 slack = max(0.0, avail - lw) / max(1.0, avail)
                 cost = base + (slack * slack) * 100.0
-                # Penalize single short orphan word on last line if multi-line
-                if line_idx == k - 1 and k > 1 and (end - start) == 1 and len(words[start]) <= 3:
-                    cost += 18.0
+
+                word_cnt = end - start
+                last_word = words[end - 1]
+
+                # Reward natural pauses after punctuation on interior line breaks
+                if line_idx < k - 1 and last_word.endswith(_CLAUSE_BREAK_CHARS):
+                    cost = max(0.0, cost - 5.5)
+
+                # Penalize single-word lines when the sentence has enough words to group naturally
+                if k > 1 and word_cnt == 1 and n >= 4:
+                    if line_idx == k - 1:
+                        # Strong penalty for tiny orphan word dangling on the last line
+                        cost += 28.0 if len(last_word) <= 4 else 12.0
+                    elif line_idx == 0:
+                        cost += 14.0 if len(last_word) <= 3 else 6.0
+                    else:
+                        cost += 10.0
+
                 if cost < dp[line_idx + 1][end]:
                     dp[line_idx + 1][end] = cost
                     parent[line_idx + 1][end] = start
@@ -372,7 +415,14 @@ def solve_layout(
     box_h = max(12.0, float(y2 - y1))
 
     is_bubble = region.kind == "bubble"
-    is_rect = is_bubble and region.is_dark_bubble and not region.draw_bubble
+    is_rect = (
+        is_bubble
+        and not region.draw_bubble
+        and (
+            region.is_dark_bubble
+            or _is_rectangular_contour(box, region.bubble_contour)
+        )
+    )
     contour = region.bubble_contour if (is_bubble and not region.draw_bubble and not is_rect) else None
 
     # Keep tall narrow standalone floating boxes inside safe canvas margins if solve_layout is called directly
@@ -408,87 +458,202 @@ def solve_layout(
         box_w = max(12.0, float(x2 - x1))
         box_h = max(12.0, float(y2 - y1))
 
-    # Generous yet compact margins (fixes horizontal pinch and keeps strokes inside edge)
-    pad_x = max(3.0, min(10.0, box_w * 0.065)) if is_bubble else max(4.0, box_w * 0.04)
-    pad_y = max(5.0, min(14.0, box_h * 0.085)) if is_bubble else max(3.0, box_h * 0.035)
-
     # Explicit paragraphs or flattened words
     paragraphs = [p.split() for p in text.splitlines() if p.strip()]
     words = [w for p in paragraphs for w in p]
     if not words:
         return SolvedLayout(font_path=font_path, font_size=14, line_height=17.0, lines=[])
 
-    # Cap max font size proportionally so floating lines look balanced alongside dialogue bubbles
+    word_count = len(words)
+    char_count = len(text)
+    is_dense = word_count >= 12 or char_count >= 56
+    is_very_dense = word_count >= 22 or char_count >= 105
+    is_narrow_tall = is_bubble and (box_h > box_w * 1.45)
+
+    # Cap max font size proportionally so dialogue & floating lines look balanced
     if region.font_size is not None:
         max_fs = min_fs = max(8, int(round(region.font_size)))
+        hard_min_fs = min_fs
     else:
         if is_bubble:
             max_fs = int(max(14, min(38, box_w * 0.40, box_h * 0.34)))
-            if len(words) <= 2:
+            if word_count <= 2:
                 max_fs = min(max_fs, int(max(14, min(box_w * 0.32, box_h * 0.24))))
+            elif is_very_dense:
+                max_fs = min(max_fs, int(max(14, min(24, math.sqrt((box_w * box_h) / max(1, char_count)) * 1.35))))
+            elif is_dense:
+                max_fs = min(max_fs, int(max(15, min(28, math.sqrt((box_w * box_h) / max(1, char_count)) * 1.45))))
             min_fs = 10 if min(box_w, box_h) < 76 else 11
+            hard_min_fs = 9 if (is_dense or min(box_w, box_h) < 72) else 10
         else:
             max_fs = int(max(15, min(30, box_w * 0.24, max(box_w * 0.16, box_h * 0.28))))
-            if len(words) <= 2:
+            if word_count <= 2:
                 max_fs = min(max_fs, int(max(15, min(box_w * 0.28, box_h * 0.24))))
             min_fs = 10
+            hard_min_fs = 9 if is_dense else 10
 
-    line_ratio = 1.24 if is_bubble else 1.18
+    def _solve_tier(
+        t_pad_x: float,
+        t_pad_y: float,
+        t_line_ratio: float,
+        t_scale_x: float,
+        fs_hi: int,
+        fs_lo: int,
+    ) -> tuple[SolvedLayout, float] | None:
+        """
+        Solve balanced layout within a single padding/line-height/scale_x tier.
+        Evaluates a small window below the first fitting font size so narrow bubbles
+        prefer clean 2+ word lines over awkward 1-word-per-line staircases.
+        """
+        best_overall: tuple[SolvedLayout, float] | None = None
+        first_fit_fs: int | None = None
+        first_fit_staircase = False
 
-    for fs in range(max_fs, min_fs - 1, -1):
-        font = _load_font(font_path, fs)
-        space_w = _measure_text_width(font, " ") or fs * 0.28
-        lh = fs * line_ratio
-        avail_h = box_h - 2.0 * pad_y
-        max_lines = min(len(words), max(1, int(math.floor((avail_h - fs * 0.14) / lh)) + 1))
+        for fs in range(fs_hi, fs_lo - 1, -1):
+            if first_fit_fs is not None:
+                if first_fit_staircase:
+                    if fs < max(fs_lo, int(round(first_fit_fs * 0.58))):
+                        break
+                else:
+                    if (first_fit_fs - fs) > 3 or fs < int(round(first_fit_fs * 0.80)):
+                        break
 
-        # Test all feasible line counts at this font size and pick best balanced oval distribution
-        best_score = float("inf")
-        best_result: SolvedLayout | None = None
+            font = _load_font(font_path, fs)
+            space_w = _measure_text_width(font, " ") or fs * 0.28
+            lh = fs * t_line_ratio
+            avail_h = box_h - 2.0 * t_pad_y
+            max_lines = min(word_count, max(1, int(math.floor((avail_h - fs * 0.14) / lh)) + 1))
 
-        for k in range(1, max_lines + 1):
-            spans = _line_spans_for_block(box, contour, k, fs, lh, pad_x, pad_y, is_bubble, is_rect=is_rect)
-            if spans is None:
-                continue
-            widths = [s[1] for s in spans]
-            # Handle explicit newlines when line count permits, otherwise join smoothly
-            wrapped = _wrap_paragraph_dp(words, widths, font_path, fs, space_w)
-            if wrapped is None:
-                continue
-            lines_text, dp_cost = wrapped
+            best_k_score = float("inf")
+            best_k_layout: SolvedLayout | None = None
+            best_k_single_ratio = 0.0
 
-            # Prefer natural vertical fill (55% - 85% of bubble height) & balanced line widths
-            block_h = fs + (k - 1) * lh
-            fill_ratio = block_h / max(1.0, avail_h)
-            fill_penalty = 0.0 if 0.45 <= fill_ratio <= 0.88 else abs(fill_ratio - 0.65) * 40.0
-            score = dp_cost + fill_penalty
+            for k in range(1, max_lines + 1):
+                spans = _line_spans_for_block(
+                    box, contour, k, fs, lh, t_pad_x, t_pad_y, is_bubble, is_rect=is_rect
+                )
+                if spans is None:
+                    continue
+                widths = [s[1] for s in spans]
+                wrapped = _wrap_paragraph_dp(
+                    words, widths, font_path, fs, space_w, scale_x=t_scale_x
+                )
+                if wrapped is None:
+                    continue
+                lines_text, dp_cost = wrapped
 
-            if score < best_score:
-                best_score = score
-                placements = [
-                    LinePlacement(
-                        text=lt,
-                        center_x=spans[idx][0],
-                        top_y=spans[idx][2],
-                        width=_measure_runs_width(font_path, fs, lt),
+                # Prefer natural vertical fill (48% - 88% of bubble height) & avoid 1-word staircases
+                block_h = fs + (k - 1) * lh
+                fill_ratio = block_h / max(1.0, avail_h)
+                fill_penalty = 0.0 if 0.45 <= fill_ratio <= 0.88 else abs(fill_ratio - 0.68) * 34.0
+
+                single_word_lines = sum(1 for lt in lines_text if len(lt.split()) == 1)
+                single_ratio = single_word_lines / max(1, k)
+                staircase_penalty = 0.0
+                if word_count >= 4 and k >= 3 and box_w >= 62.0 and single_ratio > 0.34:
+                    staircase_penalty = (single_ratio - 0.25) * 145.0
+
+                k_score = dp_cost + fill_penalty + staircase_penalty
+                if k_score < best_k_score:
+                    best_k_score = k_score
+                    best_k_single_ratio = single_ratio
+                    placements = [
+                        LinePlacement(
+                            text=lt,
+                            center_x=spans[idx][0],
+                            top_y=spans[idx][2],
+                            width=_measure_runs_width(font_path, fs, lt) * t_scale_x,
+                        )
+                        for idx, lt in enumerate(lines_text)
+                    ]
+                    best_k_layout = SolvedLayout(
+                        font_path=font_path,
+                        font_size=fs,
+                        line_height=lh,
+                        lines=placements,
+                        overflowed=False,
+                        scale_x=t_scale_x,
                     )
-                    for idx, lt in enumerate(lines_text)
-                ]
-                best_result = SolvedLayout(
-                    font_path=font_path,
-                    font_size=fs,
-                    line_height=lh,
-                    lines=placements,
-                    overflowed=False,
+
+            if best_k_layout is None:
+                continue
+
+            if first_fit_fs is None:
+                first_fit_fs = fs
+                first_fit_staircase = (
+                    word_count >= 4
+                    and len(best_k_layout.lines) >= 4
+                    and best_k_single_ratio > 0.45
                 )
 
-        if best_result is not None:
-            return best_result
+            # Trade-off: larger font is strongly preferred, UNLESS dropping font size removes a
+            # severe 1-word-per-line staircase inside a narrow oval bubble.
+            size_bonus = (fs - fs_lo) * (4.5 if first_fit_staircase else 7.5)
+            combined = best_k_score - size_bonus
+            if best_overall is None or combined < best_overall[1]:
+                best_overall = (best_k_layout, combined)
 
-    # Ultimate fallback at min_fs with greedy wrap so text never disappears
-    fs = min_fs
-    lh = fs * line_ratio
-    lines_text = _greedy_fallback_wrap(text, max(16.0, box_w - 2.0 * pad_x), font_path, fs)
+            # Fast exit as soon as we reach a clean multi-word layout (no severe staircase)
+            if word_count < 4 or best_k_single_ratio <= 0.34 or len(best_k_layout.lines) <= 2:
+                break
+
+        return best_overall
+
+    # Base comfortable margins (Tier 1)
+    base_pad_x = max(3.0, min(10.0, box_w * 0.062)) if is_bubble else max(4.0, box_w * 0.04)
+    base_pad_y = max(5.0, min(13.0, box_h * 0.080)) if is_bubble else max(3.0, box_h * 0.035)
+    base_line_ratio = (1.17 if is_dense else 1.22) if is_bubble else 1.16
+
+    tier1 = _solve_tier(base_pad_x, base_pad_y, base_line_ratio, 1.0, max_fs, min_fs)
+
+    # Comfort floor: if dense or narrow bubble got squeezed below comfortable size, try compact Tier 2
+    comfort_fs = 15 if (is_dense and min(box_w, box_h) >= 100) else (14 if is_bubble else 13)
+    need_tier2 = (
+        region.font_size is None
+        and (
+            tier1 is None
+            or tier1[0].font_size < comfort_fs
+            or (is_narrow_tall and word_count >= 5 and len(tier1[0].lines) >= 5)
+        )
+    )
+
+    best_pick = tier1
+    if need_tier2:
+        t2_pad_x = max(2.5, min(6.5, box_w * 0.040)) if is_bubble else max(3.0, box_w * 0.03)
+        t2_pad_y = max(3.5, min(8.5, box_h * 0.052)) if is_bubble else max(2.5, box_h * 0.025)
+        t2_lr = 1.13 if is_bubble else 1.12
+        t2_sx = 0.92 if (is_dense or is_narrow_tall) else 0.95
+        tier2 = _solve_tier(t2_pad_x, t2_pad_y, t2_lr, t2_sx, max_fs, min_fs)
+        if tier2 is not None:
+            if best_pick is None:
+                best_pick = tier2
+            else:
+                # Prefer Tier 2 when it boosts readable font size WITHOUT worsening quality,
+                # or cuts awkward extra lines with clearly better typography score.
+                fs_gain = tier2[0].font_size - best_pick[0].font_size
+                line_drop = len(best_pick[0].lines) - len(tier2[0].lines)
+                if (fs_gain >= 1 and tier2[1] <= best_pick[1] + 8.0) or (
+                    line_drop >= 1 and tier2[1] < best_pick[1] - 4.0
+                ):
+                    best_pick = tier2
+
+    # Tier 3 rescue for ultra-dense bubbles that still overflow or drop below 11px
+    if region.font_size is None and (best_pick is None or (is_very_dense and best_pick[0].font_size <= 11)):
+        t3_pad_x = 2.0 if is_bubble else 2.5
+        t3_pad_y = 3.0 if is_bubble else 2.0
+        tier3 = _solve_tier(t3_pad_x, t3_pad_y, 1.09, 0.88, max_fs, hard_min_fs)
+        if tier3 is not None and (best_pick is None or tier3[0].font_size > best_pick[0].font_size):
+            best_pick = tier3
+
+    if best_pick is not None:
+        return best_pick[0]
+
+    # Ultimate fallback at hard_min_fs with slight condensation & greedy wrap so text never disappears
+    fs = hard_min_fs
+    lh = fs * 1.10
+    fallback_sx = 0.88 if is_dense else 0.94
+    eff_max_w = max(16.0, (box_w - 4.0) / fallback_sx)
+    lines_text = _greedy_fallback_wrap(text, eff_max_w, font_path, fs)
     cx = (x1 + x2) * 0.5
     cy = (y1 + y2) * 0.5
     block_h = fs + (len(lines_text) - 1) * lh
@@ -498,7 +663,7 @@ def solve_layout(
             text=lt,
             center_x=cx,
             top_y=y0 + idx * lh,
-            width=_measure_runs_width(font_path, fs, lt),
+            width=_measure_runs_width(font_path, fs, lt) * fallback_sx,
         )
         for idx, lt in enumerate(lines_text)
     ]
@@ -508,6 +673,7 @@ def solve_layout(
         line_height=lh,
         lines=placements,
         overflowed=True,
+        scale_x=fallback_sx,
     )
 
 
@@ -604,14 +770,32 @@ def adapt_regions_for_readability(
             if layout.font_size < min_readable or layout.overflowed:
                 bx1, by1, bx2, by2 = copy.bubble_bbox or copy.text_bbox
                 bw, bh = bx2 - bx1, by2 - by1
-                target_w = max(bw, min(int(img_w * 0.24), max(125, int(bw * 1.45))))
-                target_h = max(bh, min(int(img_h * 0.22), int(bh * 1.15)))
+                # Compute neighbor-free horizontal span so tight bubbles never collide with neighbors
+                free_left = margin_x
+                free_right = img_w - margin_x
+                for o_idx, ob in active_boxes:
+                    if o_idx == idx:
+                        continue
+                    if ob[3] + gap <= by1 or by2 + gap <= ob[1]:
+                        continue
+                    ocx = (ob[0] + ob[2]) * 0.5
+                    cx_cur = (bx1 + bx2) * 0.5
+                    if ob[2] <= bx1 + 6 or ocx < cx_cur:
+                        free_left = max(free_left, ob[2] + gap)
+                    if ob[0] >= bx2 - 6 or ocx >= cx_cur:
+                        free_right = min(free_right, ob[0] - gap)
+
+                desired_w = max(bw, min(int(img_w * 0.28), max(125, int(bw * 1.38))))
+                avail_w = max(bw, free_right - free_left)
+                target_w = min(desired_w, avail_w)
+                target_h = max(bh, min(int(img_h * 0.24), int(bh * 1.15)))
                 cx, cy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
-                nx1 = max(margin_x, min(img_w - target_w - margin_x, int(round(cx - target_w * 0.5))))
+                nx1 = max(free_left, min(max(free_left, free_right - target_w), int(round(cx - target_w * 0.5))))
                 ny1 = max(margin_y, min(img_h - target_h - margin_y, int(round(cy - target_h * 0.5))))
                 new_box = clamp_box((nx1, ny1, nx1 + target_w, ny1 + target_h))
+                grew_significantly = (new_box[2] - new_box[0]) > bw * 1.08 or (new_box[3] - new_box[1]) > bh * 1.08
                 copy.text_bbox = new_box
-                if copy.bubble_bbox is not None:
+                if copy.bubble_bbox is not None and grew_significantly:
                     copy.bubble_bbox = new_box
                     copy.bubble_contour = None
 
@@ -658,7 +842,8 @@ def adapt_regions_for_readability(
         if not moved:
             break
 
-    # Step 3: Re-check overflow & tame excessive outlier floating font sizes relative to page bubbles
+    # Step 3: Page-level font harmonization across dialogue bubbles AND floating text.
+    # Prevents a 2-word bubble from jumping to 34px right next to a 25-word dense bubble at 13px.
     bubble_sizes = [
         solve_layout(c, canvas_size=(img_w, img_h)).font_size
         for c in adapted
@@ -670,16 +855,26 @@ def adapt_regions_for_readability(
         else max(15, min(22, int(round(min(img_w, img_h) * 0.020))))
     )
     max_float_fs = max(20, min(28, int(round(ref_fs * 1.4))))
+    max_normal_bubble_fs = max(22, min(32, int(round(ref_fs * 1.45))))
+    max_shout_bubble_fs = max(26, min(36, int(round(ref_fs * 1.65))))
+
     for copy in adapted:
-        if copy.kind != "floating" or copy.font_size is not None:
+        if copy.font_size is not None:
             continue
         if copy.is_sfx and not (copy.translated_text or "").strip():
             continue
-        if not (copy.translated_text or copy.source_text or "").strip():
+        txt = (copy.translated_text or copy.source_text or "").strip()
+        if not txt:
             continue
         lay = solve_layout(copy, canvas_size=(img_w, img_h))
-        if lay.font_size > max_float_fs:
-            copy.font_size = float(max_float_fs)
+        if copy.kind == "floating":
+            if lay.font_size > max_float_fs:
+                copy.font_size = float(max_float_fs)
+        elif len(bubble_sizes) >= 3:
+            is_shout = "!" in txt or (len(txt) <= 12 and txt.isupper())
+            cap_fs = max_shout_bubble_fs if is_shout else max_normal_bubble_fs
+            if lay.font_size > cap_fs:
+                copy.font_size = float(cap_fs)
 
     return adapted
 
@@ -739,11 +934,15 @@ def render_text_regions(canvas_rgba: Image.Image, regions: Sequence[TextRegionIt
         if pw < 4 or ph < 4:
             continue
 
-        patch_hi = Image.new("RGBA", (pw * scale, ph * scale), (0, 0, 0, 0))
+        eff_sx = max(0.75, min(1.0, float(layout.scale_x)))
+        patch_w_hi = max(8, int(round(pw * scale / eff_sx)))
+        patch_h_hi = ph * scale
+        patch_hi = Image.new("RGBA", (patch_w_hi, patch_h_hi), (0, 0, 0, 0))
         draw = ImageDraw.Draw(patch_hi)
         stroke_hi = max(1, int(round(stroke_px * scale))) if stroke_rgba else 0
         primary_hi = _load_font(layout.font_path, size_hi)
         base_ascent, _ = primary_hi.getmetrics()
+        x_scale_hi = scale / eff_sx
 
         for lp in clamped_lines:
             runs = _split_font_runs(lp.text, layout.font_path, size_hi)
@@ -751,7 +950,7 @@ def render_text_regions(canvas_rgba: Image.Image, regions: Sequence[TextRegionIt
                 _measure_text_width(_load_font(fp, size_hi), chunk) for fp, chunk in runs
             ]
             total_w_hi = sum(run_widths)
-            start_x = (lp.center_x - px1) * scale - total_w_hi * 0.5
+            start_x = (lp.center_x - px1) * x_scale_hi - total_w_hi * 0.5
             baseline_y = (lp.top_y - py1) * scale + base_ascent
 
             # Pass 1: stroke for all runs first so stroke never covers adjacent glyph fill

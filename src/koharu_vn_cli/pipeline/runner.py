@@ -1259,7 +1259,10 @@ def run_translate_pipeline(
             )
             erasure_mask = build_erasure_mask(rgb, seg_mask, active_detected)
             with gpu_lock:
-                clean_rgb = inpainter.inpaint(rgb, erasure_mask)
+                try:
+                    clean_rgb = inpainter.inpaint(rgb, erasure_mask, regions=active_detected)
+                except TypeError:
+                    clean_rgb = inpainter.inpaint(rgb, erasure_mask)
             updated_by_id: dict[int, TextRegionItem] = {}
             for det, reg in active_pairs:
                 t_col, s_col, s_factor, is_dark = classify_region_colors(

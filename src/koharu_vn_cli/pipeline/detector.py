@@ -230,15 +230,15 @@ def _flood_fill_bubble_contour(
     # Determine search ROI
     if known_bubble_box is not None:
         bx1, by1, bx2, by2 = known_bubble_box
-        roi_x1 = max(0, bx1 - 4)
-        roi_y1 = max(0, by1 - 4)
-        roi_x2 = min(w, bx2 + 4)
-        roi_y2 = min(h, by2 + 4)
+        roi_x1 = max(0, bx1 - 6)
+        roi_y1 = max(0, by1 - 6)
+        roi_x2 = min(w, bx2 + 6)
+        roi_y2 = min(h, by2 + 6)
     else:
         tx1, ty1, tx2, ty2 = seed_box
         tw, th = tx2 - tx1, ty2 - ty1
-        pad_x = max(24, int(tw * 0.9))
-        pad_y = max(24, int(th * 0.9))
+        pad_x = max(28, int(tw * 0.95))
+        pad_y = max(28, int(th * 0.95))
         roi_x1 = max(0, tx1 - pad_x)
         roi_y1 = max(0, ty1 - pad_y)
         roi_x2 = min(w, tx2 + pad_x)
@@ -282,19 +282,47 @@ def _flood_fill_bubble_contour(
         if bg_std > 42.0 and not (bg_median > 220.0 or bg_median < 60.0):
             return None, None, is_dark
 
-    # Temporarily inpaint text pixels in roi_gray so flood-fill flows smoothly across letters
-    clean_roi = cv2.inpaint(roi_gray, (roi_mask > 80).astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
+    # Temporarily erase text strokes in roi_gray so flood-fill flows smoothly across dense dialogue columns
+    text_erase = cv2.dilate(
+        (roi_mask > 38).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    if (bg_median > 195.0 or bg_median < 55.0) and bg_std < 38.0:
+        clean_roi = roi_gray.copy()
+        clean_roi[text_erase > 0] = int(round(bg_median))
+    else:
+        clean_roi = cv2.inpaint(roi_gray, text_erase, 4, cv2.INPAINT_TELEA)
 
-    # Pick a seed point inside the text box whose value is closest to bg_median
-    seed_crop = np.abs(clean_roi[ly1:ly2, lx1:lx2].astype(np.float32) - bg_median)
-    sy_rel, sx_rel = np.unravel_index(np.argmin(seed_crop), seed_crop.shape)
-    seed_pt = (int(lx1 + sx_rel), int(ly1 + sy_rel))
-
-    ff_mask = np.zeros((rh + 2, rw + 2), dtype=np.uint8)
-    tol = 20 if is_dark else 24
+    # Pick up to 3 candidate seed points (left/center/right inside seed_box) closest to bg_median
+    # so a dense vertical column splitting a bubble in half cannot trap flood-fill on one side.
+    seed_diff = np.abs(clean_roi[ly1:ly2, lx1:lx2].astype(np.float32) - bg_median)
+    sh, sw = seed_diff.shape
+    tol = 22 if is_dark else 26
     flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
-    _, _, ff_mask, _ = cv2.floodFill(clean_roi.copy(), ff_mask, seed_pt, 255, tol, tol, flags)
-    filled = ff_mask[1:-1, 1:-1]
+
+    seed_pts: list[tuple[int, int]] = []
+    if sw >= 18:
+        bands = [(0, sw // 3), (sw // 3, (2 * sw) // 3), ((2 * sw) // 3, sw)]
+    else:
+        bands = [(0, sw)]
+    for b_left, b_right in bands:
+        if b_right <= b_left:
+            continue
+        band_slice = seed_diff[:, b_left:b_right]
+        sy_rel, sx_rel = np.unravel_index(np.argmin(band_slice), band_slice.shape)
+        if float(band_slice[sy_rel, sx_rel]) <= tol * 0.9 or not seed_pts:
+            seed_pts.append((int(lx1 + b_left + sx_rel), int(ly1 + sy_rel)))
+
+    filled = np.zeros((rh, rw), dtype=np.uint8)
+    roi_area = rw * rh
+    for sp in seed_pts:
+        ff_mask = np.zeros((rh + 2, rw + 2), dtype=np.uint8)
+        _, _, ff_mask, _ = cv2.floodFill(clean_roi.copy(), ff_mask, sp, 255, tol, tol, flags)
+        cand = ff_mask[1:-1, 1:-1]
+        cand_area = int(np.count_nonzero(cand))
+        if known_bubble_box is None and cand_area > roi_area * 0.88:
+            continue
+        filled = cv2.bitwise_or(filled, cand)
 
     # Clean holes and extract largest contour
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -302,7 +330,6 @@ def _flood_fill_bubble_contour(
 
     area = int(np.count_nonzero(filled))
     text_area = max(1, (lx2 - lx1) * (ly2 - ly1))
-    roi_area = rw * rh
 
     # Guard against flood-fill leaking out into the full page background
     leaked = area > roi_area * 0.88 and known_bubble_box is None
@@ -349,11 +376,11 @@ def _expand_box_with_seg_mask(
     box: tuple[int, int, int, int],
     seg_mask: np.ndarray,
     bounds: tuple[int, int, int, int] | None = None,
-    max_expand: int = 28,
+    max_expand: int = 34,
 ) -> tuple[int, int, int, int]:
     """
     Expand an RT-DETR text box to enclose connected glyph pixels from CTD `seg_mask`
-    that overlap the box (fixes clipped top/bottom characters on vertical text/SFX).
+    that overlap the box (fixes clipped top/bottom characters, punctuation & furigana).
     """
     h, w = seg_mask.shape[:2]
     x1, y1, x2, y2 = box
@@ -369,9 +396,16 @@ def _expand_box_with_seg_mask(
     if rx2 <= rx1 or ry2 <= ry1:
         return box
 
-    roi = (seg_mask[ry1:ry2, rx1:rx2] > 42).astype(np.uint8) * 255
-    if np.count_nonzero(roi) == 0:
+    raw_roi = (seg_mask[ry1:ry2, rx1:rx2] > 28).astype(np.uint8) * 255
+    if np.count_nonzero(raw_roi) == 0:
         return box
+
+    # Bridge tiny gaps between main vertical strokes, ellipsis dots, heart marks & furigana
+    v_bridge = cv2.morphologyEx(raw_roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7)))
+    roi = cv2.bitwise_or(
+        v_bridge,
+        cv2.morphologyEx(raw_roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))),
+    )
 
     # Local coordinates of the original box inside ROI
     ox1, oy1 = max(0, x1 - rx1), max(0, y1 - ry1)
@@ -383,10 +417,10 @@ def _expand_box_with_seg_mask(
         cx, cy, cw, ch, area = stats[lbl]
         if area < 6:
             continue
-        # Check if component overlaps the core box (or sits within 4px of it)
-        if cx + cw >= ox1 - 4 and cx <= ox2 + 4 and cy + ch >= oy1 - 4 and cy <= oy2 + 4:
+        # Check if component overlaps the core box (or sits within 5px of it)
+        if cx + cw >= ox1 - 5 and cx <= ox2 + 5 and cy + ch >= oy1 - 5 and cy <= oy2 + 5:
             # Verify component actually belongs to the glyphs inside the box
-            comp_in_orig = labels[max(0, oy1 - 3) : min(ry2 - ry1, oy2 + 3), max(0, ox1 - 3) : min(rx2 - rx1, ox2 + 3)]
+            comp_in_orig = labels[max(0, oy1 - 4) : min(ry2 - ry1, oy2 + 4), max(0, ox1 - 4) : min(rx2 - rx1, ox2 + 4)]
             if np.any(comp_in_orig == lbl):
                 nx1 = min(nx1, rx1 + int(cx))
                 ny1 = min(ny1, ry1 + int(cy))
@@ -475,12 +509,12 @@ def _discover_unboxed_text_regions(
 ) -> list[DetectedRegion]:
     """Recover standalone glyph clusters lit up in UNet+DBNet `text_mask` that box detectors missed."""
     h, w = text_mask.shape[:2]
-    uncovered = (text_mask > 82).astype(np.uint8) * 255
+    uncovered = (text_mask > 70).astype(np.uint8) * 255
     for ex1, ey1, ex2, ey2 in existing_boxes:
-        pad = 5
+        pad = 6
         uncovered[max(0, ey1 - pad) : min(h, ey2 + pad), max(0, ex1 - pad) : min(w, ex2 + pad)] = 0
 
-    if np.count_nonzero(uncovered) < 95:
+    if np.count_nonzero(uncovered) < 85:
         return []
 
     closed = cv2.morphologyEx(uncovered, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 13)))
@@ -489,17 +523,17 @@ def _discover_unboxed_text_regions(
     page_area = h * w
     for lbl in range(1, num_lbl):
         cx, cy, cw, ch, area = (int(v) for v in stats[lbl])
-        if cw < 12 or ch < 12 or area < 100 or area > page_area * 0.25:
+        if cw < 12 or ch < 12 or area < 90 or area > page_area * 0.28:
             continue
         aspect = cw / max(1, ch)
-        if aspect < 0.06 or aspect > 15.0:
+        if aspect < 0.05 or aspect > 16.0:
             continue
         box = (max(0, cx - 2), max(0, cy - 2), min(w, cx + cw + 2), min(h, cy + ch + 2))
         crop_m = text_mask[box[1] : box[3], box[0] : box[2]]
-        if crop_m.size == 0 or int(crop_m.max()) < 130:
+        if crop_m.size == 0 or int(crop_m.max()) < 118:
             continue
-        fg_ratio = float(np.count_nonzero(crop_m > 65)) / max(1, crop_m.size)
-        if fg_ratio < 0.03:
+        fg_ratio = float(np.count_nonzero(crop_m > 58)) / max(1, crop_m.size)
+        if fg_ratio < 0.025:
             continue
         refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, box, None)
         recovered.append(
@@ -513,6 +547,69 @@ def _discover_unboxed_text_regions(
             )
         )
     return recovered
+
+
+def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[DetectedRegion]:
+    """
+    Merge duplicate detections that share the same physical speech bubble
+    (e.g., an edge column missed by initial grouping then flood-filled into the same balloon).
+    """
+    if len(regions) < 2:
+        return regions
+
+    merged: list[DetectedRegion] = []
+    for reg in sorted(
+        regions,
+        key=lambda r: (
+            1 if r.is_bubble else 0,
+            box_area(r.bubble_bbox or r.text_bbox),
+            r.confidence,
+        ),
+        reverse=True,
+    ):
+        r_bbox = reg.bubble_bbox
+        matched_idx: int | None = None
+        for idx, kept in enumerate(merged):
+            if not kept.is_bubble or kept.bubble_bbox is None:
+                continue
+            k_bbox = kept.bubble_bbox
+            if r_bbox is not None and iou(r_bbox, k_bbox) >= 0.70:
+                matched_idx = idx
+                break
+            if containment_ratio(reg.text_bbox, k_bbox) >= 0.65:
+                matched_idx = idx
+                break
+            if r_bbox is not None and containment_ratio(kept.text_bbox, r_bbox) >= 0.65:
+                matched_idx = idx
+                break
+
+        if matched_idx is None:
+            merged.append(reg)
+            continue
+
+        kept = merged[matched_idx]
+        new_tbox = union_box([kept.text_bbox, reg.text_bbox])
+        if kept.bubble_bbox is not None and r_bbox is not None:
+            if box_area(r_bbox) > box_area(kept.bubble_bbox):
+                new_bbox = r_bbox
+                new_contour = reg.bubble_contour or kept.bubble_contour
+            else:
+                new_bbox = kept.bubble_bbox
+                new_contour = kept.bubble_contour or reg.bubble_contour
+        else:
+            new_bbox = kept.bubble_bbox or r_bbox
+            new_contour = kept.bubble_contour or reg.bubble_contour
+
+        merged[matched_idx] = DetectedRegion(
+            text_bbox=new_tbox,
+            bubble_bbox=new_bbox,
+            bubble_contour=new_contour,
+            is_bubble=True,
+            is_dark_bubble=kept.is_dark_bubble,
+            confidence=max(kept.confidence, reg.confidence),
+            angle=kept.angle,
+        )
+    return merged
 
 
 def _to_prob_01(arr: np.ndarray) -> np.ndarray:
@@ -755,9 +852,15 @@ class ComicDetector:
         for t_box, t_score, t_lbl in texts:
             best_b_idx: int | None = None
             best_score = 0.0
+            tcx = (t_box[0] + t_box[2]) * 0.5
+            tcy = (t_box[1] + t_box[3]) * 0.5
             for idx, (b_box, _, _) in enumerate(bubbles):
                 c = containment_ratio(t_box, b_box)
-                if c >= 0.55 and c > best_score:
+                center_inside = (
+                    (b_box[0] - 4) <= tcx <= (b_box[2] + 4)
+                    and (b_box[1] - 4) <= tcy <= (b_box[3] + 4)
+                )
+                if (c >= 0.55 or (c >= 0.40 and center_inside)) and c > best_score:
                     best_score = c
                     best_b_idx = idx
             if best_b_idx is not None:
@@ -771,7 +874,7 @@ class ComicDetector:
         for b_idx, members in bubble_groups.items():
             b_box, b_score, _ = bubbles[b_idx]
             merged_tbox = union_box([m[0] for m in members])
-            merged_tbox = _expand_box_with_seg_mask(merged_tbox, text_mask, bounds=b_box, max_expand=24)
+            merged_tbox = _expand_box_with_seg_mask(merged_tbox, text_mask, bounds=b_box, max_expand=32)
             avg_conf = max(b_score, max(m[1] for m in members))
             refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, merged_tbox, b_box)
             regions.append(
@@ -787,7 +890,7 @@ class ComicDetector:
 
         # 2. Standalone texts (may still sit inside an undetected white/dark translucent bubble!)
         for t_box, t_score, t_lbl in standalone_texts:
-            expanded_tbox = _expand_box_with_seg_mask(t_box, text_mask, bounds=None, max_expand=28)
+            expanded_tbox = _expand_box_with_seg_mask(t_box, text_mask, bounds=None, max_expand=34)
             refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, expanded_tbox, None)
             is_bubble = refined_box is not None or t_lbl == 1
             regions.append(
@@ -803,6 +906,9 @@ class ComicDetector:
 
         # 3. Fallback: recover strong UNet+DBNet glyph clusters missed by box detectors
         regions.extend(_discover_unboxed_text_regions(rgb, text_mask, [r.text_bbox for r in regions]))
+
+        # 4. Merge any duplicate regions belonging to the exact same speech bubble
+        regions = _merge_overlapping_bubble_regions(regions)
 
         # Sort in Manga reading order: top-to-bottom bands, right-to-left within bands
         regions.sort(key=lambda r: (r.text_bbox[1] // max(40, h // 8), -((r.text_bbox[0] + r.text_bbox[2]) // 2)))
