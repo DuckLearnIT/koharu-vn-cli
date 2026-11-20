@@ -779,6 +779,16 @@ def adapt_regions_for_readability(
                     nx1 = max(margin_x, min(img_w - margin_x - eff_w, int(round(cx_orig - eff_w * 0.5))))
                     nx2 = min(img_w - margin_x, nx1 + eff_w)
 
+                # Never let Step 1 widening push a floating box far off its original center
+                max_shift_x = max(44.0, bw * 0.45)
+                cur_cx = (nx1 + nx2) * 0.5
+                if abs(cur_cx - cx_orig) > max_shift_x:
+                    clamped_cx = max(cx_orig - max_shift_x, min(cx_orig + max_shift_x, cur_cx))
+                    half_w = min(eff_w * 0.5, max(bw * 0.5, abs(free_right - clamped_cx) if cur_cx < cx_orig else abs(clamped_cx - free_left)))
+                    eff_w_t = max(bw, int(round(half_w * 2.0)))
+                    nx1 = max(margin_x, min(img_w - margin_x - eff_w_t, int(round(clamped_cx - eff_w_t * 0.5))))
+                    nx2 = min(img_w - margin_x, nx1 + eff_w_t)
+
                 trial = copy.model_copy(update={"text_bbox": clamp_box((nx1, y1, nx2, y2))})
                 trial_lay = solve_layout(trial, canvas_size=(img_w, img_h))
                 if trial_lay.lines:
@@ -829,7 +839,30 @@ def adapt_regions_for_readability(
                     copy.bubble_bbox = new_box
                     copy.bubble_contour = None
 
-    # Step 2: Iterative overlap resolution moving ONLY floating boxes (anchors keep real speech balloons fixed)
+    # Step 2: Iterative overlap resolution moving ONLY floating boxes (anchors keep real speech balloons fixed),
+    # strictly tethered to each region's original center so text NEVER flies away onto character faces!
+    orig_anchors = {
+        i: (
+            (regions[i].text_bbox[0] + regions[i].text_bbox[2]) * 0.5,
+            (regions[i].text_bbox[1] + regions[i].text_bbox[3]) * 0.5,
+            max(1, regions[i].text_bbox[2] - regions[i].text_bbox[0]),
+            max(1, regions[i].text_bbox[3] - regions[i].text_bbox[1]),
+        )
+        for i in range(len(adapted))
+    }
+
+    def tether_box(idx: int, cand: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        c = clamp_box(cand)
+        ocx, ocy, obw, obh = orig_anchors[idx]
+        cw, ch = c[2] - c[0], c[3] - c[1]
+        max_dx = max(42.0, obw * 0.45)
+        max_dy = max(48.0, obh * 0.40)
+        ncx = max(ocx - max_dx, min(ocx + max_dx, (c[0] + c[2]) * 0.5))
+        ncy = max(ocy - max_dy, min(ocy + max_dy, (c[1] + c[3]) * 0.5))
+        nx1 = int(round(ncx - cw * 0.5))
+        ny1 = int(round(ncy - ch * 0.5))
+        return clamp_box((nx1, ny1, nx1 + cw, ny1 + ch))
+
     floating_indices = [
         i
         for i, c in enumerate(adapted)
@@ -844,7 +877,7 @@ def adapt_regions_for_readability(
         and (c.translated_text or c.source_text or "").strip()
     ]
 
-    for _ in range(20):
+    for _ in range(16):
         moved = False
         for i in floating_indices:
             a = adapted[i].text_bbox
@@ -854,7 +887,6 @@ def adapt_regions_for_readability(
                 b = adapted[j].bubble_bbox or adapted[j].text_bbox
                 if not _rect_overlap(a, b, gap=gap):
                     continue
-                moved = True
                 ox = min(a[2] + gap, b[2] + gap) - max(a[0], b[0])
                 oy = min(a[3] + gap, b[3] + gap) - max(a[1], b[1])
                 acx, acy = (a[0] + a[2]) * 0.5, (a[1] + a[3]) * 0.5
@@ -862,13 +894,29 @@ def adapt_regions_for_readability(
                 if oy <= ox * 1.15:
                     dir_y = -1 if acy <= bcy else 1
                     shift = int(math.ceil(oy * (0.6 if adapted[j].kind == "floating" else 1.0)))
-                    a = clamp_box((a[0], a[1] + dir_y * shift, a[2], a[3] + dir_y * shift))
-                    adapted[i].text_bbox = a
+                    cand = tether_box(i, (a[0], a[1] + dir_y * shift, a[2], a[3] + dir_y * shift))
                 else:
                     dir_x = -1 if acx <= bcx else 1
                     shift = int(math.ceil(ox * (0.6 if adapted[j].kind == "floating" else 1.0)))
-                    a = clamp_box((a[0] + dir_x * shift, a[1], a[2] + dir_x * shift, a[3]))
+                    cand = tether_box(i, (a[0] + dir_x * shift, a[1], a[2] + dir_x * shift, a[3]))
+                if cand != a:
+                    moved = True
+                    a = cand
                     adapted[i].text_bbox = a
+                elif (a[2] - a[0]) > 96 and ox <= (a[2] - a[0]) * 0.45:
+                    # Already at tether limit: trim the overlapping edge instead of flying away
+                    if acx <= bcx:
+                        new_x2 = max(a[0] + 84, b[0] - gap)
+                        if new_x2 < a[2]:
+                            a = (a[0], a[1], new_x2, a[3])
+                            adapted[i].text_bbox = a
+                            moved = True
+                    else:
+                        new_x1 = min(a[2] - 84, b[2] + gap)
+                        if new_x1 > a[0]:
+                            a = (new_x1, a[1], a[2], a[3])
+                            adapted[i].text_bbox = a
+                            moved = True
         if not moved:
             break
 

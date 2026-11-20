@@ -761,21 +761,30 @@ _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 class ComicDetector:
     """
-    Combined YSG YOLOv11-S 1024x1024 (accurate=True) or YSG YOLOv11-N (accurate=False)
-    + ComicTextDetector UNet/DBNet pixel text mask.
-    Lightweight (~36MB), 1024x1024 native resolution, safe on 8GB RAM laptops & 4GB GPUs.
+    Hybrid Detector combining:
+      1. YSG YOLOv11-S 1024x1024 (accurate=True) or YOLOv11-N (accurate=False) for razor-sharp text lines/columns.
+      2. ogkalu/comic-text-and-bubble-detector (int8 ~35MB) for full speech-bubble & translucent balloon containers.
+      3. ComicTextDetector UNet+DBNet for pixel-level glyph mask.
     """
 
     def __init__(self, accurate: bool = True, use_gpu: bool = True) -> None:
         self._accurate = accurate
         self._ysg_yolo11s: ort.InferenceSession | None = None
         self._ysg_rfdetr: ort.InferenceSession | None = None
+        self._bubble_det: ort.InferenceSession | None = None
         self._rtdetr: ort.InferenceSession | None = None
 
         yolo_file = YSG_YOLO11S_FILE if accurate else YSG_YOLO11N_FILE
         y11_path = hf_hub_download(YSG_REPO_ID, yolo_file)
         self._ysg_yolo11s = _create_ort_session(y11_path, use_gpu=use_gpu, low_mem=True)
         self._rtdetr = self._ysg_yolo11s
+
+        # Lightweight int8 RT-DETR bubble detector reliably catches dark translucent & wavy cloud bubbles
+        try:
+            bub_path = hf_hub_download("ogkalu/comic-text-and-bubble-detector", "detector_int8.onnx")
+            self._bubble_det = _create_ort_session(bub_path, use_gpu=use_gpu, low_mem=True)
+        except Exception:
+            self._bubble_det = None
 
         ctd_path = _ensure_ctd_model()
         self._ctd = _create_ort_session(ctd_path, use_gpu=use_gpu, low_mem=True)
@@ -960,6 +969,51 @@ class ComicDetector:
                 texts.append((clamped, ranked, 2))
         return bubbles, texts
 
+    def _run_bubble_det(
+        self,
+        rgb_tile: np.ndarray,
+        offset_x: int = 0,
+        offset_y: int = 0,
+        conf_thresh: float = 0.34,
+        full_w: int | None = None,
+        full_h: int | None = None,
+    ) -> tuple[list[tuple[tuple[int, int, int, int], float, int]], list[tuple[tuple[int, int, int, int], float, int]]]:
+        """Run lightweight ogkalu RT-DETR int8 to catch translucent dark/cloud speech bubbles & missed bubble text."""
+        if self._bubble_det is None:
+            return [], []
+        th, tw = rgb_tile.shape[:2]
+        fw = full_w if full_w is not None else offset_x + tw
+        fh = full_h if full_h is not None else offset_y + th
+        tile_rect = (offset_x, offset_y, offset_x + tw, offset_y + th)
+
+        resized = cv2.resize(rgb_tile, (640, 640), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        inp = np.transpose(resized, (2, 0, 1))[None]
+        labels, boxes, scores = self._bubble_det.run(
+            None,
+            {"images": inp, "orig_target_sizes": np.array([[tw, th]], dtype=np.int64)},
+        )
+        bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
+        texts: list[tuple[tuple[int, int, int, int], float, int]] = []
+        for lbl, box, sc in zip(labels[0], boxes[0], scores[0]):
+            score = float(sc)
+            label = int(lbl)
+            min_sc = max(0.32, conf_thresh) if label == 0 else max(0.42, conf_thresh + 0.06)
+            if score < min_sc:
+                continue
+            x1 = float(box[0]) + offset_x
+            y1 = float(box[1]) + offset_y
+            x2 = float(box[2]) + offset_x
+            y2 = float(box[3]) + offset_y
+            clamped = _clamp_box((x1, y1, x2, y2), offset_x + tw, offset_y + th)
+            if box_area(clamped) < 64:
+                continue
+            ranked = _tile_clip_score(score, clamped, tile_rect, fw, fh)
+            if label == 0:
+                bubbles.append((clamped, ranked, 0))
+            elif label == 1:
+                texts.append((clamped, ranked, 1))
+        return bubbles, texts
+
     def detect(
         self,
         rgb: np.ndarray,
@@ -972,7 +1026,7 @@ class ComicDetector:
         raw_bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
         raw_lines: list[tuple[tuple[int, int, int, int], float, int]] = []
 
-        # Primary pass: YSG RF-DETR Large (accurate=True) or YSG YOLOv11-S 1024x1024 (accurate=False)
+        # Primary pass: YSG YOLOv11-S 1024x1024 (text lines) + ogkalu int8 (speech bubbles incl. dark/translucent)
         # Only tile on ultra-tall webtoons (aspect > 2.2) to keep RAM usage compact and fast.
         is_webtoon = (max(w, h) / max(1, min(w, h)) > 2.2) and (max(w, h) > 1600)
         windows = _compute_tile_windows(w, h, max_side=1280, overlap=0.20) if is_webtoon else [(0, 0, w, h)]
@@ -986,6 +1040,13 @@ class ComicDetector:
                 b11, t11 = self._run_ysg_yolo11s(tile, wx1, wy1, conf_thresh=conf_thresh, full_w=w, full_h=h)
                 raw_bubbles.extend(b11)
                 raw_lines.extend(t11)
+            if self._bubble_det is not None:
+                bb, bt = self._run_bubble_det(tile, wx1, wy1, conf_thresh=conf_thresh, full_w=w, full_h=h)
+                raw_bubbles.extend(bb)
+                # Keep ogkalu text_bubble hits only when YSG didn't cover that region
+                for b_tbox, b_tsc, b_tlbl in bt:
+                    if not any(containment_ratio(b_tbox, lb) >= 0.45 or iou(b_tbox, lb) >= 0.25 for lb, _, _ in raw_lines):
+                        raw_lines.append((b_tbox, b_tsc * 0.92, b_tlbl))
 
         # Deduplicate bubble containers and per-column/per-line boxes
         bubbles = _containment_nms(raw_bubbles, iou_thresh=0.45, contain_thresh=0.70)

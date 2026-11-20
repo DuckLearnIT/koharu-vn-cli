@@ -205,7 +205,15 @@ def build_erasure_mask(
             else:
                 bg_med = float(np.median(bg_sample)) if bg_sample.size > 0 else float(np.median(roi_gray))
 
-            diff = np.abs(roi_gray.astype(np.float32) - bg_med)
+            # Use max-channel RGB diff as well as grayscale diff so vivid pink/red glyphs on light bubbles are caught
+            bg_rgb_med = (
+                np.median(interior_bg_rgb.astype(np.float32), axis=0)
+                if interior_bg_rgb.size >= 24
+                else np.array([bg_med, bg_med, bg_med], dtype=np.float32)
+            )
+            diff_gray = np.abs(roi_gray.astype(np.float32) - bg_med)
+            diff_rgb = np.max(np.abs(roi_rgb.astype(np.float32) - bg_rgb_med[None, None, :]), axis=-1)
+            diff = np.maximum(diff_gray, diff_rgb * 0.85)
             otsu_val, _ = cv2.threshold(
                 np.clip(diff, 0, 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
             )
@@ -216,11 +224,35 @@ def build_erasure_mask(
             else:
                 thresh = max(24.0, float(otsu_val))
 
-            # On flat bubbles, clean ANY dark/contrast ink across the entire safe interior
-            # (erases vertical stroke ghosts, furigana & punctuation outside tight text_bbox).
+            # On flat bubbles, clean ANY contrast ink across the entire safe interior
             ink_scope = safe_roi if (safe_roi is not None and is_flat_bubble) else tbox_roi
             extra = ((diff > thresh) & (ink_scope > 0)).astype(np.uint8) * 255
             local_mask = cv2.bitwise_or(local_mask, extra)
+
+            # On TRANSLUCENT bubbles (dark smoke bubbles with white Japanese text OR wavy white clouds
+            # over artwork), a tight text_bbox often misses top/edge glyphs (e.g. な/ん/い/温/え/ろ).
+            # Run local-background contrast across the full safe_roi (inset from bubble outline) so
+            # stray edge glyphs are cleanly erased without erasing underlying translucent artwork!
+            if reg.is_bubble and safe_roi is not None and not is_flat_bubble:
+                k_blur = min(31, max(15, (min(roi_h, roi_w) // 5) | 1))
+                local_bg = cv2.medianBlur(roi_gray, k_blur).astype(np.float32)
+                g_f = roi_gray.astype(np.float32)
+                if bg_med < 120.0:
+                    # Dark translucent bubble: original text is bright white ink
+                    stray_ink = (
+                        (safe_roi > 0)
+                        & ((g_f - local_bg) > 38.0)
+                        & (g_f > max(132.0, bg_med + 42.0))
+                    )
+                else:
+                    # Bright translucent cloud bubble: original text is dark black or vivid colored ink
+                    local_rgb_bg = cv2.medianBlur(roi_rgb, k_blur).astype(np.float32)
+                    local_cdiff = np.max(np.abs(roi_rgb.astype(np.float32) - local_rgb_bg), axis=-1)
+                    stray_ink = (safe_roi > 0) & (
+                        ((local_bg - g_f) > 34.0)
+                        | ((local_cdiff > 58.0) & (g_f < bg_med - 16.0))
+                    )
+                local_mask = cv2.bitwise_or(local_mask, stray_ink.astype(np.uint8) * 255)
         else:
             # Floating outlined glyph border absorption: check narrow ring around detected glyphs
             halo_ring = cv2.subtract(

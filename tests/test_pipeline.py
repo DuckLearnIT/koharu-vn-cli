@@ -3614,3 +3614,64 @@ def test_typesetter_dense_dialogue_narrow_oval_and_white_narration_rect():
     short_lay = solve_layout(short_out, canvas_size=(800, 1100))
     assert short_lay.font_size < raw_short_lay.font_size
     assert short_lay.font_size <= max(24, int(round(dense_ref_lay.font_size * 1.5)))
+
+
+def test_inpaint_translucent_dark_bubble_erases_edge_white_glyphs_and_tether_prevents_flyaway():
+    """Verify dark translucent bubbles erase stray white edge glyphs & floating text stays tethered near origin."""
+    import cv2
+
+    from koharu_vn_cli.models import TextRegionItem
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.inpaint import build_erasure_mask
+    from koharu_vn_cli.pipeline.typesetter import adapt_regions_for_readability
+
+    # 1. Dark translucent smoke bubble with artwork gradient behind it + stray white glyph outside tight text_bbox
+    h, w = 260, 220
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    for y in range(h):
+        rgb[y, :, :] = (min(255, 80 + y // 2), 95, 110)
+    # Draw semi-transparent dark bubble
+    overlay = rgb.copy()
+    cv2.ellipse(overlay, (110, 130), (80, 100), 0, 0, 360, (25, 25, 30), -1)
+    rgb = cv2.addWeighted(overlay, 0.72, rgb, 0.28, 0)
+    cv2.ellipse(rgb, (110, 130), (80, 100), 0, 0, 360, (235, 235, 235), 2)
+
+    # White glyph near top-left edge INSIDE bubble (outside tight text_bbox) like `い 温`
+    cv2.putText(rgb, "A", (58, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (250, 250, 250), 2)
+    # Main white glyph inside text_bbox
+    cv2.putText(rgb, "B", (95, 145), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (250, 250, 250), 2)
+
+    seg_mask = np.zeros((h, w), dtype=np.uint8)
+    seg_mask[115:155, 92:125] = 200  # CTD only caught center glyph 'B', missed edge glyph 'A'
+
+    reg = DetectedRegion(
+        text_bbox=(90, 110, 135, 165),
+        bubble_bbox=(30, 30, 190, 230),
+        bubble_contour=None,
+        is_bubble=True,
+        is_dark_bubble=True,
+        confidence=0.92,
+    )
+    erasure = build_erasure_mask(rgb, seg_mask, [reg])
+    # Edge white glyph 'A' around (58..74, 52..74) must be captured in erasure mask!
+    assert int(np.count_nonzero(erasure[50:76, 56:78])) >= 40, "Stray white edge glyph inside dark translucent bubble was missed!"
+
+    # 2. Tether guard prevents floating box from flying far away onto a character's face
+    bubble_anchor = TextRegionItem(
+        id=1,
+        kind="bubble",
+        text_bbox=(980, 40, 1250, 360),
+        bubble_bbox=(960, 20, 1265, 380),
+        translated_text="Cái miệng hỗn xược này tối nay không phải để cãi đâu...",
+    )
+    nearby_float = TextRegionItem(
+        id=2,
+        kind="floating",
+        text_bbox=(940, 240, 1060, 460),
+        translated_text="Mà là để phục vụ cho con hàng này sướng điên lên thôi chứ gì?",
+    )
+    adapted = adapt_regions_for_readability([bubble_anchor, nearby_float], 1280, 905)
+    f_out = adapted[1].text_bbox
+    orig_cx = (940 + 1060) * 0.5
+    new_cx = (f_out[0] + f_out[2]) * 0.5
+    assert abs(new_cx - orig_cx) <= 80.0, f"Floating box flew too far from origin: {orig_cx} -> {new_cx}"
