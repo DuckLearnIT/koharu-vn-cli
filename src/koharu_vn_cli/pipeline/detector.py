@@ -520,8 +520,15 @@ def _discover_unboxed_text_regions(
     rgb: np.ndarray,
     text_mask: np.ndarray,
     existing_boxes: list[tuple[int, int, int, int]],
+    *,
+    bubbles_only: bool = False,
 ) -> list[DetectedRegion]:
-    """Recover standalone glyph clusters lit up in UNet+DBNet `text_mask` that box detectors missed."""
+    """
+    Recover glyph clusters lit up in UNet+DBNet `text_mask` that box detectors missed.
+    When `bubbles_only=True` (default once YSG/ogkalu box detectors already ran), ONLY recover
+    clusters enclosed inside a real speech bubble so hand-drawn floating Japanese SFX on artwork
+    is left untouched!
+    """
     h, w = text_mask.shape[:2]
     uncovered = (text_mask > 70).astype(np.uint8) * 255
     for ex1, ey1, ex2, ey2 in existing_boxes:
@@ -550,6 +557,10 @@ def _discover_unboxed_text_regions(
         if fg_ratio < 0.025:
             continue
         refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, box, None)
+        if bubbles_only:
+            # Reject floating SFX and tiny white-outlined SFX blobs that pretend to be mini-bubbles
+            if refined_box is None or box_area(refined_box) < 2200:
+                continue
         recovered.append(
             DetectedRegion(
                 text_bbox=box,
@@ -999,10 +1010,13 @@ class ComicDetector:
 
         resized = cv2.resize(rgb_tile, (640, 640), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
         inp = np.transpose(resized, (2, 0, 1))[None]
-        labels, boxes, scores = self._bubble_det.run(
-            None,
-            {"images": inp, "orig_target_sizes": np.array([[tw, th]], dtype=np.int64)},
-        )
+        try:
+            labels, boxes, scores = self._bubble_det.run(
+                None,
+                {"images": inp, "orig_target_sizes": np.array([[tw, th]], dtype=np.int64)},
+            )
+        except Exception:
+            return [], []
         bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
         texts: list[tuple[tuple[int, int, int, int], float, int]] = []
         for lbl, box, sc in zip(labels[0], boxes[0], scores[0]):
@@ -1146,8 +1160,16 @@ class ComicDetector:
                 )
             )
 
-        # 3. Fallback: recover strong UNet+DBNet glyph clusters completely missed by box detectors
-        regions.extend(_discover_unboxed_text_regions(rgb, text_mask, [r.text_bbox for r in regions]))
+        # 3. Fallback: recover missed real speech bubbles ONLY (never scoop hand-drawn artwork SFX
+        # that YSG YOLOv11-S + ogkalu intentionally ignored!)
+        regions.extend(
+            _discover_unboxed_text_regions(
+                rgb,
+                text_mask,
+                [r.text_bbox for r in regions],
+                bubbles_only=len(regions) > 0,
+            )
+        )
 
         # 4. Merge any duplicate regions belonging to the exact same speech bubble
         regions = _merge_overlapping_bubble_regions(regions)

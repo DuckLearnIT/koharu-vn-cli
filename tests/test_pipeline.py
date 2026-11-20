@@ -3746,3 +3746,50 @@ def test_resume_skips_pass1_after_prohibit_or_existing_page_cache(tmp_path: Path
     )
     assert res3 is None
     assert calls["n"] == 1
+
+
+def test_japanese_sfx_protection_and_uncensor_vietnamese_asterisks():
+    """Verify Japanese SFX glyphs stay untouched and asterisk self-censorship (`C* L*`) is eliminated."""
+    from koharu_vn_cli.models import TextRegionItem
+    from koharu_vn_cli.pipeline.gemini_client import (
+        has_asterisk_censor,
+        looks_like_floating_sfx,
+        region_needs_translation,
+        uncensor_vietnamese_asterisks,
+    )
+
+    # 1. All common manga/doujinshi SFX variants must be flagged as SFX
+    for sfx in (
+        "フルフル",
+        "ふるふる",
+        "プルン♡",
+        "ぷるぷる",
+        "ビチャ♡",
+        "ひちゃ",
+        "レロレロ♡",
+        "じゅぷ",
+        "ギシッ",
+        "メキッ..",
+        "ンンッ♡",
+        "ハァハァ",
+    ):
+        assert looks_like_floating_sfx(sfx) is True, f"Missed Japanese SFX: {sfx}"
+
+    # Spoken dialogue must NOT be mistaken for SFX
+    for speech in ("あっ…ぐっ！！", "先輩…だめですっ", "やめてください"):
+        assert looks_like_floating_sfx(speech) is False, f"Spoken dialogue misclassified as SFX: {speech}"
+
+    # 2. Asterisk self-censorship detection & restoration
+    assert has_asterisk_censor("KHÁC NÀO CHIẾC C* L* SỐNG CẢ...") is True
+    assert uncensor_vietnamese_asterisks("KHÁC NÀO CHIẾC C* L* SỐNG CẢ...") == "KHÁC NÀO CHIẾC CÁI LỒN SỐNG CẢ..."
+    assert uncensor_vietnamese_asterisks("cái l*n này sướng v*i") == "cái lồn này sướng vãi"
+    assert has_asterisk_censor("Không hề có dấu sao kiểm duyệt") is False
+
+    censored_reg = TextRegionItem(
+        id=1,
+        kind="bubble",
+        text_bbox=(10, 10, 120, 80),
+        source_text="生オナホみたいだ",
+        translated_text="Khác nào cái b*p b* sống...",
+    )
+    assert region_needs_translation(censored_reg) is True

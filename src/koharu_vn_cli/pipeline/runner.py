@@ -1262,6 +1262,17 @@ def run_translate_pipeline(
         ) -> tuple[np.ndarray, list[TextRegionItem]]:
             """Build erasure mask and run LaMa inpainting only on non-SFX regions so artwork SFX stays intact."""
             by_id_det = {reg_idx: det for reg_idx, det in enumerate(detected, start=1)}
+            normalized_items: list[TextRegionItem] = []
+            for r in items:
+                if skip_sfx and r.kind == "floating" and (
+                    r.is_sfx
+                    or looks_like_floating_sfx(r.source_text)
+                    or not (r.translated_text or "").strip()
+                ):
+                    normalized_items.append(r.model_copy(update={"is_sfx": True, "translated_text": ""}))
+                else:
+                    normalized_items.append(r)
+            items = normalized_items
             active_pairs = [
                 (by_id_det[r.id], r)
                 for r in items
@@ -1792,9 +1803,14 @@ def run_translate_pipeline(
                     except Exception:
                         pass
 
-            # Ensure any region with a non-empty Vietnamese translation is never skipped as SFX during inpainting/typesetting
+            # Preserve SFX protection for floating sound effects; only clear is_sfx on genuine translated dialogue
             for item_r in translated_items:
-                if (item_r.translated_text or "").strip():
+                if skip_sfx and item_r.kind == "floating" and (
+                    item_r.is_sfx or looks_like_floating_sfx(item_r.source_text)
+                ):
+                    item_r.is_sfx = True
+                    item_r.translated_text = ""
+                elif (item_r.translated_text or "").strip():
                     item_r.is_sfx = False
 
             with state_lock:
@@ -1911,7 +1927,12 @@ def run_translate_pipeline(
                         pass
 
                 for item_r in translated_items:
-                    if (item_r.translated_text or "").strip():
+                    if skip_sfx and item_r.kind == "floating" and (
+                        item_r.is_sfx or looks_like_floating_sfx(item_r.source_text)
+                    ):
+                        item_r.is_sfx = True
+                        item_r.translated_text = ""
+                    elif (item_r.translated_text or "").strip():
                         item_r.is_sfx = False
                 with state_lock:
                     _remember_translations(translated_items)

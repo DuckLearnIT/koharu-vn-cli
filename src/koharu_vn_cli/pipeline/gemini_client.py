@@ -841,15 +841,27 @@ def _format_tags_block(tags: str | None) -> str:
 _CJK_KANA_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
 _KANA_HANGUL_RE = re.compile(r"[\u3040-\u30ff\uac00-\ud7af]")
 _PURE_KATAKANA_RE = re.compile(r"^[\u3040-\u30ffーッンヴ]+$")
+_STRICT_KATAKANA_RE = re.compile(r"^[\u30a0-\u30ffーッンヴ]+$")
+_REDUPLICATED_KANA_SFX_RE = re.compile(r"^([\u3040-\u30ff]{2,3})\1+[ッっーーンん]*$")
 _PURE_HANGUL_RE = re.compile(r"^[\uac00-\ud7af]+$")
 _SFX_STEMS_RE = re.compile(
     r"^(?:"
-    r"ドキ|ドク|ビク|ピタ|ツル|ニュル|ヌル|ヌチ|グチュ|グチョ|ズチュ|ズボ|ジュポ|ピチャ|"
-    r"ドピュ|ビュル|ペチ|パチ|パキ|バキ|ガタ|カチ|ギシ|ゴゴ|ザワ|ゾク|シク|キラ|"
-    r"どき|どく|びく|ぴた|つる|にゅる|ぬる|ぬち|ぐちゅ|ぐちょ|ずちゅ|ずぼ|じゅぽ|ぴちゃ|"
-    r"どぴゅ|びゅる|ぺち|ぱち|ぱき|ばき|がた|かち|ぎし|ごご|ざわ|ぞく|しく|きら|ぽよん|ずっぽ|"
-    r"ド[ンー]|バ[ンー]|パ[ンー]|ポ[ンヨ]|ギ[ュヤ]|ズ[ンボ]|"
-    r"ど[んー]|ば[んー]|ぱ[んー]|ぽ[んよ]|ぎ[ゅや]|ず[んぼ]"
+    r"ドキ|ドク|ビク|ピク|ピタ|ツル|ニュル|ヌル|ヌチ|ヌプ|グチュ|グチョ|クチュ|クチョ|"
+    r"ズチュ|ズボ|ズブ|ジュポ|ジュプ|ジュル|ズル|ピチャ|ビチャ|ヒチャ|ペチャ|ベチャ|ピシャ|ビシャ|"
+    r"プチュ|ブチュ|チュパ|ペロ|ベロ|レロ|フル|プル|ブル|プニ|ムニュ|ムギュ|ムチ|グニ|プク|ボイン|ユサ|"
+    r"メキ|ギシ|ギュ|キュ|ガシ|ガク|グラ|フラ|クラ|モゾ|ゴク|ボタ|ポタ|タラ|トロ|ジワ|"
+    r"ドピュ|ビュル|ドバ|ビュ|ピュ|ブシュ|プシュ|シュ|コキ|シコ|ズコ|"
+    r"ペチ|パチ|バチ|パキ|バキ|ピキ|ガタ|カチ|ゴゴ|ザワ|ゾク|ゾワ|シク|キラ|ヒク|チク|コツ|カサ|ガサ|ボコ|"
+    r"ンン|ハァ|ゼェ|フゥ|"
+    r"どき|どく|びく|ぴく|ぴた|つる|にゅる|ぬる|ぬち|ぬぷ|ぐちゅ|ぐちょ|くちゅ|くちょ|"
+    r"ずちゅ|ずぼ|ずぶ|じゅぽ|じゅぷ|じゅる|ずる|ぴちゃ|びちゃ|ひちゃ|ぺちゃ|べちゃ|ぴしゃ|びしゃ|"
+    r"ぷちゅ|ぶちゅ|ちゅぱ|ぺろ|べろ|れろ|ふる|ぷる|ぶる|ぷに|むにゅ|むぎゅ|むち|ぐに|ぷく|ぼいん|ゆさ|"
+    r"めき|ぎし|ぎゅ|きゅ|がし|がく|ぐら|ふら|くら|もぞ|ごく|ぼた|ぽた|たら|とろ|じわ|"
+    r"どぴゅ|びゅる|どば|びゅ|ぴゅ|ぶしゅ|ぷしゅ|しゅ|こき|しこ|ずこ|"
+    r"ぺち|ぱち|ばち|ぱき|ばき|ぴき|がた|かち|ごご|ざわ|ぞく|ぞわ|しく|きら|ひく|ちく|こつ|かさ|がさ|ぼこ|"
+    r"ぽよん|ずっぽ|んん|はぁ|ぜぇ|ふぅ|"
+    r"ド[ンー]|バ[ンー]|パ[ンァー]|ポ[ンヨ]|ギ[ュヤ]|ズ[ンボ]|ゴ[ッン]|ザ[ッー]|サ[ッー]|ス[ッー]|グ[ッイ]|"
+    r"ど[んー]|ば[んー]|ぱ[んぁー]|ぽ[んよ]|ぎ[ゅや]|ず[んぼ]|ご[っん]|ざ[っー]|さ[っー]|す[っー]|ぐ[っい]"
     r")",
 )
 _KO_SFX_RE = re.compile(
@@ -858,6 +870,48 @@ _KO_SFX_RE = re.compile(
     r"두근|움찔|부르르|덜컥|스윽|슥|휘익|달칵|찰칵|꿀꺽|사각|바스락|짜릿"
     r")+$"
 )
+_ASTERISK_CENSOR_RE = re.compile(
+    r"(?:(?<!\w)[A-Za-zÀ-ỹ]{1,4}\*+[A-Za-zÀ-ỹ]{0,4}(?!\w)|\*{2,})",
+    re.UNICODE,
+)
+
+
+def has_asterisk_censor(text: str | None) -> bool:
+    """Detect self-censored Vietnamese profanity/NSFW tokens like `C* L*`, `l*n`, `c*c`, `đ*t`, `***`."""
+    return bool(_ASTERISK_CENSOR_RE.search((text or "").strip()))
+
+
+_VN_CENSOR_FIXES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bc\*\s*l\*", re.IGNORECASE), "cái lồn"),
+    (re.compile(r"\bl\*n\b", re.IGNORECASE), "lồn"),
+    (re.compile(r"\bl\*\*\b", re.IGNORECASE), "lồn"),
+    (re.compile(r"\bc\*c\b", re.IGNORECASE), "cặc"),
+    (re.compile(r"\bc\*\*\b", re.IGNORECASE), "cặc"),
+    (re.compile(r"\bđ\*t\b", re.IGNORECASE), "địt"),
+    (re.compile(r"\bd\*t\b", re.IGNORECASE), "địt"),
+    (re.compile(r"\bđ\*o\b", re.IGNORECASE), "đéo"),
+    (re.compile(r"\bv\*i\b", re.IGNORECASE), "vãi"),
+    (re.compile(r"\bch\*ch\b", re.IGNORECASE), "chịch"),
+    (re.compile(r"\bb\*ồi\b", re.IGNORECASE), "buồi"),
+    (re.compile(r"\bđ\*ụ\b|\bđ\*\b", re.IGNORECASE), "đụ"),
+]
+
+
+def _preserve_case_sub(match: re.Match[str], repl: str) -> str:
+    src = match.group(0)
+    if src.isupper():
+        return repl.upper()
+    if src[:1].isupper():
+        return repl[:1].upper() + repl[1:]
+    return repl
+
+
+def uncensor_vietnamese_asterisks(text: str) -> str:
+    """Restore common self-censored Vietnamese tokens (`C* L*`, `l*n`, `c*c`, `đ*t`) into natural full words."""
+    out = text
+    for pat, repl in _VN_CENSOR_FIXES:
+        out = pat.sub(lambda m, r=repl: _preserve_case_sub(m, r), out)
+    return out
 _VN_TEXT_KEYS = ("vietnamese", "vi", "viet", "translated", "translated_text", "translation", "text_vi", "text")
 _HARD_PLACEHOLDER_TEXTS = {"", "(trống)", "n/a", "none", "null"}
 _ELLIPSIS_PLACEHOLDER_TEXTS = {"...", "…", "—", "-"}
@@ -882,7 +936,7 @@ def _parse_bool_flag(val: Any) -> bool:
 
 def looks_like_floating_sfx(text: str) -> bool:
     """Return True when non-bubble OCR text is unambiguously a Japanese/Korean sound-effect glyph."""
-    cleaned = re.sub(r"[\s\u3000!！?？…・〜~\-ー♡♥]+", "", (text or "").strip())
+    cleaned = re.sub(r"[\s\u3000!！?？…・〜~\-ー♡♥\.。、]+", "", (text or "").strip())
     if not cleaned or len(cleaned) > 16:
         return False
     if _PURE_HANGUL_RE.match(cleaned):
@@ -892,19 +946,30 @@ def looks_like_floating_sfx(text: str) -> bool:
         return len(cleaned) == 1 and "(" not in (text or "") and ")" not in (text or "")
     if not _PURE_KATAKANA_RE.match(cleaned):
         return False
-    return bool(_SFX_STEMS_RE.search(cleaned))
+    if _SFX_STEMS_RE.search(cleaned):
+        return True
+    # Reduplicated Kana onomatopoeia outside bubbles (e.g. フルフル, レロレロ, ぷるぷる, ちゅぱちゅぱ)
+    if _REDUPLICATED_KANA_SFX_RE.match(cleaned):
+        return True
+    # Short pure Katakana sound effect ending with sokuon/prolongation/n (e.g. メキッ, ギシッ, プルン, ンンッ)
+    if _STRICT_KATAKANA_RE.match(cleaned) and 2 <= len(cleaned) <= 6 and cleaned.endswith(("ッ", "ー", "ン")):
+        return True
+    return False
 
 
 def _sfx_rule_block(skip_sfx: bool) -> str:
     if not skip_sfx:
         return ""
     return (
-        "\nQUY TẮC BỎ QUA SFX (BẮT BUỘC):\n"
-        "- Nếu khung [ID] là **SFX / từ tượng thanh / tiếng động hiệu ứng vẽ trực tiếp trên tranh** "
-        "(Nhật: ドン, ドキッ, ビクン, グチュ, ズチュ, バキッ, カチッ, ぱんっ, ぽよん; "
-        "Hàn: 하앙, 옥, 푹, 찔꺽, 철퍽, 주륵, 두근, 움찔, 짝; Trung: 咻, 啪...): "
-        "BẮT BUỘC đặt `\"is_sfx\": true` và `\"vietnamese\": \"\"` (để TRỐNG hoàn toàn, KHÔNG dịch và KHÔNG chèn chữ đè tranh).\n"
-        "- NGƯỢC LẠI, với MỌI lời thoại trong bubble, suy nghĩ trong ngoặc `(...)`, lời dẫn hay tiếng rên có câu chữ từ miệng nhân vật: "
+        "\nQUY TẮC GIỮ NGUYÊN SFX TIẾNG NHẬT/HÀN GỐC (BẮT BUỘC TUYỆT ĐỐI):\n"
+        "- Người dùng muốn **GIỮ NGUYÊN 100% các hiệu ứng SFX vẽ trực tiếp trên tranh** (không dịch, không tẩy, không chèn chữ Việt đè lên tranh!).\n"
+        "- BẤT KỲ khung [ID] nào là **SFX / từ tượng thanh / tiếng động / tiếng cọ xát / tiếng ướt át / tiếng run rẩy / tiếng thở vẽ tay bên ngoài bóng thoại** "
+        "(Nhật: ドン, ドキッ, ビクン, グチュ, ズチュ, バキッ, カチッ, ギシ, ギシッ, フルフル, ふるふる, プルン, ぷるぷる, ビチャ, ひちゃ, レロレロ, じゅぷ, メキ, ぱんっ, ぽよん, ンンッ, ハァハァ, ゼェゼェ...; "
+        "Hàn: 하앙, 옥, 푹, 찔꺽, 철퍽, 주륵, 두근, 움찔, 짝; Trung: 咻, 啪...) "
+        "hoặc watermark/copyright (`©...`, `http://...`): "
+        "BẮT BUỘC đặt `\"is_sfx\": true` và `\"vietnamese\": \"\"` (để TRỐNG hoàn toàn!).\n"
+        "- KHÔNG dịch các SFX trên tranh thành 'Hộc...!', 'Lép nhép', 'Rung rẩy', 'Kẽo kẹt', 'Bạch bạch'...\n"
+        "- NGƯỢC LẠI, với MỌI lời thoại trong bubble, suy nghĩ trong ngoặc `(...)`, lời dẫn hay câu nói rõ ràng của nhân vật: "
         "đặt `\"is_sfx\": false` và dịch sang Tiếng Việt tự nhiên.\n"
     )
 
@@ -915,7 +980,7 @@ def normalize_source_key(text: str) -> str:
 
 
 def region_needs_translation(reg: TextRegionItem) -> bool:
-    """Return True if a non-SFX region is still empty, placeholder, or untranslated CJK/Kana/Hangul."""
+    """Return True if a non-SFX region is still empty, placeholder, asterisk-censored, or untranslated CJK/Kana/Hangul."""
     if reg.is_sfx:
         return False
     src = (reg.source_text or "").strip()
@@ -925,6 +990,8 @@ def region_needs_translation(reg: TextRegionItem) -> bool:
     if vn in _ELLIPSIS_PLACEHOLDER_TEXTS:
         return _source_has_substantive_words(src)
     if _KANA_HANGUL_RE.search(vn):
+        return True
+    if has_asterisk_censor(vn):
         return True
     if src and _CJK_KANA_RE.search(src):
         if normalize_source_key(vn) == normalize_source_key(src):
@@ -1539,6 +1606,8 @@ class VisionLLMClient:
         "NGUYÊN TẮC VIỆT HÓA TỰ NHIÊN & GỢI CẢM ĐÚNG CONTEXT (CỰC KỲ QUAN TRỌNG):\n"
         "- Viết như người Việt ngoài đời đang nói chuyện/thì thầm/rên rỉ thật; TUYỆT ĐỐI KHÔNG dịch word-by-word, không văn viết, không lối diễn văn sách vở hay từ y khoa khô khan.\n"
         "- Khi cảnh mang sắc thái thân mật/18+/trêu chọc, hãy dùng ngôn từ mềm mại, ướt át, gợi cảm hoặc táo bạo đúng với biểu cảm & ngữ cảnh gốc (vd: 'nhạy cảm quá...', 'đừng chạm chỗ đó mà...', 'sâu quá... chậm chút đi...', 'cứng hết cả lên rồi kìa', 'chịu hết nổi rồi...', 'bên trong khít chặt quá...').\n"
+        "- TUYỆT ĐỐI CẤM TỰ KIỂM DUYỆT BẰNG DẤU SAO `*` HOẶC VIẾT TẮT CHE CHỮ (CẤM TUYỆT ĐỐI kiểu `C* L*`, `l*n`, `c*c`, `đ*t`, `v*i`, `c**`, `***`, `c.ặ.c`): "
+        "phải viết ĐẦY ĐỦ 100% từ Tiếng Việt tự nhiên! Nếu cần tránh từ quá thô ở cảnh nhẹ, hãy chọn từ lóng/khẩu ngữ tiếng Việt viết đầy đủ và gợi cảm (vd: `生オナホ / 肉オナホ` -> 'búp bê sống', 'món đồ chơi sống', 'cái lồn sống'; `ちんぽ` -> 'cây hàng', 'con cặc'; `まんこ` -> 'chỗ đó', 'cái lồn'), KHÔNG BAO GIỜ chèn dấu `*` vào giữa từ!\n"
         "- TUYỆT ĐỐI TRÁNH từ y khoa khô khan ('âm đạo', 'dương vật', 'giao hợp') và tiếng rên kiểu Anh ('UGH', 'GUH', 'BUH', 'NNGH', 'MMN', 'FUH'): đổi sang khẩu ngữ Việt tự nhiên theo sắc thái cảnh ('bên trong', 'chỗ đó', 'nóng hổi', 'ướt nhẹp', 'sâu quá', 'ra mất') và tiếng thở Việt ('Ư...', 'Ưm...', 'Á...', 'Aaa...', 'Hộc...', 'Khựa...').\n"
         "- CẤM dùng từ cứng, sáo rỗng ít ai nói ngoài đời như: 'hắn ta', 'ả', 'gã', 'cô nàng', 'thực sự là', 'vô cùng', 'cái đó', 'vậy sao', 'thèm thuồng lắm chứ', 'kẻ hầu', 'ấn ký' (trừ khi đúng bối cảnh kỳ ảo cổ trang: mới dùng 'ta - ngươi' hoặc danh xưng cổ trang).\n"
         "- Câu ngắn gọn, súc tích VỪA KHÍT KHUNG THOẠI (tránh dịch rườm rà dài dòng làm chữ bị bóp nhỏ hoặc tràn khung), giữ nhịp thở ngắt quãng (`...`, `!?`) và tiểu từ tự nhiên (à, ừ, nhỉ, đấy, chứ, đâu, cơ mà, mất rồi, luôn ấy, nha...).\n"
@@ -1843,9 +1912,12 @@ class VisionLLMClient:
                     copy.source_text = fallback_src
 
                 vn = _extract_vn_from_item(match, source_text=copy.source_text)
+                if vn and has_asterisk_censor(vn):
+                    vn = uncensor_vietnamese_asterisks(vn)
                 raw_is_sfx = _parse_bool_flag(match.get("is_sfx"))
                 norm_src = normalize_source_key(copy.source_text)
-                is_pure_floating_sfx = looks_like_floating_sfx(copy.source_text)
+                is_watermark = bool(re.search(r"(?:©|https?://|\.(?:com|net|org|jp)/?)", norm_src, re.IGNORECASE))
+                is_pure_floating_sfx = looks_like_floating_sfx(copy.source_text) or is_watermark
                 bubble_has_spoken = bool(re.search(r"[\u3040-\u309f\uac00-\ud7af]", norm_src))
 
                 # Protect spoken dialogue & valid translations from accidental SFX mis-tagging:
