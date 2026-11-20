@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import gc
+import math
+
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -155,12 +158,14 @@ def build_erasure_mask(
             safe_roi[by1 - py1 : by2 - py1, bx1 - px1 : bx2 - px1] = safe_int
 
         tbox_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
-        tx1_l = max(0, x1 - pad_box - px1)
-        ty1_l = max(0, y1 - pad_box - py1)
-        tx2_l = min(roi_w, x2 + pad_box - px1)
-        ty2_l = min(roi_h, y2 + pad_box - py1)
-        if tx2_l > tx1_l and ty2_l > ty1_l:
-            tbox_roi[ty1_l:ty2_l, tx1_l:tx2_l] = 255
+        sub_boxes = reg.line_bboxes if (reg.line_bboxes and not reg.is_bubble) else [reg.text_bbox]
+        for sb in sub_boxes:
+            tx1_l = max(0, sb[0] - pad_box - px1)
+            ty1_l = max(0, sb[1] - pad_box - py1)
+            tx2_l = min(roi_w, sb[2] + pad_box - px1)
+            ty2_l = min(roi_h, sb[3] + pad_box - py1)
+            if tx2_l > tx1_l and ty2_l > ty1_l:
+                tbox_roi[ty1_l:ty2_l, tx1_l:tx2_l] = 255
 
         # Restrict seg seed to text_bbox union safe_interior so outer artwork never leaks in
         seed_allowed = cv2.bitwise_or(tbox_roi, safe_roi) if safe_roi is not None else tbox_roi
@@ -241,7 +246,7 @@ def build_erasure_mask(
         )
 
         # Slightly fuller dilation so LaMa never sees residual dark stroke halos or furigana
-        k_size = 11 if reg.is_bubble else 13
+        k_size = 11 if reg.is_bubble else 15
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
         local_mask = cv2.dilate(local_mask, kernel, iterations=1)
 
@@ -325,45 +330,95 @@ def classify_region_colors(
 
 
 class HybridInpainter:
-    """Erases detected text using fast solid-fill for uniform bubbles and LaMa-Manga ONNX for complex areas."""
+    """
+    Erases detected text using fast spotless solid-fill for uniform bubbles and
+    dynamic-resolution LaMa-Manga ONNX (`ogkalu/lama-manga-onnx-dynamic`) for complex CG/artwork.
+    """
 
     def __init__(self, use_gpu: bool = True) -> None:
-        self._lama_path = hf_hub_download("mayocream/lama-manga-onnx", "lama-manga.onnx")
         self._use_gpu = use_gpu
-        self._lama = _create_ort_session(self._lama_path, use_gpu=use_gpu)
+        try:
+            self._lama_path = hf_hub_download("ogkalu/lama-manga-onnx-dynamic", "lama-manga-dynamic.onnx")
+            self._lama = _create_ort_session(self._lama_path, use_gpu=use_gpu)
+            self._is_dynamic = True
+        except Exception:
+            self._lama_path = hf_hub_download("mayocream/lama-manga-onnx", "lama-manga.onnx")
+            self._lama = _create_ort_session(self._lama_path, use_gpu=use_gpu)
+            self._is_dynamic = False
 
     def _run_lama_patch(self, rgb_patch: np.ndarray, mask_patch: np.ndarray) -> np.ndarray:
         ph, pw = rgb_patch.shape[:2]
-        if ph <= 512 and pw <= 512:
-            if ph == 512 and pw == 512:
-                rgb_512 = rgb_patch
-                msk_512 = mask_patch
-            else:
-                rgb_512 = cv2.copyMakeBorder(rgb_patch, 0, 512 - ph, 0, 512 - pw, cv2.BORDER_REPLICATE)
-                msk_512 = cv2.copyMakeBorder(mask_patch, 0, 512 - ph, 0, 512 - pw, cv2.BORDER_CONSTANT, value=0)
-            img_512 = rgb_512.astype(np.float32) / 255.0
-            msk_bin = (msk_512 > 127).astype(np.float32)
-        else:
-            img_512 = cv2.resize(rgb_patch, (512, 512), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-            msk_resized = cv2.resize(mask_patch, (512, 512), interpolation=cv2.INTER_AREA)
-            msk_bin = (msk_resized > 24).astype(np.float32)
+        is_dynamic = bool(getattr(self, "_is_dynamic", False))
 
-        inp_img = np.transpose(img_512, (2, 0, 1))[None]
+        if is_dynamic:
+            # Dynamic-resolution LaMa: 1:1 native rectangular patch (padded to multiple of 8),
+            # bounded by pixel area so tall narrow vertical dialogue runs 1:1 with tiny RAM!
+            on_gpu = (
+                hasattr(self._lama, "get_providers")
+                and self._lama.get_providers() != ["CPUExecutionProvider"]
+            )
+            max_pixels = (768 * 768) if on_gpu else (512 * 512)
+            cur_pixels = ph * pw
+            if cur_pixels <= max_pixels and max(ph, pw) <= (1024 if on_gpu else 800):
+                pad_h = (8 - (ph % 8)) % 8
+                pad_w = (8 - (pw % 8)) % 8
+                rgb_in = (
+                    cv2.copyMakeBorder(rgb_patch, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
+                    if (pad_h or pad_w)
+                    else rgb_patch
+                )
+                msk_in = (
+                    cv2.copyMakeBorder(mask_patch, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+                    if (pad_h or pad_w)
+                    else mask_patch
+                )
+                img_f = rgb_in.astype(np.float32) / 255.0
+                msk_bin = (msk_in > 127).astype(np.float32)
+                resized_down = False
+            else:
+                scale = min(
+                    math.sqrt(max_pixels / max(1.0, float(cur_pixels))),
+                    (1024.0 if on_gpu else 800.0) / max(1.0, float(max(ph, pw))),
+                )
+                rw = max(64, int(round(pw * scale)) // 8 * 8)
+                rh = max(64, int(round(ph * scale)) // 8 * 8)
+                img_f = cv2.resize(rgb_patch, (rw, rh), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+                msk_resized = cv2.resize(mask_patch, (rw, rh), interpolation=cv2.INTER_AREA)
+                msk_bin = (msk_resized > 24).astype(np.float32)
+                resized_down = True
+        else:
+            resized_down = ph > 512 or pw > 512
+            if not resized_down:
+                if ph == 512 and pw == 512:
+                    rgb_512 = rgb_patch
+                    msk_512 = mask_patch
+                else:
+                    rgb_512 = cv2.copyMakeBorder(rgb_patch, 0, 512 - ph, 0, 512 - pw, cv2.BORDER_REPLICATE)
+                    msk_512 = cv2.copyMakeBorder(mask_patch, 0, 512 - ph, 0, 512 - pw, cv2.BORDER_CONSTANT, value=0)
+                img_f = rgb_512.astype(np.float32) / 255.0
+                msk_bin = (msk_512 > 127).astype(np.float32)
+            else:
+                img_f = cv2.resize(rgb_patch, (512, 512), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+                msk_resized = cv2.resize(mask_patch, (512, 512), interpolation=cv2.INTER_AREA)
+                msk_bin = (msk_resized > 24).astype(np.float32)
+
+        inp_img = np.transpose(img_f, (2, 0, 1))[None]
         inp_msk = msk_bin[None, None]
         try:
             out = self._lama.run(None, {"image": inp_img, "mask": inp_msk})[0][0]
         except Exception:
-            # DirectML fails on LaMa's FFC FFT MatMul_5 node; safely downgrade to CPU without losing progress.
-            if self._lama.get_providers() != ["CPUExecutionProvider"]:
+            # DirectML/CUDA failure: free old session BEFORE creating CPU fallback to avoid doubling RAM.
+            if hasattr(self._lama, "get_providers") and self._lama.get_providers() != ["CPUExecutionProvider"]:
+                self._lama = None  # type: ignore[assignment]
+                gc.collect()
                 self._lama = _create_ort_session(self._lama_path, use_gpu=False)
                 out = self._lama.run(None, {"image": inp_img, "mask": inp_msk})[0][0]
             else:
                 raise
-        # mayocream/lama-manga-onnx outputs float RGB in [0.0, 1.0]
-        pred_512 = np.clip(np.transpose(out, (1, 2, 0)) * 255.0, 0.0, 255.0).astype(np.uint8)
-        if ph <= 512 and pw <= 512:
-            return pred_512[:ph, :pw]
-        return cv2.resize(pred_512, (pw, ph), interpolation=cv2.INTER_LINEAR)
+        pred = np.clip(np.transpose(out, (1, 2, 0)) * 255.0, 0.0, 255.0).astype(np.uint8)
+        if not resized_down:
+            return pred[:ph, :pw]
+        return cv2.resize(pred, (pw, ph), interpolation=cv2.INTER_LINEAR)
 
     def inpaint(
         self,
@@ -436,19 +491,28 @@ class HybridInpainter:
                     result[gy : gy + gh, gx : gx + gw] = np.clip(blended, 0, 255).astype(np.uint8)
                     continue
 
-            # Complex / translucent background: run LaMa at exact 512x512 when block <= 440px
-            cx, cy = gx + gw // 2, gy + gh // 2
-            max_span = max(gw, gh)
-            side = 512 if max_span <= 440 else min(max(512, int(max_span * 1.45)), max(h, w))
-            side = min(side, max(h, w))
-            half = side // 2
-            px1 = max(0, cx - half)
-            py1 = max(0, cy - half)
-            px2 = min(w, px1 + side)
-            py2 = min(h, py1 + side)
-            # Re-adjust start if clipped on right/bottom
-            px1 = max(0, px2 - side)
-            py1 = max(0, py2 - side)
+            # Complex / translucent background:
+            # With dynamic LaMa, crop a tight rectangular context (+64px margin) instead of an oversized
+            # square — keeps 1:1 crispness on tall vertical CG dialogue while using 3x less RAM!
+            if bool(getattr(self, "_is_dynamic", False)):
+                ctx_x = max(56, min(96, int(gw * 0.35)))
+                ctx_y = max(56, min(96, int(gh * 0.25)))
+                px1 = max(0, gx - ctx_x)
+                py1 = max(0, gy - ctx_y)
+                px2 = min(w, gx + gw + ctx_x)
+                py2 = min(h, gy + gh + ctx_y)
+            else:
+                cx, cy = gx + gw // 2, gy + gh // 2
+                max_span = max(gw, gh)
+                side = 512 if max_span <= 440 else min(max(512, int(max_span * 1.45)), max(h, w))
+                side = min(side, max(h, w))
+                half = side // 2
+                px1 = max(0, cx - half)
+                py1 = max(0, cy - half)
+                px2 = min(w, px1 + side)
+                py2 = min(h, py1 + side)
+                px1 = max(0, px2 - side)
+                py1 = max(0, py2 - side)
 
             patch_rgb = result[py1:py2, px1:px2]
             patch_msk = cv2.morphologyEx(binary[py1:py2, px1:px2], cv2.MORPH_CLOSE, k_close_lama)

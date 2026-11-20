@@ -470,23 +470,30 @@ def solve_layout(
     is_very_dense = word_count >= 22 or char_count >= 105
     is_narrow_tall = is_bubble and (box_h > box_w * 1.45)
 
+    # Scale font caps proportionally with high-res page dimensions (e.g. 1200x1800 CG pages)
+    page_scale = 1.0
+    if canvas_size is not None:
+        page_scale = max(1.0, min(1.65, min(canvas_size[0], canvas_size[1]) / 850.0))
+
     # Cap max font size proportionally so dialogue & floating lines look balanced
     if region.font_size is not None:
         max_fs = min_fs = max(8, int(round(region.font_size)))
         hard_min_fs = min_fs
     else:
         if is_bubble:
-            max_fs = int(max(14, min(38, box_w * 0.40, box_h * 0.34)))
+            max_cap = int(round(38 * page_scale))
+            max_fs = int(max(14, min(max_cap, box_w * 0.40, box_h * 0.34)))
             if word_count <= 2:
                 max_fs = min(max_fs, int(max(14, min(box_w * 0.32, box_h * 0.24))))
             elif is_very_dense:
-                max_fs = min(max_fs, int(max(14, min(24, math.sqrt((box_w * box_h) / max(1, char_count)) * 1.35))))
+                max_fs = min(max_fs, int(max(14, min(int(round(26 * page_scale)), math.sqrt((box_w * box_h) / max(1, char_count)) * 1.35))))
             elif is_dense:
-                max_fs = min(max_fs, int(max(15, min(28, math.sqrt((box_w * box_h) / max(1, char_count)) * 1.45))))
+                max_fs = min(max_fs, int(max(15, min(int(round(30 * page_scale)), math.sqrt((box_w * box_h) / max(1, char_count)) * 1.45))))
             min_fs = 10 if min(box_w, box_h) < 76 else 11
             hard_min_fs = 9 if (is_dense or min(box_w, box_h) < 72) else 10
         else:
-            max_fs = int(max(15, min(30, box_w * 0.24, max(box_w * 0.16, box_h * 0.28))))
+            float_cap = int(round(32 * page_scale))
+            max_fs = int(max(15, min(float_cap, box_w * 0.24, max(box_w * 0.16, box_h * 0.28))))
             if word_count <= 2:
                 max_fs = min(max_fs, int(max(15, min(box_w * 0.28, box_h * 0.24))))
             min_fs = 10
@@ -733,36 +740,59 @@ def adapt_regions_for_readability(
         if copy.kind == "floating":
             x1, y1, x2, y2 = clamp_box(copy.text_bbox)
             bw, bh = x2 - x1, y2 - y1
-            # Compute available free left/right span bounded by vertically overlapping neighbors
-            free_left = margin_x
-            free_right = img_w - margin_x
-            for o_idx, ob in active_boxes:
-                if o_idx == idx:
-                    continue
-                if ob[3] + gap <= y1 or y2 + gap <= ob[1]:
-                    continue
-                ocx = (ob[0] + ob[2]) * 0.5
-                cx = (x1 + x2) * 0.5
-                if ob[2] <= x1 + 6 or ocx < cx:
-                    free_left = max(free_left, ob[2] + gap)
-                if ob[0] >= x2 - 6 or ocx >= cx:
-                    free_right = min(free_right, ob[0] - gap)
+            cx_orig = (x1 + x2) * 0.5
+            cy_orig = (y1 + y2) * 0.5
 
-            if bw < max(130, int(img_w * 0.14)) and bh > bw * 1.35:
-                cx = (x1 + x2) * 0.5
-                desired_w = max(bw, min(int(img_w * 0.34), max(165, int(math.sqrt(len(text) * 185)))))
+            if bw < max(195, int(img_w * 0.22)) and bh > bw * 1.45:
+                # Tall vertical Japanese floating column(s): widen around ORIGINAL center first,
+                # then compact vertical height to actual rendered Vietnamese text band so distant
+                # upper/lower boxes don't falsely collide and push text sideways onto character faces!
+                desired_w = max(
+                    bw,
+                    min(int(img_w * 0.30), max(210, int(bw * 1.35), int(math.sqrt(len(text) * 260)))),
+                )
+                # Estimate vertical span around cy_orig to check true horizontal neighbors only
+                est_h = min(bh, max(96, int(desired_w * 0.95)))
+                ey1 = int(round(cy_orig - est_h * 0.5))
+                ey2 = int(round(cy_orig + est_h * 0.5))
+
+                free_left = margin_x
+                free_right = img_w - margin_x
+                for o_idx, ob in active_boxes:
+                    if o_idx == idx:
+                        continue
+                    if ob[3] + gap <= ey1 or ey2 + gap <= ob[1]:
+                        continue
+                    ocx = (ob[0] + ob[2]) * 0.5
+                    if ob[2] <= x1 + 6 or ocx < cx_orig:
+                        free_left = max(free_left, ob[2] + gap)
+                    if ob[0] >= x2 - 6 or ocx >= cx_orig:
+                        free_right = min(free_right, ob[0] - gap)
+
                 avail_span = free_right - free_left
-                if avail_span >= max(bw, 110):
+                if avail_span >= max(bw, 120):
                     eff_w = min(desired_w, avail_span)
-                    nx1 = max(free_left, min(free_right - eff_w, int(round(cx - eff_w * 0.5))))
+                    nx1 = max(free_left, min(free_right - eff_w, int(round(cx_orig - eff_w * 0.5))))
                     nx2 = min(free_right, nx1 + eff_w)
                 else:
-                    # Neighbor sits immediately adjacent: stay clamped outside neighbor + margin
                     eff_w = min(desired_w, max(bw, int(img_w * 0.26)))
-                    nx1 = max(margin_x, min(img_w - margin_x - eff_w, int(round(cx - eff_w * 0.5))))
+                    nx1 = max(margin_x, min(img_w - margin_x - eff_w, int(round(cx_orig - eff_w * 0.5))))
                     nx2 = min(img_w - margin_x, nx1 + eff_w)
-                ny2 = max(y2, min(img_h - margin_y, y1 + max(bh, 48)))
-                copy.text_bbox = clamp_box((nx1, y1, nx2, ny2))
+
+                trial = copy.model_copy(update={"text_bbox": clamp_box((nx1, y1, nx2, y2))})
+                trial_lay = solve_layout(trial, canvas_size=(img_w, img_h))
+                if trial_lay.lines:
+                    used_h = int(
+                        math.ceil(
+                            trial_lay.font_size + (len(trial_lay.lines) - 1) * trial_lay.line_height + 28
+                        )
+                    )
+                    compact_h = min(bh, max(used_h, 64))
+                    ny1 = int(round(cy_orig - compact_h * 0.5))
+                    ny2 = ny1 + compact_h
+                else:
+                    ny1, ny2 = y1, max(y2, min(img_h - margin_y, y1 + max(bh, 48)))
+                copy.text_bbox = clamp_box((nx1, ny1, nx2, ny2))
             else:
                 copy.text_bbox = clamp_box((x1, y1, x2, y2))
         else:
@@ -849,14 +879,15 @@ def adapt_regions_for_readability(
         for c in adapted
         if c.kind == "bubble" and (c.translated_text or c.source_text or "").strip()
     ]
+    page_scale = max(1.0, min(1.65, min(img_w, img_h) / 850.0))
     ref_fs = (
         sorted(bubble_sizes)[len(bubble_sizes) // 2]
         if bubble_sizes
-        else max(15, min(22, int(round(min(img_w, img_h) * 0.020))))
+        else max(16, min(int(round(26 * page_scale)), int(round(min(img_w, img_h) * 0.024))))
     )
-    max_float_fs = max(20, min(28, int(round(ref_fs * 1.4))))
-    max_normal_bubble_fs = max(22, min(32, int(round(ref_fs * 1.45))))
-    max_shout_bubble_fs = max(26, min(36, int(round(ref_fs * 1.65))))
+    max_float_fs = max(22, min(int(round(32 * page_scale)), int(round(ref_fs * 1.4))))
+    max_normal_bubble_fs = max(22, min(int(round(34 * page_scale)), int(round(ref_fs * 1.45))))
+    max_shout_bubble_fs = max(26, min(int(round(38 * page_scale)), int(round(ref_fs * 1.65))))
 
     for copy in adapted:
         if copy.font_size is not None:

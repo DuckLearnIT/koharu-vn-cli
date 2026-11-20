@@ -27,6 +27,7 @@ class DetectedRegion:
     is_dark_bubble: bool
     confidence: float
     angle: float = 0.0
+    line_bboxes: list[tuple[int, int, int, int]] | None = None
 
 
 def _ensure_ctd_model() -> Path:
@@ -78,7 +79,7 @@ def _create_ort_session(
     *,
     use_gpu: bool = True,
     cpu_threads: int | None = None,
-    low_mem: bool = False,
+    low_mem: bool = True,
 ) -> ort.InferenceSession:
     """Create an ONNXRuntime session preferring GPU (CUDA/DirectML) with automatic CPU fallback."""
     opts = ort.SessionOptions()
@@ -86,6 +87,7 @@ def _create_ort_session(
     if low_mem:
         opts.enable_cpu_mem_arena = False
         opts.enable_mem_pattern = False
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     if cpu_threads is not None:
         opts.intra_op_num_threads = max(1, cpu_threads)
     providers = _ort_providers(use_gpu=use_gpu)
@@ -97,6 +99,7 @@ def _create_ort_session(
             cpu_opts.log_severity_level = 3
             cpu_opts.enable_cpu_mem_arena = False
             cpu_opts.enable_mem_pattern = False
+            cpu_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
             if cpu_threads is not None:
                 cpu_opts.intra_op_num_threads = max(1, cpu_threads)
             return ort.InferenceSession(str(model_path), sess_options=cpu_opts, providers=["CPUExecutionProvider"])
@@ -600,6 +603,13 @@ def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[Det
             new_bbox = kept.bubble_bbox or r_bbox
             new_contour = kept.bubble_contour or reg.bubble_contour
 
+        new_lines: list[tuple[int, int, int, int]] = []
+        for src in (kept, reg):
+            if src.line_bboxes:
+                new_lines.extend(src.line_bboxes)
+            else:
+                new_lines.append(src.text_bbox)
+
         merged[matched_idx] = DetectedRegion(
             text_bbox=new_tbox,
             bubble_bbox=new_bbox,
@@ -608,8 +618,86 @@ def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[Det
             is_dark_bubble=kept.is_dark_bubble,
             confidence=max(kept.confidence, reg.confidence),
             angle=kept.angle,
+            line_bboxes=new_lines,
         )
     return merged
+
+
+def _group_text_lines_into_blocks(
+    items: list[tuple[tuple[int, int, int, int], float, int]],
+) -> list[tuple[tuple[int, int, int, int], float, int, list[tuple[int, int, int, int]]]]:
+    """
+    Group adjacent vertical Japanese columns (or stacked horizontal lines) belonging to
+    the same floating dialogue paragraph into a single translation block while retaining
+    exact per-line bounding boxes for surgical inpainting.
+    """
+    if not items:
+        return []
+    n = len(items)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        ax1, ay1, ax2, ay2 = items[i][0]
+        aw, ah = max(1, ax2 - ax1), max(1, ay2 - ay1)
+        a_vert = ah >= aw * 1.35
+        a_horiz = aw >= ah * 1.35
+        for j in range(i + 1, n):
+            bx1, by1, bx2, by2 = items[j][0]
+            bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
+            b_vert = bh >= bw * 1.35
+            b_horiz = bw >= bh * 1.35
+
+            gap_x = max(0, max(ax1, bx1) - min(ax2, bx2))
+            gap_y = max(0, max(ay1, by1) - min(ay2, by2))
+            ov_x = max(0, min(ax2, bx2) - max(ax1, bx1))
+            ov_y = max(0, min(ay2, by2) - max(ay1, by1))
+
+            # Vertical manga/CG dialogue columns sitting side-by-side in the same paragraph
+            if a_vert and b_vert:
+                ref_w = (aw + bw) * 0.5
+                min_h = max(1, min(ah, bh))
+                top_diff = abs(ay1 - by1)
+                mid_diff = abs((ay1 + ay2) * 0.5 - (by1 + by2) * 0.5)
+                if (
+                    gap_x <= max(26.0, ref_w * 0.72)
+                    and (ov_y / min_h) >= 0.35
+                    and (top_diff <= max(72.0, ref_w * 1.55) or mid_diff <= max(85.0, min_h * 0.30))
+                ):
+                    union(i, j)
+                    continue
+
+            # Horizontal stacked dialogue lines in the same paragraph
+            if a_horiz and b_horiz:
+                ref_h = (ah + bh) * 0.5
+                min_w = max(1, min(aw, bw))
+                if gap_y <= max(22.0, ref_h * 0.75) and (ov_x / min_w) >= 0.35:
+                    union(i, j)
+                    continue
+
+    groups: dict[int, list[tuple[tuple[int, int, int, int], float, int]]] = {}
+    for i, item in enumerate(items):
+        groups.setdefault(find(i), []).append(item)
+
+    blocks: list[tuple[tuple[int, int, int, int], float, int, list[tuple[int, int, int, int]]]] = []
+    for members in groups.values():
+        line_boxes = [m[0] for m in members]
+        ubox = union_box(line_boxes)
+        best_sc = max(m[1] for m in members)
+        # Preserve bubble-text hint if any member had label=1
+        lbl = 1 if any(m[2] == 1 for m in members) else 2
+        blocks.append((ubox, best_sc, lbl, line_boxes))
+    return blocks
 
 
 def _to_prob_01(arr: np.ndarray) -> np.ndarray:
@@ -663,16 +751,34 @@ def _decode_ctd_blk(
     return _containment_nms(hits, iou_thresh=0.45, contain_thresh=0.65)
 
 
+YSG_REPO_ID = "YSGforMTL/YSGYoloDetector"
+YSG_YOLO11S_FILE = "YOLOv11合/S/model.onnx"
+YSG_YOLO11N_FILE = "YOLOv11合/N/110best.onnx"
+YSG_RFDETR_LARGE_FILE = "RFDETR_1.0/RFDETR_3000_55_Large_ONNX/inference_model.sim.onnx"
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
 class ComicDetector:
-    """Combined RT-DETRv2 bubble/text detector + full 3-head ComicTextDetector (`blk` + UNet `seg` + DBNet `det`)."""
+    """
+    Combined YSG YOLOv11-S 1024x1024 (accurate=True) or YSG YOLOv11-N (accurate=False)
+    + ComicTextDetector UNet/DBNet pixel text mask.
+    Lightweight (~36MB), 1024x1024 native resolution, safe on 8GB RAM laptops & 4GB GPUs.
+    """
 
     def __init__(self, accurate: bool = True, use_gpu: bool = True) -> None:
-        det_filename = "detector.onnx" if accurate else "detector_int8.onnx"
-        det_path = hf_hub_download("ogkalu/comic-text-and-bubble-detector", det_filename)
-        self._rtdetr = _create_ort_session(det_path, use_gpu=use_gpu)
+        self._accurate = accurate
+        self._ysg_yolo11s: ort.InferenceSession | None = None
+        self._ysg_rfdetr: ort.InferenceSession | None = None
+        self._rtdetr: ort.InferenceSession | None = None
+
+        yolo_file = YSG_YOLO11S_FILE if accurate else YSG_YOLO11N_FILE
+        y11_path = hf_hub_download(YSG_REPO_ID, yolo_file)
+        self._ysg_yolo11s = _create_ort_session(y11_path, use_gpu=use_gpu, low_mem=True)
+        self._rtdetr = self._ysg_yolo11s
 
         ctd_path = _ensure_ctd_model()
-        self._ctd = _create_ort_session(ctd_path, use_gpu=use_gpu)
+        self._ctd = _create_ort_session(ctd_path, use_gpu=use_gpu, low_mem=True)
 
     def _run_ctd_crop(
         self,
@@ -686,7 +792,8 @@ class ComicDetector:
         nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
         resized = cv2.resize(rgb_crop, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-        canvas = np.zeros((1024, 1024, 3), dtype=np.float32)
+        # Use standard 114/255 neutral gray padding instead of black so page borders never form false edges
+        canvas = np.full((1024, 1024, 3), 114.0 / 255.0, dtype=np.float32)
         canvas[:nh, :nw] = resized.astype(np.float32) / 255.0
         inp = np.transpose(canvas, (2, 0, 1))[None]
 
@@ -704,14 +811,15 @@ class ComicDetector:
     def detect_ctd(
         self,
         rgb: np.ndarray,
-        blk_conf_thresh: float = 0.28,
+        blk_conf_thresh: float = 0.34,
         enhanced_rgb: np.ndarray | None = None,
     ) -> tuple[np.ndarray, list[tuple[tuple[int, int, int, int], float, int]]]:
-        """Return fused uint8 (H, W) UNet+DBNet text mask and mask-verified CTD `blk` text boxes."""
+        """Return uint8 (H, W) CTD text mask and mask-verified CTD `blk` text boxes."""
         h, w = rgb.shape[:2]
         full_mask, raw_blks = self._run_ctd_crop(rgb, 0, 0, blk_conf_thresh=blk_conf_thresh)
-        if max(h, w) > 1280 or max(w, h) / max(1, min(w, h)) > 1.8:
-            for wx1, wy1, wx2, wy2 in _compute_tile_windows(w, h, max_side=1024, overlap=0.22):
+        # Only tile CTD on ultra-tall webtoons / extreme aspect ratios to avoid unnecessary RAM spikes
+        if max(w, h) / max(1, min(w, h)) > 2.2 and max(h, w) > 1600:
+            for wx1, wy1, wx2, wy2 in _compute_tile_windows(w, h, max_side=1280, overlap=0.20)[:6]:
                 if (wx1, wy1, wx2, wy2) == (0, 0, w, h):
                     continue
                 tile_mask, tile_blks = self._run_ctd_crop(
@@ -722,30 +830,13 @@ class ComicDetector:
                     (b, _tile_clip_score(s, b, (wx1, wy1, wx2, wy2), w, h), l) for b, s, l in tile_blks
                 )
 
-        # Contrast-boosted pass captures translucent/low-contrast kanji & white-outlined Korean/JP floating text
         if enhanced_rgb is not None:
             enh_mask, enh_blks = self._run_ctd_crop(
-                enhanced_rgb, 0, 0, blk_conf_thresh=max(0.22, blk_conf_thresh - 0.04)
+                enhanced_rgb, 0, 0, blk_conf_thresh=max(0.28, blk_conf_thresh - 0.04)
             )
             full_mask = np.maximum(full_mask, enh_mask)
             raw_blks.extend((b, s * 0.94, l) for b, s, l in enh_blks)
-            if max(h, w) > 1280 or max(w, h) / max(1, min(w, h)) > 1.8:
-                for wx1, wy1, wx2, wy2 in _compute_tile_windows(w, h, max_side=1024, overlap=0.22)[:6]:
-                    if (wx1, wy1, wx2, wy2) == (0, 0, w, h):
-                        continue
-                    t_mask, t_blks = self._run_ctd_crop(
-                        enhanced_rgb[wy1:wy2, wx1:wx2],
-                        wx1,
-                        wy1,
-                        blk_conf_thresh=max(0.22, blk_conf_thresh - 0.04),
-                    )
-                    full_mask[wy1:wy2, wx1:wx2] = np.maximum(full_mask[wy1:wy2, wx1:wx2], t_mask)
-                    raw_blks.extend(
-                        (b, _tile_clip_score(s * 0.94, b, (wx1, wy1, wx2, wy2), w, h), l)
-                        for b, s, l in t_blks
-                    )
 
-        # Keep CTD `blk` hits backed by CTD's own fused UNet+DBNet mask to suppress texture/hair noise
         verified_blks: list[tuple[tuple[int, int, int, int], float, int]] = []
         for b_box, b_score, b_lbl in _containment_nms(raw_blks, iou_thresh=0.45, contain_thresh=0.65):
             x1, y1, x2, y2 = b_box
@@ -753,51 +844,120 @@ class ComicDetector:
             if seg_crop.size == 0:
                 continue
             seg_ratio = float(np.count_nonzero(seg_crop > 65)) / float(seg_crop.size)
-            if seg_ratio >= 0.02:
+            if seg_ratio >= 0.025:
                 verified_blks.append((b_box, b_score, b_lbl))
         return full_mask, verified_blks
 
     def detect_text_mask(self, rgb: np.ndarray) -> np.ndarray:
-        """Return a uint8 (H, W) pixel probability mask [0..255] using multi-tile CTD (UNet + DBNet)."""
+        """Return a uint8 (H, W) pixel probability mask [0..255] using CTD."""
         return self.detect_ctd(rgb)[0]
 
-    def _run_rtdetr_tile(
+    def _run_ysg_yolo11s(
         self,
         rgb_tile: np.ndarray,
-        offset_x: int,
-        offset_y: int,
-        conf_thresh: float,
+        offset_x: int = 0,
+        offset_y: int = 0,
+        conf_thresh: float = 0.34,
         full_w: int | None = None,
         full_h: int | None = None,
     ) -> tuple[list[tuple[tuple[int, int, int, int], float, int]], list[tuple[tuple[int, int, int, int], float, int]]]:
+        """Run YSG YOLOv11-S (1024x1024) returning (bubbles, text_lines)."""
+        if self._ysg_yolo11s is None:
+            return [], []
         th, tw = rgb_tile.shape[:2]
         fw = full_w if full_w is not None else offset_x + tw
         fh = full_h if full_h is not None else offset_y + th
         tile_rect = (offset_x, offset_y, offset_x + tw, offset_y + th)
 
-        resized = cv2.resize(rgb_tile, (640, 640), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-        inp = np.transpose(resized, (2, 0, 1))[None]
-        labels, boxes, scores = self._rtdetr.run(
-            None,
-            {"images": inp, "orig_target_sizes": np.array([[tw, th]], dtype=np.int64)},
+        ishape = self._ysg_yolo11s.get_inputs()[0].shape
+        ih = int(ishape[2]) if isinstance(ishape[2], int) else 1024
+        iw = int(ishape[3]) if isinstance(ishape[3], int) else 1024
+        scale = min(iw / max(1.0, float(tw)), ih / max(1.0, float(th)))
+        nw, nh = max(1, int(round(tw * scale))), max(1, int(round(th * scale)))
+        pad_x, pad_y = (iw - nw) // 2, (ih - nh) // 2
+
+        canvas = np.full((ih, iw, 3), 114, dtype=np.uint8)
+        canvas[pad_y : pad_y + nh, pad_x : pad_x + nw] = cv2.resize(
+            rgb_tile, (nw, nh), interpolation=cv2.INTER_LINEAR
         )
+        inp = np.transpose(canvas.astype(np.float32) / 255.0, (2, 0, 1))[None]
+        arr = self._ysg_yolo11s.run(None, {self._ysg_yolo11s.get_inputs()[0].name: inp})[0][0]
+        if arr.shape[0] < arr.shape[1]:
+            arr = arr.T  # [N, 4+C]
+
+        cls_scores = arr[:, 4:]
+        scores = np.max(cls_scores, axis=1)
+        cids = np.argmax(cls_scores, axis=1)
+        keep = np.where(scores >= max(0.30, conf_thresh - 0.02))[0]
+
         bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
         texts: list[tuple[tuple[int, int, int, int], float, int]] = []
-        for lbl, box, sc in zip(labels[0], boxes[0], scores[0]):
-            score = float(sc)
-            label = int(lbl)
-            min_score = 0.18 if label in (1, 2) else conf_thresh
-            if score < min_score:
-                continue
-            x1, y1, x2, y2 = float(box[0]) + offset_x, float(box[1]) + offset_y, float(box[2]) + offset_x, float(box[3]) + offset_y
+        inv_scale = 1.0 / scale
+        for idx in keep:
+            cx, cy, bw, bh = (float(v) for v in arr[idx, :4])
+            sc = float(scores[idx])
+            cid = int(cids[idx])
+            x1 = (cx - bw * 0.5 - pad_x) * inv_scale + offset_x
+            y1 = (cy - bh * 0.5 - pad_y) * inv_scale + offset_y
+            x2 = (cx + bw * 0.5 - pad_x) * inv_scale + offset_x
+            y2 = (cy + bh * 0.5 - pad_y) * inv_scale + offset_y
             clamped = _clamp_box((x1, y1, x2, y2), offset_x + tw, offset_y + th)
-            if box_area(clamped) < 36:
+            if box_area(clamped) < 48:
                 continue
-            ranked_score = _tile_clip_score(score, clamped, tile_rect, fw, fh)
-            if label == 0:
-                bubbles.append((clamped, ranked_score, label))
-            elif label in (1, 2):
-                texts.append((clamped, ranked_score, label))
+            ranked = _tile_clip_score(sc, clamped, tile_rect, fw, fh)
+            if cid == 5:
+                bubbles.append((clamped, ranked, 0))
+            else:
+                texts.append((clamped, ranked, 2))
+        return bubbles, texts
+
+    def _run_ysg_rfdetr(
+        self,
+        rgb_tile: np.ndarray,
+        offset_x: int = 0,
+        offset_y: int = 0,
+        conf_thresh: float = 0.36,
+        full_w: int | None = None,
+        full_h: int | None = None,
+    ) -> tuple[list[tuple[tuple[int, int, int, int], float, int]], list[tuple[tuple[int, int, int, int], float, int]]]:
+        """Run YSG RF-DETR Large (704x704) returning (bubbles, text_lines)."""
+        if self._ysg_rfdetr is None:
+            return [], []
+        th, tw = rgb_tile.shape[:2]
+        fw = full_w if full_w is not None else offset_x + tw
+        fh = full_h if full_h is not None else offset_y + th
+        tile_rect = (offset_x, offset_y, offset_x + tw, offset_y + th)
+
+        ishape = self._ysg_rfdetr.get_inputs()[0].shape
+        ih = int(ishape[2]) if isinstance(ishape[2], int) else 704
+        iw = int(ishape[3]) if isinstance(ishape[3], int) else 704
+        rz = cv2.resize(rgb_tile, (iw, ih), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        rz = (rz - _IMAGENET_MEAN) / _IMAGENET_STD
+        inp = np.transpose(rz, (2, 0, 1))[None]
+        dets, logits = self._ysg_rfdetr.run(None, {self._ysg_rfdetr.get_inputs()[0].name: inp})
+        probs = _to_prob_01(logits[0])
+
+        bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
+        texts: list[tuple[tuple[int, int, int, int], float, int]] = []
+        for i in range(len(probs)):
+            cid = int(np.argmax(probs[i]))
+            sc = float(probs[i, cid])
+            min_sc = max(0.36, conf_thresh) if cid == 5 else max(0.34, conf_thresh)
+            if sc < min_sc:
+                continue
+            cx, cy, bw, bh = (float(v) for v in dets[0, i])
+            x1 = (cx - bw * 0.5) * tw + offset_x
+            y1 = (cy - bh * 0.5) * th + offset_y
+            x2 = (cx + bw * 0.5) * tw + offset_x
+            y2 = (cy + bh * 0.5) * th + offset_y
+            clamped = _clamp_box((x1, y1, x2, y2), offset_x + tw, offset_y + th)
+            if box_area(clamped) < 48:
+                continue
+            ranked = _tile_clip_score(sc, clamped, tile_rect, fw, fh)
+            if cid == 5:
+                bubbles.append((clamped, ranked, 0))
+            else:
+                texts.append((clamped, ranked, 2))
         return bubbles, texts
 
     def detect(
@@ -807,49 +967,56 @@ class ComicDetector:
     ) -> tuple[list[DetectedRegion], np.ndarray]:
         """Detect deduplicated text/bubble regions and pixel-level text mask."""
         h, w = rgb.shape[:2]
-        enhanced = _enhance_contrast(rgb)
-        text_mask, ctd_texts = self.detect_ctd(rgb, blk_conf_thresh=0.26, enhanced_rgb=enhanced)
+        text_mask, ctd_texts = self.detect_ctd(rgb, blk_conf_thresh=0.38, enhanced_rgb=None)
 
         raw_bubbles: list[tuple[tuple[int, int, int, int], float, int]] = []
-        raw_texts: list[tuple[tuple[int, int, int, int], float, int]] = list(ctd_texts)
+        raw_lines: list[tuple[tuple[int, int, int, int], float, int]] = []
 
-        for wx1, wy1, wx2, wy2 in _compute_tile_windows(w, h):
-            b_hits, t_hits = self._run_rtdetr_tile(
-                rgb[wy1:wy2, wx1:wx2], wx1, wy1, conf_thresh, full_w=w, full_h=h
-            )
-            raw_bubbles.extend(b_hits)
-            raw_texts.extend(t_hits)
+        # Primary pass: YSG RF-DETR Large (accurate=True) or YSG YOLOv11-S 1024x1024 (accurate=False)
+        # Only tile on ultra-tall webtoons (aspect > 2.2) to keep RAM usage compact and fast.
+        is_webtoon = (max(w, h) / max(1, min(w, h)) > 2.2) and (max(w, h) > 1600)
+        windows = _compute_tile_windows(w, h, max_side=1280, overlap=0.20) if is_webtoon else [(0, 0, w, h)]
+        for wx1, wy1, wx2, wy2 in windows:
+            tile = rgb[wy1:wy2, wx1:wx2]
+            if self._ysg_rfdetr is not None:
+                brf, trf = self._run_ysg_rfdetr(tile, wx1, wy1, conf_thresh=max(0.35, conf_thresh), full_w=w, full_h=h)
+                raw_bubbles.extend(brf)
+                raw_lines.extend(trf)
+            if self._ysg_yolo11s is not None:
+                b11, t11 = self._run_ysg_yolo11s(tile, wx1, wy1, conf_thresh=conf_thresh, full_w=w, full_h=h)
+                raw_bubbles.extend(b11)
+                raw_lines.extend(t11)
 
-        # Secondary contrast pass captures faint/translucent bubbles & colored SFX
-        cb_hits, ct_hits = self._run_rtdetr_tile(enhanced, 0, 0, conf_thresh, full_w=w, full_h=h)
-        raw_bubbles.extend((b, s * 0.94, l) for b, s, l in cb_hits)
-        raw_texts.extend((b, s * 0.94, l) for b, s, l in ct_hits)
-
+        # Deduplicate bubble containers and per-column/per-line boxes
         bubbles = _containment_nms(raw_bubbles, iou_thresh=0.45, contain_thresh=0.70)
-        raw_texts = _promote_complete_boxes(raw_texts, text_mask)
-        texts = _containment_nms(raw_texts, iou_thresh=0.40, contain_thresh=0.52)
+        lines = _containment_nms(raw_lines, iou_thresh=0.45, contain_thresh=0.68)
 
-        # Verify candidate text boxes against fused UNet+DBNet text_mask to drop texture/clothing false positives
-        verified_texts: list[tuple[tuple[int, int, int, int], float, int]] = []
-        for t_box, t_score, t_lbl in texts:
+        # Keep CTD fallback boxes ONLY where YSG detected nothing overlapping at all
+        for c_box, c_sc, c_lbl in ctd_texts:
+            if c_sc < 0.45:
+                continue
+            if any(iou(c_box, lb) >= 0.20 or containment_ratio(c_box, lb) >= 0.45 or containment_ratio(lb, c_box) >= 0.45 for lb, _, _ in lines):
+                continue
+            lines.append((c_box, c_sc * 0.90, c_lbl))
+
+        # Drop tiny noise boxes with zero support in CTD text_mask unless YSG confidence is very high
+        verified_lines: list[tuple[tuple[int, int, int, int], float, int]] = []
+        for t_box, t_score, t_lbl in lines:
             x1, y1, x2, y2 = t_box
             if (x2 - x1) < 10 or (y2 - y1) < 10:
                 continue
             seg_crop = text_mask[y1:y2, x1:x2]
-            seg_ratio = float(np.count_nonzero(seg_crop > 65)) / max(1, seg_crop.size)
-            if t_score < conf_thresh and seg_ratio < 0.025:
+            seg_ratio = float(np.count_nonzero(seg_crop > 55)) / max(1, seg_crop.size)
+            if t_score < 0.55 and seg_ratio < 0.015:
                 continue
-            if t_score < 0.55 and t_lbl == 2 and seg_ratio < 0.012:
-                continue
-            verified_texts.append((t_box, t_score, t_lbl))
-        texts = verified_texts
+            verified_lines.append((t_box, t_score, t_lbl))
+        lines = verified_lines
 
-        # Group text boxes belonging to the same speech bubble so multi-column
-        # Japanese/Chinese text in one bubble becomes ONE dialogue unit (fixes overlapping text!).
+        # Group text lines belonging to the same detected speech bubble
         bubble_groups: dict[int, list[tuple[tuple[int, int, int, int], float, int]]] = {}
-        standalone_texts: list[tuple[tuple[int, int, int, int], float, int]] = []
+        standalone_lines: list[tuple[tuple[int, int, int, int], float, int]] = []
 
-        for t_box, t_score, t_lbl in texts:
+        for t_box, t_score, t_lbl in lines:
             best_b_idx: int | None = None
             best_score = 0.0
             tcx = (t_box[0] + t_box[2]) * 0.5
@@ -857,8 +1024,8 @@ class ComicDetector:
             for idx, (b_box, _, _) in enumerate(bubbles):
                 c = containment_ratio(t_box, b_box)
                 center_inside = (
-                    (b_box[0] - 4) <= tcx <= (b_box[2] + 4)
-                    and (b_box[1] - 4) <= tcy <= (b_box[3] + 4)
+                    (b_box[0] - 6) <= tcx <= (b_box[2] + 6)
+                    and (b_box[1] - 6) <= tcy <= (b_box[3] + 6)
                 )
                 if (c >= 0.55 or (c >= 0.40 and center_inside)) and c > best_score:
                     best_score = c
@@ -866,15 +1033,16 @@ class ComicDetector:
             if best_b_idx is not None:
                 bubble_groups.setdefault(best_b_idx, []).append((t_box, t_score, t_lbl))
             else:
-                standalone_texts.append((t_box, t_score, t_lbl))
+                standalone_lines.append((t_box, t_score, t_lbl))
 
         regions: list[DetectedRegion] = []
 
         # 1. Bubble-contained text groups
         for b_idx, members in bubble_groups.items():
             b_box, b_score, _ = bubbles[b_idx]
-            merged_tbox = union_box([m[0] for m in members])
-            merged_tbox = _expand_box_with_seg_mask(merged_tbox, text_mask, bounds=b_box, max_expand=32)
+            member_lines = [m[0] for m in members]
+            merged_tbox = union_box(member_lines)
+            merged_tbox = _expand_box_with_seg_mask(merged_tbox, text_mask, bounds=b_box, max_expand=24)
             avg_conf = max(b_score, max(m[1] for m in members))
             refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, merged_tbox, b_box)
             regions.append(
@@ -885,14 +1053,15 @@ class ComicDetector:
                     is_bubble=True,
                     is_dark_bubble=is_dark,
                     confidence=avg_conf,
+                    line_bboxes=member_lines,
                 )
             )
 
-        # 2. Standalone texts (may still sit inside an undetected white/dark translucent bubble!)
-        for t_box, t_score, t_lbl in standalone_texts:
-            expanded_tbox = _expand_box_with_seg_mask(t_box, text_mask, bounds=None, max_expand=34)
+        # 2. Standalone text lines -> group adjacent vertical columns / horizontal lines into dialogue blocks
+        for block_box, block_score, block_lbl, block_lines in _group_text_lines_into_blocks(standalone_lines):
+            expanded_tbox = _expand_box_with_seg_mask(block_box, text_mask, bounds=None, max_expand=20)
             refined_box, contour, is_dark = _flood_fill_bubble_contour(rgb, text_mask, expanded_tbox, None)
-            is_bubble = refined_box is not None or t_lbl == 1
+            is_bubble = refined_box is not None or block_lbl == 1
             regions.append(
                 DetectedRegion(
                     text_bbox=expanded_tbox,
@@ -900,11 +1069,12 @@ class ComicDetector:
                     bubble_contour=contour,
                     is_bubble=is_bubble,
                     is_dark_bubble=is_dark,
-                    confidence=t_score,
+                    confidence=block_score,
+                    line_bboxes=block_lines,
                 )
             )
 
-        # 3. Fallback: recover strong UNet+DBNet glyph clusters missed by box detectors
+        # 3. Fallback: recover strong UNet+DBNet glyph clusters completely missed by box detectors
         regions.extend(_discover_unboxed_text_regions(rgb, text_mask, [r.text_bbox for r in regions]))
 
         # 4. Merge any duplicate regions belonging to the exact same speech bubble
