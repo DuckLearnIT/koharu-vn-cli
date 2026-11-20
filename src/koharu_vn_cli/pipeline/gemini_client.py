@@ -1616,6 +1616,7 @@ class VisionLLMClient:
         "- Đúng ngữ khí nhân vật & văn phong truyện: không nhồi khẩu ngữ hài hước/tấu hài ('ối giồi ôi') vào cảnh đe dọa, uy hiếp hoặc nhân vật lạnh lùng.\n"
         "- Không giải thích dài dòng, không thêm chú thích ngoài lời thoại.\n"
         "- Tiếng thở/rên thoại của nhân vật (khi là lời nói/suy nghĩ, không phải SFX nền) dịch tự nhiên đúng chất doujinshi (vd: 'Ư...', 'Ưm...', 'Á...', 'Hộc...', 'Hả?!').\n"
+        "- CHỐNG LẶP THOẠI / TRÙNG KHUNG: Nếu 2 khung [ID] bị detect chồng lên nhau hoặc tách đôi từ CÙNG 1 đoạn chữ gốc giống hệt nhau, CHỈ điền bản dịch đầy đủ vào 1 ID bao phủ tốt nhất, còn ID bị trùng lặp đặt `\"is_sfx\": true` và `\"vietnamese\": \"\"` — TUYỆT ĐỐI KHÔNG lặp lại nguyên văn cùng 1 câu thoại sang 2 khung sát nhau.\n"
         "Bắt buộc trả về đúng JSON hợp lệ."
     )
 

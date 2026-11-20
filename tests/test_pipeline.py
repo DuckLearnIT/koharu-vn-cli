@@ -3793,3 +3793,130 @@ def test_japanese_sfx_protection_and_uncensor_vietnamese_asterisks():
         translated_text="Khác nào cái b*p b* sống...",
     )
     assert region_needs_translation(censored_reg) is True
+
+
+def test_deduplicate_split_dialogue_and_detector_overlap_merge():
+    """Verify split frosted boxes / duplicate dialogue collapse to 1 item while preserving full erasure masks."""
+    from koharu_vn_cli.models import TextRegionItem
+    from koharu_vn_cli.pipeline.detector import (
+        DetectedRegion,
+        _group_text_lines_into_blocks,
+        _merge_overlapping_bubble_regions,
+    )
+    from koharu_vn_cli.pipeline.runner import deduplicate_duplicate_regions
+
+    # 1. Detector grouping merges a 2-column sub-box (aspect ~1.15) with an adjacent vertical column
+    col_2 = ((100, 100, 230, 250), 0.85, 2)  # 130x150 -> ah/aw = 1.15
+    col_1 = ((245, 105, 295, 260), 0.82, 2)  # 50x155, gap_x = 15 <= max(30, 50*0.85)
+    overlap_sub = ((180, 110, 260, 240), 0.78, 2)
+    blocks = _group_text_lines_into_blocks([col_2, col_1, overlap_sub])
+    assert len(blocks) == 1
+    assert blocks[0][0] == (100, 100, 295, 260)
+
+    # 2. _merge_overlapping_bubble_regions merges overlapping floating boxes while keeping separate bubbles apart
+    f1 = DetectedRegion((100, 100, 240, 380), None, None, False, False, 0.90, line_bboxes=[(105, 105, 165, 375), (175, 105, 235, 375)])
+    f2 = DetectedRegion((160, 110, 280, 370), None, None, False, False, 0.70, line_bboxes=[(165, 115, 275, 365)])
+    merged_floats = _merge_overlapping_bubble_regions([f1, f2])
+    assert len(merged_floats) == 1
+    assert merged_floats[0].text_bbox == (100, 100, 280, 380)
+    assert len(merged_floats[0].line_bboxes or []) == 3
+
+    # Separate conjoined speech bubbles must NOT be collapsed at detection time
+    b_left = DetectedRegion((15, 230, 130, 590), (0, 200, 155, 620), None, True, False, 0.92)
+    b_right = DetectedRegion((150, 80, 295, 360), (125, 30, 310, 410), None, True, False, 0.90)
+    kept_bubbles = _merge_overlapping_bubble_regions([b_left, b_right])
+    assert len(kept_bubbles) == 2
+
+    # 3. Reproduction of frosted narration split: identical long dialogue rendered side-by-side collapses to 1
+    dup_line = (
+        "Anh sẽ gặm nhấm em từ trong ra ngoài, biến em thành một con bé cả đời này không tài nào quên được anh... "
+        "cất công chờ đợi đến lúc cơ thể này trở nên ngon nghẻ thế này cơ mà."
+    )
+    det_list = [
+        DetectedRegion((310, 90, 450, 620), None, None, False, False, 0.90, line_bboxes=[(315, 95, 375, 615), (385, 95, 445, 615)]),
+        DetectedRegion((465, 95, 580, 615), None, None, False, False, 0.85, line_bboxes=[(470, 100, 520, 610), (530, 100, 575, 610)]),
+        DetectedRegion((40, 80, 120, 190), (30, 70, 130, 200), None, True, False, 0.95),
+        DetectedRegion((650, 80, 730, 190), (640, 70, 740, 200), None, True, False, 0.95),
+    ]
+    items = [
+        TextRegionItem(id=1, kind="floating", text_bbox=(310, 90, 450, 620), source_text="JP 1", translated_text=dup_line),
+        TextRegionItem(id=2, kind="floating", text_bbox=(465, 95, 580, 615), source_text="JP 2", translated_text=dup_line),
+        # Short repeated moans in distant bubbles must NEVER be falsely deduplicated
+        TextRegionItem(id=3, kind="bubble", text_bbox=(40, 80, 120, 190), bubble_bbox=(30, 70, 130, 200), translated_text="Ư..."),
+        TextRegionItem(id=4, kind="bubble", text_bbox=(650, 80, 730, 190), bubble_bbox=(640, 70, 740, 200), translated_text="Ư..."),
+    ]
+    dedup_items, dedup_det = deduplicate_duplicate_regions(items, det_list)
+    assert len(dedup_items) == 3
+    keeper_item = next(it for it in dedup_items if it.id == 1)
+    assert keeper_item.text_bbox == (310, 90, 580, 620)
+    assert dedup_det is not None
+    # Both left and right columns' line_bboxes are preserved on keeper DetectedRegion so ALL Japanese text is erased
+    assert dedup_det[keeper_item.id - 1].text_bbox == (310, 90, 580, 620)
+    assert len(dedup_det[keeper_item.id - 1].line_bboxes or []) == 4
+    assert len([it for it in dedup_items if it.translated_text == "Ư..."]) == 2
+
+
+def test_conjoined_bubbles_and_rendered_lines_never_collide():
+    """Reproduce conjoined double-lobe edge bubbles and assert rendered glyph+stroke lines keep >= 14px clearance."""
+    from koharu_vn_cli.models import TextRegionItem
+    from koharu_vn_cli.pipeline.typesetter import (
+        _rendered_line_rects,
+        adapt_regions_for_readability,
+        render_text_regions,
+    )
+
+    regions = [
+        # Edge-hugging left bubble overlapping at the neck with right bubble (like uploaded screenshot)
+        TextRegionItem(
+            id=1,
+            kind="bubble",
+            text_bbox=(8, 175, 132, 540),
+            bubble_bbox=(0, 145, 152, 575),
+            stroke_color=(255, 255, 255),
+            translated_text="Em không cần phải kìm nén nữa đâu... cứ tận hưởng đi.",
+        ),
+        TextRegionItem(
+            id=2,
+            kind="bubble",
+            text_bbox=(142, 45, 295, 360),
+            bubble_bbox=(122, 18, 310, 390),
+            stroke_color=(255, 255, 255),
+            translated_text="Bắt đầu thấy sướng rồi đúng không?",
+        ),
+        # Nearby floating text that also must maintain clearance
+        TextRegionItem(
+            id=3,
+            kind="floating",
+            text_bbox=(145, 355, 280, 470),
+            stroke_color=(0, 0, 0),
+            text_color=(255, 255, 255),
+            translated_text="Thả lỏng người ra nào em...",
+        ),
+    ]
+    img_w, img_h = 330, 620
+    adapted = adapt_regions_for_readability(regions, img_w=img_w, img_h=img_h)
+    line_sets = [_rendered_line_rects(r, img_w, img_h)[1] for r in adapted]
+    assert all(len(ls) >= 1 for ls in line_sets)
+
+    # No two lines from different regions may touch or crowd horizontally when sharing vertical band
+    min_req_gap = 12.0  # gap = max(12, ...) on small 330px crop; min_text_gap = max(14, ...)
+    for i in range(len(line_sets)):
+        for j in range(i + 1, len(line_sets)):
+            for la in line_sets[i]:
+                for lb in line_sets[j]:
+                    v_prox = (la[1] - 4.0 < lb[3]) and (lb[1] - 4.0 < la[3])
+                    if v_prox:
+                        h_gap = max(lb[0] - la[2], la[0] - lb[2])
+                        assert h_gap >= min_req_gap, (
+                            f"Regions {i + 1} and {j + 1} lines crowded/collided: {la} vs {lb} (gap={h_gap:.1f}px)"
+                        )
+                    h_ov = min(la[2], lb[2]) - max(la[0], lb[0])
+                    if h_ov > 4.0:
+                        v_gap = max(lb[1] - la[3], la[1] - lb[3])
+                        assert v_gap >= 10.0, (
+                            f"Regions {i + 1} and {j + 1} lines crowded vertically: {la} vs {lb} (v_gap={v_gap:.1f}px)"
+                        )
+
+    canvas = Image.new("RGBA", (img_w, img_h), (255, 255, 255, 255))
+    rendered = render_text_regions(canvas, adapted)
+    assert rendered.size == (img_w, img_h)

@@ -576,7 +576,7 @@ def _discover_unboxed_text_regions(
 
 def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[DetectedRegion]:
     """
-    Merge duplicate detections that share the same physical speech bubble
+    Merge duplicate detections that share the same physical speech bubble or overlapping text block
     (e.g., an edge column missed by initial grouping then flood-filled into the same balloon).
     """
     if len(regions) < 2:
@@ -595,16 +595,20 @@ def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[Det
         r_bbox = reg.bubble_bbox
         matched_idx: int | None = None
         for idx, kept in enumerate(merged):
-            if not kept.is_bubble or kept.bubble_bbox is None:
-                continue
-            k_bbox = kept.bubble_bbox
-            if r_bbox is not None and iou(r_bbox, k_bbox) >= 0.70:
-                matched_idx = idx
-                break
-            if containment_ratio(reg.text_bbox, k_bbox) >= 0.65:
-                matched_idx = idx
-                break
-            if r_bbox is not None and containment_ratio(kept.text_bbox, r_bbox) >= 0.65:
+            if kept.is_bubble and kept.bubble_bbox is not None:
+                k_bbox = kept.bubble_bbox
+                if r_bbox is not None and iou(r_bbox, k_bbox) >= 0.70:
+                    matched_idx = idx
+                    break
+                if containment_ratio(reg.text_bbox, k_bbox) >= 0.65:
+                    matched_idx = idx
+                    break
+                if r_bbox is not None and containment_ratio(kept.text_bbox, r_bbox) >= 0.65:
+                    matched_idx = idx
+                    break
+            min_t_area = min(box_area(reg.text_bbox), box_area(kept.text_bbox))
+            t_inter = intersection_area(reg.text_bbox, kept.text_bbox)
+            if (min_t_area > 0 and (t_inter / min_t_area) >= 0.45) or iou(reg.text_bbox, kept.text_bbox) >= 0.35:
                 matched_idx = idx
                 break
 
@@ -613,17 +617,25 @@ def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[Det
             continue
 
         kept = merged[matched_idx]
+        is_bub = kept.is_bubble or reg.is_bubble
         new_tbox = union_box([kept.text_bbox, reg.text_bbox])
-        if kept.bubble_bbox is not None and r_bbox is not None:
-            if box_area(r_bbox) > box_area(kept.bubble_bbox):
-                new_bbox = r_bbox
-                new_contour = reg.bubble_contour or kept.bubble_contour
+        if is_bub:
+            if kept.bubble_bbox is not None and r_bbox is not None:
+                if box_area(r_bbox) > box_area(kept.bubble_bbox):
+                    new_bbox = r_bbox
+                    new_contour = reg.bubble_contour or kept.bubble_contour
+                else:
+                    new_bbox = kept.bubble_bbox
+                    new_contour = kept.bubble_contour or reg.bubble_contour
             else:
-                new_bbox = kept.bubble_bbox
+                new_bbox = kept.bubble_bbox or r_bbox
                 new_contour = kept.bubble_contour or reg.bubble_contour
+            if new_bbox is not None and containment_ratio(new_tbox, new_bbox) < 0.90:
+                new_bbox = union_box([new_bbox, new_tbox])
+                new_contour = None
         else:
-            new_bbox = kept.bubble_bbox or r_bbox
-            new_contour = kept.bubble_contour or reg.bubble_contour
+            new_bbox = None
+            new_contour = None
 
         new_lines: list[tuple[int, int, int, int]] = []
         for src in (kept, reg):
@@ -636,8 +648,8 @@ def _merge_overlapping_bubble_regions(regions: list[DetectedRegion]) -> list[Det
             text_bbox=new_tbox,
             bubble_bbox=new_bbox,
             bubble_contour=new_contour,
-            is_bubble=True,
-            is_dark_bubble=kept.is_dark_bubble,
+            is_bubble=is_bub,
+            is_dark_bubble=kept.is_dark_bubble or reg.is_dark_bubble,
             confidence=max(kept.confidence, reg.confidence),
             angle=kept.angle,
             line_bboxes=new_lines,
@@ -672,12 +684,14 @@ def _group_text_lines_into_blocks(
     for i in range(n):
         ax1, ay1, ax2, ay2 = items[i][0]
         aw, ah = max(1, ax2 - ax1), max(1, ay2 - ay1)
-        a_vert = ah >= aw * 1.35
+        a_vert = ah >= aw * 1.25
+        a_tallish = ah >= aw * 0.85
         a_horiz = aw >= ah * 1.35
         for j in range(i + 1, n):
             bx1, by1, bx2, by2 = items[j][0]
             bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
-            b_vert = bh >= bw * 1.35
+            b_vert = bh >= bw * 1.25
+            b_tallish = bh >= bw * 0.85
             b_horiz = bw >= bh * 1.35
 
             gap_x = max(0, max(ax1, bx1) - min(ax2, bx2))
@@ -685,16 +699,22 @@ def _group_text_lines_into_blocks(
             ov_x = max(0, min(ax2, bx2) - max(ax1, bx1))
             ov_y = max(0, min(ay2, by2) - max(ay1, by1))
 
+            inter = ov_x * ov_y
+            min_area = min(aw * ah, bw * bh)
+            if min_area > 0 and ((inter / min_area) >= 0.25 or iou(items[i][0], items[j][0]) >= 0.20):
+                union(i, j)
+                continue
+
             # Vertical manga/CG dialogue columns sitting side-by-side in the same paragraph
-            if a_vert and b_vert:
-                ref_w = (aw + bw) * 0.5
+            if (a_vert and b_tallish) or (b_vert and a_tallish):
+                ref_w = float(min(aw, bw))
                 min_h = max(1, min(ah, bh))
                 top_diff = abs(ay1 - by1)
                 mid_diff = abs((ay1 + ay2) * 0.5 - (by1 + by2) * 0.5)
                 if (
-                    gap_x <= max(26.0, ref_w * 0.72)
+                    gap_x <= max(30.0, ref_w * 0.85)
                     and (ov_y / min_h) >= 0.35
-                    and (top_diff <= max(72.0, ref_w * 1.55) or mid_diff <= max(85.0, min_h * 0.30))
+                    and (top_diff <= max(85.0, ref_w * 1.75) or mid_diff <= max(95.0, min_h * 0.32))
                 ):
                     union(i, j)
                     continue
@@ -1068,9 +1088,14 @@ class ComicDetector:
             if self._bubble_det is not None:
                 bb, bt = self._run_bubble_det(tile, wx1, wy1, conf_thresh=conf_thresh, full_w=w, full_h=h)
                 raw_bubbles.extend(bb)
-                # Keep ogkalu text_bubble hits only when YSG didn't cover that region
+                # Keep ogkalu text_bubble hits only when YSG didn't cover that region (symmetric check)
                 for b_tbox, b_tsc, b_tlbl in bt:
-                    if not any(containment_ratio(b_tbox, lb) >= 0.45 or iou(b_tbox, lb) >= 0.25 for lb, _, _ in raw_lines):
+                    if not any(
+                        containment_ratio(b_tbox, lb) >= 0.45
+                        or containment_ratio(lb, b_tbox) >= 0.45
+                        or iou(b_tbox, lb) >= 0.25
+                        for lb, _, _ in raw_lines
+                    ):
                         raw_lines.append((b_tbox, b_tsc * 0.92, b_tlbl))
 
         # Deduplicate bubble containers and per-column/per-line boxes

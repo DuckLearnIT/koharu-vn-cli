@@ -182,7 +182,7 @@ def _is_rectangular_contour(
 def _ellipse_chord_at_y(
     box: tuple[int, int, int, int], y: float
 ) -> tuple[float, float] | None:
-    """Superellipse (p=2.6) chord width matching real manga/CG oval speech balloons."""
+    """Superellipse (p=2.45) chord width matching real manga/CG oval speech balloons."""
     x1, y1, x2, y2 = box
     cx = (x1 + x2) * 0.5
     cy = (y1 + y2) * 0.5
@@ -191,7 +191,7 @@ def _ellipse_chord_at_y(
     norm_y = abs(y - cy) / ry
     if norm_y >= 0.985:
         return None
-    p = 2.6
+    p = 2.45
     half_w = rx * (max(0.0, 1.0 - norm_y ** p) ** (1.0 / p))
     return (cx - half_w, cx + half_w)
 
@@ -607,7 +607,7 @@ def solve_layout(
         return best_overall
 
     # Base comfortable margins (Tier 1)
-    base_pad_x = max(3.0, min(10.0, box_w * 0.062)) if is_bubble else max(4.0, box_w * 0.04)
+    base_pad_x = max(4.5, min(11.0, box_w * 0.068)) if is_bubble else max(4.0, box_w * 0.04)
     base_pad_y = max(5.0, min(13.0, box_h * 0.080)) if is_bubble else max(3.0, box_h * 0.035)
     base_line_ratio = (1.17 if is_dense else 1.22) if is_bubble else 1.16
 
@@ -615,18 +615,17 @@ def solve_layout(
 
     # Comfort floor: if dense or narrow bubble got squeezed below comfortable size, try compact Tier 2
     comfort_fs = 15 if (is_dense and min(box_w, box_h) >= 100) else (14 if is_bubble else 13)
-    need_tier2 = (
+    need_tier2 = tier1 is None or (
         region.font_size is None
         and (
-            tier1 is None
-            or tier1[0].font_size < comfort_fs
+            tier1[0].font_size < comfort_fs
             or (is_narrow_tall and word_count >= 5 and len(tier1[0].lines) >= 5)
         )
     )
 
     best_pick = tier1
     if need_tier2:
-        t2_pad_x = max(2.5, min(6.5, box_w * 0.040)) if is_bubble else max(3.0, box_w * 0.03)
+        t2_pad_x = max(3.5, min(7.5, box_w * 0.048)) if is_bubble else max(3.0, box_w * 0.03)
         t2_pad_y = max(3.5, min(8.5, box_h * 0.052)) if is_bubble else max(2.5, box_h * 0.025)
         t2_lr = 1.13 if is_bubble else 1.12
         t2_sx = 0.92 if (is_dense or is_narrow_tall) else 0.95
@@ -645,8 +644,8 @@ def solve_layout(
                     best_pick = tier2
 
     # Tier 3 rescue for ultra-dense bubbles that still overflow or drop below 11px
-    if region.font_size is None and (best_pick is None or (is_very_dense and best_pick[0].font_size <= 11)):
-        t3_pad_x = 2.0 if is_bubble else 2.5
+    if best_pick is None or (region.font_size is None and is_very_dense and best_pick[0].font_size <= 11):
+        t3_pad_x = 2.5 if is_bubble else 2.5
         t3_pad_y = 3.0 if is_bubble else 2.0
         tier3 = _solve_tier(t3_pad_x, t3_pad_y, 1.09, 0.88, max_fs, hard_min_fs)
         if tier3 is not None and (best_pick is None or tier3[0].font_size > best_pick[0].font_size):
@@ -693,6 +692,245 @@ def _rect_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int], ga
     )
 
 
+def _rendered_line_rects(
+    reg: TextRegionItem,
+    img_w: int,
+    img_h: int,
+) -> tuple[SolvedLayout, list[tuple[float, float, float, float]]]:
+    """Compute exact rendered glyph+stroke bounding rects matching `render_text_regions`."""
+    layout = solve_layout(reg, canvas_size=(img_w, img_h))
+    if not layout.lines:
+        return layout, []
+    stroke_px = float(reg.stroke_width or 0.0)
+    if stroke_px <= 0.0 and reg.stroke_color is not None:
+        stroke_px = min(2.8, max(1.3, round(layout.font_size * 0.085, 1)))
+    edge_safe = max(6.0, img_w * 0.008) + stroke_px + 2.0
+    rects: list[tuple[float, float, float, float]] = []
+    for lp in layout.lines:
+        half_w = lp.width * 0.5
+        safe_cx = min(
+            max(lp.center_x, edge_safe + half_w),
+            max(edge_safe + half_w, img_w - edge_safe - half_w),
+        )
+        rects.append(
+            (
+                safe_cx - half_w - stroke_px,
+                lp.top_y - stroke_px,
+                safe_cx + half_w + stroke_px,
+                lp.top_y + layout.font_size * 1.15 + stroke_px,
+            )
+        )
+    return layout, rects
+
+
+def _enforce_rendered_text_clearance(
+    adapted: list[TextRegionItem],
+    img_w: int,
+    img_h: int,
+    *,
+    orig_anchors: dict[int, tuple[float, float, int, int]],
+    user_fixed_fs: set[int],
+    min_gap_x: int,
+    min_gap_y: int,
+) -> None:
+    """
+    Iteratively eliminate ANY remaining glyph+stroke proximity violations between
+    distinct regions (even when bubbles sit near page borders or touch at a neck).
+    """
+    active_indices = [
+        i
+        for i, c in enumerate(adapted)
+        if not (c.is_sfx and not (c.translated_text or "").strip())
+        and (c.translated_text or c.source_text or "").strip()
+    ]
+    if len(active_indices) < 2:
+        return
+
+    step3_caps: dict[int, float] = {
+        i: float(adapted[i].font_size)
+        for i in active_indices
+        if adapted[i].font_size is not None and i not in user_fixed_fs
+    }
+    cache: dict[int, tuple[SolvedLayout, list[tuple[float, float, float, float]]]] = {
+        i: _rendered_line_rects(adapted[i], img_w, img_h) for i in active_indices
+    }
+
+    def _refresh(idx: int) -> None:
+        cache[idx] = _rendered_line_rects(adapted[idx], img_w, img_h)
+
+    def _trim_box_edge(idx: int, edge: str, amount: int) -> int:
+        c = adapted[idx]
+        cur = c.bubble_bbox or c.text_bbox
+        x1, y1, x2, y2 = cur
+        w, h = x2 - x1, y2 - y1
+        if edge in ("left", "right"):
+            avail = max(0, w - 48)
+            shift = min(avail, max(0, amount))
+            if shift < 2:
+                return 0
+            nx1 = x1 + shift if edge == "left" else x1
+            nx2 = x2 - shift if edge == "right" else x2
+            ny1, ny2 = y1, y2
+        else:
+            avail = max(0, h - 32)
+            shift = min(avail, max(0, amount))
+            if shift < 2:
+                return 0
+            nx1, nx2 = x1, x2
+            ny1 = y1 + shift if edge == "top" else y1
+            ny2 = y2 - shift if edge == "bottom" else y2
+
+        if c.kind == "floating":
+            ocx, ocy, obw, obh = orig_anchors[idx]
+            max_dx = max(42.0, obw * 0.45)
+            max_dy = max(48.0, obh * 0.40)
+            ncx, ncy = (nx1 + nx2) * 0.5, (ny1 + ny2) * 0.5
+            if abs(ncx - ocx) > max_dx or abs(ncy - ocy) > max_dy:
+                return 0
+
+        new_box = (nx1, ny1, nx2, ny2)
+        if c.bubble_bbox is not None:
+            c.bubble_bbox = new_box
+            c.bubble_contour = None
+        if c.kind == "floating":
+            c.text_bbox = new_box
+        else:
+            tx1, ty1, tx2, ty2 = c.text_bbox
+            c.text_bbox = (
+                max(nx1, min(tx1, max(nx1, nx2 - 32))),
+                max(ny1, min(ty1, max(ny1, ny2 - 24))),
+                min(nx2, max(tx2, min(nx2, nx1 + 32))),
+                min(ny2, max(ty2, min(ny2, ny1 + 24))),
+            )
+
+        if idx not in user_fixed_fs and idx in step3_caps:
+            c.font_size = None
+            nat = solve_layout(c, canvas_size=(img_w, img_h))
+            if nat.font_size > step3_caps[idx]:
+                c.font_size = step3_caps[idx]
+        _refresh(idx)
+        return shift
+
+    def _shrink_font(idx: int) -> bool:
+        if idx in user_fixed_fs:
+            return False
+        cur_fs = float(cache[idx][0].font_size)
+        if cur_fs <= 9.0:
+            return False
+        new_fs = max(9.0, float(int(round(cur_fs)) - 1))
+        if new_fs >= cur_fs:
+            return False
+        adapted[idx].font_size = new_fs
+        step3_caps[idx] = new_fs
+        _refresh(idx)
+        return True
+
+    v_band = max(4.0, min_gap_y * 0.5)
+    h_band = 4.0
+
+    for it in range(14):
+        any_changed = False
+        for pos_a in range(len(active_indices)):
+            ia = active_indices[pos_a]
+            rects_a = cache[ia][1]
+            if not rects_a:
+                continue
+            for pos_b in range(pos_a + 1, len(active_indices)):
+                ib = active_indices[pos_b]
+                rects_b = cache[ib][1]
+                if not rects_b:
+                    continue
+
+                worst_deficit = 0.0
+                worst_pair: tuple[tuple[float, float, float, float], tuple[float, float, float, float], bool, float, float] | None = None
+                for la in rects_a:
+                    for lb in rects_b:
+                        v_prox = (la[1] - v_band < lb[3]) and (lb[1] - v_band < la[3])
+                        h_gap_val = max(lb[0] - la[2], la[0] - lb[2])
+                        h_overlap = min(la[2], lb[2]) - max(la[0], lb[0])
+                        v_gap_val = max(lb[1] - la[3], la[1] - lb[3])
+                        violates_h = v_prox and (h_gap_val < min_gap_x)
+                        violates_v = (h_overlap > h_band) and (v_gap_val < min_gap_y)
+                        if not (violates_h or violates_v):
+                            continue
+                        deficit = max(
+                            (min_gap_x - h_gap_val) if violates_h else 0.0,
+                            (min_gap_y - v_gap_val) if violates_v else 0.0,
+                        )
+                        if deficit > worst_deficit:
+                            worst_deficit = deficit
+                            worst_pair = (la, lb, v_prox, h_gap_val, v_gap_val)
+
+                if worst_pair is None:
+                    continue
+
+                la, lb, v_prox, h_gap_val, v_gap_val = worst_pair
+                ov_y_line = min(la[3], lb[3]) - max(la[1], lb[1])
+                min_lh = max(1.0, min(la[3] - la[1], lb[3] - lb[1]))
+                fix_horiz = (ov_y_line >= min_lh * 0.35) or (v_prox and h_gap_val > v_gap_val)
+
+                ba = adapted[ia].bubble_bbox or adapted[ia].text_bbox
+                bb = adapted[ib].bubble_bbox or adapted[ib].text_bbox
+
+                trimmed = False
+                if it < 4:
+                    if fix_horiz:
+                        if ((ba[0] + ba[2]) * 0.5, ba[0]) <= ((bb[0] + bb[2]) * 0.5, bb[0]):
+                            left_idx, right_idx = ia, ib
+                        else:
+                            left_idx, right_idx = ib, ia
+                        half_need = max(2, int(math.ceil(worst_deficit * 0.55)))
+                        s1 = _trim_box_edge(left_idx, "right", half_need)
+                        s2 = _trim_box_edge(right_idx, "left", half_need)
+                        trimmed = (s1 + s2) >= 2
+                    else:
+                        if ((ba[1] + ba[3]) * 0.5, ba[1]) <= ((bb[1] + bb[3]) * 0.5, bb[1]):
+                            top_idx, bot_idx = ia, ib
+                        else:
+                            top_idx, bot_idx = ib, ia
+                        half_need = max(2, int(math.ceil(worst_deficit * 0.55)))
+                        s1 = _trim_box_edge(top_idx, "bottom", half_need)
+                        s2 = _trim_box_edge(bot_idx, "top", half_need)
+                        trimmed = (s1 + s2) >= 2
+
+                # Check if trimming actually resolved or shrank the violation; otherwise drop font_size
+                still_bad = False
+                if not trimmed:
+                    still_bad = True
+                else:
+                    new_max_def = 0.0
+                    for na in cache[ia][1]:
+                        for nb in cache[ib][1]:
+                            vp = (na[1] - v_band < nb[3]) and (nb[1] - v_band < na[3])
+                            hg = max(nb[0] - na[2], na[0] - nb[2])
+                            ho = min(na[2], nb[2]) - max(na[0], nb[0])
+                            vg = max(nb[1] - na[3], na[1] - nb[3])
+                            if (vp and hg < min_gap_x) or (ho > h_band and vg < min_gap_y):
+                                d = max((min_gap_x - hg) if vp else 0.0, (min_gap_y - vg) if ho > h_band else 0.0)
+                                new_max_def = max(new_max_def, d)
+                    if new_max_def >= worst_deficit - 0.5:
+                        still_bad = True
+                    else:
+                        any_changed = True
+
+                if still_bad:
+                    fs_a = cache[ia][0].font_size
+                    fs_b = cache[ib][0].font_size
+                    if fs_a > fs_b:
+                        shrunk = _shrink_font(ia) or _shrink_font(ib)
+                    elif fs_b > fs_a:
+                        shrunk = _shrink_font(ib) or _shrink_font(ia)
+                    else:
+                        s_a = _shrink_font(ia)
+                        s_b = _shrink_font(ib)
+                        shrunk = s_a or s_b
+                    if shrunk or trimmed:
+                        any_changed = True
+
+        if not any_changed:
+            break
+
+
 def adapt_regions_for_readability(
     regions: Sequence[TextRegionItem],
     img_w: int,
@@ -701,12 +939,15 @@ def adapt_regions_for_readability(
     """
     Prevent translated Vietnamese text from being crushed OR overlapping adjacent regions:
     1. Widens tall-narrow floating regions only into conflict-free horizontal space.
-    2. Separates any remaining floating/floating or floating/bubble overlaps cleanly inside safe margins.
-    3. Harmonizes outlier floating font sizes alongside speech bubbles on the same page.
+    2. Partitions conjoined overlapping speech bubbles cleanly along their shared boundary.
+    3. Separates any remaining floating/floating or floating/bubble overlaps cleanly inside safe margins.
+    4. Harmonizes outlier floating font sizes alongside speech bubbles on the same page.
+    5. Enforces exact rendered glyph+stroke clearance so text blocks never touch or crowd.
     """
     margin_x = max(10, int(round(img_w * 0.015)))
     margin_y = max(10, int(round(img_h * 0.015)))
-    gap = 8
+    gap = max(12, min(20, int(round(min(img_w, img_h) * 0.014))))
+    min_text_gap = max(14, min(24, int(round(min(img_w, img_h) * 0.016))))
     min_readable = max(13, min(16, int(round(min(img_w, img_h) * 0.015))))
 
     def clamp_box(b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
@@ -717,17 +958,20 @@ def adapt_regions_for_readability(
         return (x1, y1, x1 + bw, y1 + bh)
 
     adapted = [reg.model_copy() for reg in regions]
+    orig_text_boxes = {i: regions[i].text_bbox for i in range(len(adapted))}
+    user_fixed_fs = {i for i, r in enumerate(regions) if r.font_size is not None}
+
     # Sanitize text before sizing/rendering so CJK brackets never skew measurements or render tofu
     for copy in adapted:
         if copy.translated_text:
             copy.translated_text = sanitize_render_text(copy.translated_text)
 
-    active_boxes = [
-        (idx, (copy.bubble_bbox or copy.text_bbox))
+    active_boxes: dict[int, tuple[int, int, int, int]] = {
+        idx: (copy.bubble_bbox or copy.text_bbox)
         for idx, copy in enumerate(adapted)
         if not (copy.is_sfx and not (copy.translated_text or "").strip())
         and (copy.translated_text or copy.source_text or "").strip()
-    ]
+    }
 
     # Step 1: Neighbor-aware floating widening & tight-bubble expansion
     for idx, copy in enumerate(adapted):
@@ -758,7 +1002,7 @@ def adapt_regions_for_readability(
 
                 free_left = margin_x
                 free_right = img_w - margin_x
-                for o_idx, ob in active_boxes:
+                for o_idx, ob in active_boxes.items():
                     if o_idx == idx:
                         continue
                     if ob[3] + gap <= ey1 or ey2 + gap <= ob[1]:
@@ -805,41 +1049,167 @@ def adapt_regions_for_readability(
                 copy.text_bbox = clamp_box((nx1, ny1, nx2, ny2))
             else:
                 copy.text_bbox = clamp_box((x1, y1, x2, y2))
+            active_boxes[idx] = copy.text_bbox
         else:
             layout = solve_layout(copy, canvas_size=(img_w, img_h))
             if layout.font_size < min_readable or layout.overflowed:
                 bx1, by1, bx2, by2 = copy.bubble_bbox or copy.text_bbox
                 bw, bh = bx2 - bx1, by2 - by1
-                # Compute neighbor-free horizontal span so tight bubbles never collide with neighbors
+                # Compute neighbor-free horizontal & vertical spans so tight bubbles never encroach on neighbors
                 free_left = margin_x
                 free_right = img_w - margin_x
-                for o_idx, ob in active_boxes:
+                free_top = margin_y
+                free_bot = img_h - margin_y
+                cx_cur = (bx1 + bx2) * 0.5
+                cy_cur = (by1 + by2) * 0.5
+                for o_idx, ob in active_boxes.items():
                     if o_idx == idx:
                         continue
-                    if ob[3] + gap <= by1 or by2 + gap <= ob[1]:
-                        continue
                     ocx = (ob[0] + ob[2]) * 0.5
-                    cx_cur = (bx1 + bx2) * 0.5
-                    if ob[2] <= bx1 + 6 or ocx < cx_cur:
-                        free_left = max(free_left, ob[2] + gap)
-                    if ob[0] >= bx2 - 6 or ocx >= cx_cur:
-                        free_right = min(free_right, ob[0] - gap)
+                    ocy = (ob[1] + ob[3]) * 0.5
+                    if not (ob[3] + gap <= by1 or by2 + gap <= ob[1]):
+                        if ob[2] <= bx1 + 6 or ocx < cx_cur:
+                            free_left = max(free_left, ob[2] + gap)
+                        if ob[0] >= bx2 - 6 or ocx >= cx_cur:
+                            free_right = min(free_right, ob[0] - gap)
+                    if not (ob[2] + gap <= bx1 or bx2 + gap <= ob[0]):
+                        if ob[3] <= by1 + 6 or ocy < cy_cur:
+                            free_top = max(free_top, ob[3] + gap)
+                        if ob[1] >= by2 - 6 or ocy >= cy_cur:
+                            free_bot = min(free_bot, ob[1] - gap)
 
                 desired_w = max(bw, min(int(img_w * 0.28), max(125, int(bw * 1.38))))
-                avail_w = max(bw, free_right - free_left)
-                target_w = min(desired_w, avail_w)
-                target_h = max(bh, min(int(img_h * 0.24), int(bh * 1.15)))
-                cx, cy = (bx1 + bx2) * 0.5, (by1 + by2) * 0.5
-                nx1 = max(free_left, min(max(free_left, free_right - target_w), int(round(cx - target_w * 0.5))))
-                ny1 = max(margin_y, min(img_h - target_h - margin_y, int(round(cy - target_h * 0.5))))
-                new_box = clamp_box((nx1, ny1, nx1 + target_w, ny1 + target_h))
-                grew_significantly = (new_box[2] - new_box[0]) > bw * 1.08 or (new_box[3] - new_box[1]) > bh * 1.08
-                copy.text_bbox = new_box
-                if copy.bubble_bbox is not None and grew_significantly:
-                    copy.bubble_bbox = new_box
-                    copy.bubble_contour = None
+                avail_span_w = free_right - free_left
+                if avail_span_w > bw:
+                    target_w = min(desired_w, avail_span_w)
+                    nx1 = max(free_left, min(free_right - target_w, int(round(cx_cur - target_w * 0.5))))
+                    nx2 = min(free_right, nx1 + target_w)
+                else:
+                    nx1, nx2 = bx1, bx2
 
-    # Step 2: Iterative overlap resolution moving ONLY floating boxes (anchors keep real speech balloons fixed),
+                desired_h = max(bh, min(int(img_h * 0.24), int(bh * 1.15)))
+                avail_span_h = free_bot - free_top
+                if avail_span_h > bh:
+                    target_h = min(desired_h, avail_span_h)
+                    ny1 = max(free_top, min(free_bot - target_h, int(round(cy_cur - target_h * 0.5))))
+                    ny2 = min(free_bot, ny1 + target_h)
+                else:
+                    ny1, ny2 = by1, by2
+
+                new_box = clamp_box((nx1, ny1, nx2, ny2))
+                # Only apply if it keeps or expands dimensions without creating a new overlap
+                grew_significantly = (new_box[2] - new_box[0]) > bw * 1.08 or (new_box[3] - new_box[1]) > bh * 1.08
+                if (new_box[2] - new_box[0]) >= bw or (new_box[3] - new_box[1]) >= bh:
+                    copy.text_bbox = new_box
+                    if copy.bubble_bbox is not None and grew_significantly:
+                        copy.bubble_bbox = new_box
+                        copy.bubble_contour = None
+                    active_boxes[idx] = copy.bubble_bbox or copy.text_bbox
+
+    # Step 2A: Partition conjoined or adjacent overlapping speech bubbles along their shared boundary
+    bubble_indices = [
+        i
+        for i, c in enumerate(adapted)
+        if c.kind == "bubble"
+        and not (c.is_sfx and not (c.translated_text or "").strip())
+        and (c.translated_text or c.source_text or "").strip()
+    ]
+    half_gap = max(8, (min_text_gap + 1) // 2)
+    for _ in range(6):
+        b_moved = False
+        for pos_a in range(len(bubble_indices)):
+            ia = bubble_indices[pos_a]
+            for pos_b in range(pos_a + 1, len(bubble_indices)):
+                ib = bubble_indices[pos_b]
+                ba = adapted[ia].bubble_bbox or adapted[ia].text_bbox
+                bb = adapted[ib].bubble_bbox or adapted[ib].text_bbox
+                if not _rect_overlap(ba, bb, gap=min_text_gap):
+                    continue
+                ov_x = min(ba[2], bb[2]) - max(ba[0], bb[0])
+                ov_y = min(ba[3], bb[3]) - max(ba[1], bb[1])
+                ta, tb = orig_text_boxes[ia], orig_text_boxes[ib]
+                tcx_a, tcy_a = (ta[0] + ta[2]) * 0.5, (ta[1] + ta[3]) * 0.5
+                tcx_b, tcy_b = (tb[0] + tb[2]) * 0.5, (tb[1] + tb[3]) * 0.5
+                acx, acy = (ba[0] + ba[2]) * 0.5, (ba[1] + ba[3]) * 0.5
+                bcx, bcy = (bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5
+
+                split_horiz = (
+                    (ov_x <= ov_y)
+                    if (ov_x > 0 and ov_y > 0)
+                    else (abs(tcx_a - tcx_b) >= abs(tcy_a - tcy_b))
+                )
+                if split_horiz:
+                    left_idx, right_idx = (ia, ib) if (tcx_a, acx) <= (tcx_b, bcx) else (ib, ia)
+                    lb = adapted[left_idx].bubble_bbox or adapted[left_idx].text_bbox
+                    rb = adapted[right_idx].bubble_bbox or adapted[right_idx].text_bbox
+                    lt, rt = orig_text_boxes[left_idx], orig_text_boxes[right_idx]
+                    mid_x = (lt[2] + rt[0]) * 0.5 if lt[2] < rt[0] else (lb[2] + rb[0]) * 0.5
+                    if lb[0] + 50 <= rb[2] - 50:
+                        mid_x = max(lb[0] + 50.0, min(rb[2] - 50.0, mid_x))
+                    new_lx2 = min(lb[2], int(math.floor(mid_x - half_gap)))
+                    new_rx1 = max(rb[0], int(math.ceil(mid_x + half_gap)))
+                    if new_lx2 < lb[2] and (new_lx2 - lb[0]) >= 44:
+                        if adapted[left_idx].bubble_bbox is not None:
+                            adapted[left_idx].bubble_bbox = (lb[0], lb[1], new_lx2, lb[3])
+                        ltx1, lty1, ltx2, lty2 = adapted[left_idx].text_bbox
+                        adapted[left_idx].text_bbox = (
+                            min(ltx1, max(0, new_lx2 - 36)),
+                            lty1,
+                            min(ltx2, new_lx2),
+                            lty2,
+                        )
+                        adapted[left_idx].bubble_contour = None
+                        b_moved = True
+                    if new_rx1 > rb[0] and (rb[2] - new_rx1) >= 44:
+                        if adapted[right_idx].bubble_bbox is not None:
+                            adapted[right_idx].bubble_bbox = (new_rx1, rb[1], rb[2], rb[3])
+                        rtx1, rty1, rtx2, rty2 = adapted[right_idx].text_bbox
+                        adapted[right_idx].text_bbox = (
+                            max(rtx1, new_rx1),
+                            rty1,
+                            max(rtx2, min(img_w, new_rx1 + 36)),
+                            rty2,
+                        )
+                        adapted[right_idx].bubble_contour = None
+                        b_moved = True
+                else:
+                    top_idx, bot_idx = (ia, ib) if (tcy_a, acy) <= (tcy_b, bcy) else (ib, ia)
+                    tb_top = adapted[top_idx].bubble_bbox or adapted[top_idx].text_bbox
+                    tb_bot = adapted[bot_idx].bubble_bbox or adapted[bot_idx].text_bbox
+                    tt, bt = orig_text_boxes[top_idx], orig_text_boxes[bot_idx]
+                    mid_y = (tt[3] + bt[1]) * 0.5 if tt[3] < bt[1] else (tb_top[3] + tb_bot[1]) * 0.5
+                    if tb_top[1] + 40 <= tb_bot[3] - 40:
+                        mid_y = max(tb_top[1] + 40.0, min(tb_bot[3] - 40.0, mid_y))
+                    new_ty2 = min(tb_top[3], int(math.floor(mid_y - half_gap)))
+                    new_by1 = max(tb_bot[1], int(math.ceil(mid_y + half_gap)))
+                    if new_ty2 < tb_top[3] and (new_ty2 - tb_top[1]) >= 36:
+                        if adapted[top_idx].bubble_bbox is not None:
+                            adapted[top_idx].bubble_bbox = (tb_top[0], tb_top[1], tb_top[2], new_ty2)
+                        tx1, ty1, tx2, ty2 = adapted[top_idx].text_bbox
+                        adapted[top_idx].text_bbox = (
+                            tx1,
+                            min(ty1, max(0, new_ty2 - 28)),
+                            tx2,
+                            min(ty2, new_ty2),
+                        )
+                        adapted[top_idx].bubble_contour = None
+                        b_moved = True
+                    if new_by1 > tb_bot[1] and (tb_bot[3] - new_by1) >= 36:
+                        if adapted[bot_idx].bubble_bbox is not None:
+                            adapted[bot_idx].bubble_bbox = (tb_bot[0], new_by1, tb_bot[2], tb_bot[3])
+                        bx1_, by1_, bx2_, by2_ = adapted[bot_idx].text_bbox
+                        adapted[bot_idx].text_bbox = (
+                            bx1_,
+                            max(by1_, new_by1),
+                            bx2_,
+                            max(by2_, min(img_h, new_by1 + 28)),
+                        )
+                        adapted[bot_idx].bubble_contour = None
+                        b_moved = True
+        if not b_moved:
+            break
+
+    # Step 2B: Iterative overlap resolution moving ONLY floating boxes (anchors keep speech balloons fixed),
     # strictly tethered to each region's original center so text NEVER flies away onto character faces!
     orig_anchors = {
         i: (
@@ -885,13 +1255,14 @@ def adapt_regions_for_readability(
                 if i == j:
                     continue
                 b = adapted[j].bubble_bbox or adapted[j].text_bbox
-                if not _rect_overlap(a, b, gap=gap):
+                if not _rect_overlap(a, b, gap=min_text_gap):
                     continue
-                ox = min(a[2] + gap, b[2] + gap) - max(a[0], b[0])
-                oy = min(a[3] + gap, b[3] + gap) - max(a[1], b[1])
+                ox = min(a[2] + min_text_gap, b[2] + min_text_gap) - max(a[0], b[0])
+                oy = min(a[3] + min_text_gap, b[3] + min_text_gap) - max(a[1], b[1])
                 acx, acy = (a[0] + a[2]) * 0.5, (a[1] + a[3]) * 0.5
                 bcx, bcy = (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5
-                if oy <= ox * 1.15:
+                try_horiz = oy > ox * 1.15
+                if not try_horiz:
                     dir_y = -1 if acy <= bcy else 1
                     shift = int(math.ceil(oy * (0.6 if adapted[j].kind == "floating" else 1.0)))
                     cand = tether_box(i, (a[0], a[1] + dir_y * shift, a[2], a[3] + dir_y * shift))
@@ -903,18 +1274,32 @@ def adapt_regions_for_readability(
                     moved = True
                     a = cand
                     adapted[i].text_bbox = a
-                elif (a[2] - a[0]) > 96 and ox <= (a[2] - a[0]) * 0.45:
-                    # Already at tether limit: trim the overlapping edge instead of flying away
+                elif try_horiz and (a[2] - a[0]) > 96 and ox <= (a[2] - a[0]) * 0.45:
+                    # Already at horizontal tether limit: trim the overlapping edge instead of flying away
                     if acx <= bcx:
-                        new_x2 = max(a[0] + 84, b[0] - gap)
+                        new_x2 = max(a[0] + 84, b[0] - min_text_gap)
                         if new_x2 < a[2]:
                             a = (a[0], a[1], new_x2, a[3])
                             adapted[i].text_bbox = a
                             moved = True
                     else:
-                        new_x1 = min(a[2] - 84, b[2] + gap)
+                        new_x1 = min(a[2] - 84, b[2] + min_text_gap)
                         if new_x1 > a[0]:
                             a = (new_x1, a[1], a[2], a[3])
+                            adapted[i].text_bbox = a
+                            moved = True
+                elif (not try_horiz) and (a[3] - a[1]) > 56 and oy <= (a[3] - a[1]) * 0.45:
+                    # Already at vertical tether limit: trim vertical overlapping edge cleanly
+                    if acy <= bcy:
+                        new_y2 = max(a[1] + 44, b[1] - min_text_gap)
+                        if new_y2 < a[3]:
+                            a = (a[0], a[1], a[2], new_y2)
+                            adapted[i].text_bbox = a
+                            moved = True
+                    else:
+                        new_y1 = min(a[3] - 44, b[3] + min_text_gap)
+                        if new_y1 > a[1]:
+                            a = (a[0], new_y1, a[2], a[3])
                             adapted[i].text_bbox = a
                             moved = True
         if not moved:
@@ -954,6 +1339,17 @@ def adapt_regions_for_readability(
             cap_fs = max_shout_bubble_fs if is_shout else max_normal_bubble_fs
             if lay.font_size > cap_fs:
                 copy.font_size = float(cap_fs)
+
+    # Step 4: Final pixel-accurate rendered line clearance guard (catches edge-safe shifts & close neighbors)
+    _enforce_rendered_text_clearance(
+        adapted,
+        img_w,
+        img_h,
+        orig_anchors=orig_anchors,
+        user_fixed_fs=user_fixed_fs,
+        min_gap_x=min_text_gap,
+        min_gap_y=max(10, min_text_gap - 2),
+    )
 
     return adapted
 

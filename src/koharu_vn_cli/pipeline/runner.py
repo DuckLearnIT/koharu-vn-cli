@@ -13,6 +13,7 @@ import time
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,6 +28,9 @@ from koharu_vn_cli.pipeline.detector import (
     DetectedRegion,
     _ensure_ctd_model,
     active_ort_provider_label,
+    box_area,
+    intersection_area,
+    union_box,
 )
 from koharu_vn_cli.pipeline.gemini_client import (
     _CJK_KANA_RE,
@@ -354,6 +358,186 @@ def parse_page_range_spec(spec: str, total: int) -> list[int]:
     return sorted(selected)
 
 
+def deduplicate_duplicate_regions(
+    items: list[TextRegionItem],
+    detected: list[DetectedRegion] | None = None,
+) -> tuple[list[TextRegionItem], list[DetectedRegion] | None]:
+    """
+    Collapse adjacent or overlapping split detections that received identical/near-identical
+    Vietnamese dialogue into a single consolidated region while expanding the kept DetectedRegion
+    so inpainting erases ALL original glyphs underneath every merged duplicate box.
+    """
+    if len(items) < 2:
+        return items, detected
+
+    def _norm_vn(text: str) -> str:
+        return re.sub(r"[^\w]+", "", (text or "").lower(), flags=re.UNICODE)
+
+    active_indices = [
+        i
+        for i, r in enumerate(items)
+        if not (r.is_sfx and not (r.translated_text or "").strip())
+        and bool((r.translated_text or "").strip())
+    ]
+    if len(active_indices) < 2:
+        return items, detected
+
+    parent = {i: i for i in active_indices}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    norm_texts = {i: _norm_vn(items[i].translated_text or "") for i in active_indices}
+
+    for pos_a, ia in enumerate(active_indices):
+        na = norm_texts[ia]
+        if len(na) < 4:
+            continue
+        ba = items[ia].bubble_bbox or items[ia].text_bbox
+        wa = max(1, ba[2] - ba[0])
+        ha = max(1, ba[3] - ba[1])
+        area_a = max(1, wa * ha)
+        for ib in active_indices[pos_a + 1 :]:
+            nb = norm_texts[ib]
+            min_len = min(len(na), len(nb))
+            max_len = max(len(na), len(nb))
+            if min_len < 4:
+                continue
+
+            bb = items[ib].bubble_bbox or items[ib].text_bbox
+            wb = max(1, bb[2] - bb[0])
+            hb = max(1, bb[3] - bb[1])
+            min_area = max(1, min(area_a, wb * hb))
+            inter = intersection_area(ba, bb)
+            gap_x = max(0, max(ba[0], bb[0]) - min(ba[2], bb[2]))
+            gap_y = max(0, max(ba[1], bb[1]) - min(ba[3], bb[3]))
+            ov_x = max(0, min(ba[2], bb[2]) - max(ba[0], bb[0]))
+            ov_y = max(0, min(ba[3], bb[3]) - max(ba[1], bb[1]))
+
+            strong_overlap = (inter / min_area) >= 0.35
+            overlapping = inter > 0 or (gap_x <= 8 and gap_y <= 8)
+            side_by_side = gap_x <= max(110, int(min(wa, wb) * 0.95)) and ov_y >= 0.25 * min(ha, hb)
+            stacked = gap_y <= max(90, int(min(ha, hb) * 0.85)) and ov_x >= 0.25 * min(wa, wb)
+            if not (overlapping or side_by_side or stacked):
+                continue
+
+            if strong_overlap:
+                similar = na == nb or SequenceMatcher(None, na, nb).ratio() >= 0.88
+            else:
+                if min_len < 12:
+                    continue
+                if na == nb or SequenceMatcher(None, na, nb).ratio() >= 0.84:
+                    similar = True
+                elif min_len >= 18 and (na in nb or nb in na) and (min_len / max(1, max_len)) >= 0.68:
+                    similar = True
+                else:
+                    similar = False
+
+            if similar:
+                union(ia, ib)
+
+    groups: dict[int, list[int]] = {}
+    for i in active_indices:
+        groups.setdefault(find(i), []).append(i)
+
+    if all(len(g) == 1 for g in groups.values()):
+        return items, detected
+
+    detected_out = list(detected) if detected is not None else None
+    merged_keepers: dict[int, TextRegionItem] = {}
+    dropped_indices: set[int] = set()
+
+    for members_idx in groups.values():
+        if len(members_idx) < 2:
+            continue
+        members = [items[i] for i in members_idx]
+        keeper_idx = max(
+            members_idx,
+            key=lambda i: (
+                len((items[i].translated_text or "").strip()),
+                1 if items[i].kind == "bubble" else 0,
+                box_area(items[i].text_bbox),
+                -items[i].id,
+            ),
+        )
+        keeper = items[keeper_idx]
+        merged_tbox = union_box([m.text_bbox for m in members])
+
+        new_bbox = keeper.bubble_bbox
+        new_contour = keeper.bubble_contour
+        if keeper.kind == "bubble":
+            bub_boxes = [m.bubble_bbox or m.text_bbox for m in members]
+            merged_bbox = union_box(bub_boxes)
+            if keeper.bubble_bbox is None or box_area(merged_bbox) > box_area(keeper.bubble_bbox) * 1.08:
+                new_contour = None
+            new_bbox = merged_bbox
+
+        best_src = max(
+            (m.source_text or "" for m in members),
+            key=lambda s: len(s.strip()),
+            default=keeper.source_text,
+        )
+        merged_keepers[keeper_idx] = keeper.model_copy(
+            update={
+                "text_bbox": merged_tbox,
+                "bubble_bbox": new_bbox,
+                "bubble_contour": new_contour,
+                "source_text": best_src,
+            }
+        )
+        for i in members_idx:
+            if i != keeper_idx:
+                dropped_indices.add(i)
+
+        if detected_out is not None and 1 <= keeper.id <= len(detected_out):
+            det_members = [
+                detected_out[m.id - 1]
+                for m in members
+                if 1 <= m.id <= len(detected_out)
+            ]
+            if det_members:
+                k_det = detected_out[keeper.id - 1]
+                k_det_tbox = union_box([d.text_bbox for d in det_members])
+                k_det_lines: list[tuple[int, int, int, int]] = []
+                for d in det_members:
+                    if d.line_bboxes:
+                        k_det_lines.extend(d.line_bboxes)
+                    else:
+                        k_det_lines.append(d.text_bbox)
+                k_det_bbox = k_det.bubble_bbox
+                k_det_contour = k_det.bubble_contour
+                if k_det.is_bubble:
+                    cand_bbox = union_box([d.bubble_bbox or d.text_bbox for d in det_members])
+                    if k_det.bubble_bbox is None or box_area(cand_bbox) > box_area(k_det.bubble_bbox) * 1.08:
+                        k_det_contour = None
+                    k_det_bbox = cand_bbox
+                detected_out[keeper.id - 1] = DetectedRegion(
+                    text_bbox=k_det_tbox,
+                    bubble_bbox=k_det_bbox,
+                    bubble_contour=k_det_contour,
+                    is_bubble=k_det.is_bubble or any(d.is_bubble for d in det_members),
+                    is_dark_bubble=k_det.is_dark_bubble,
+                    confidence=max(d.confidence for d in det_members),
+                    angle=k_det.angle,
+                    line_bboxes=k_det_lines,
+                )
+
+    items_out = [
+        merged_keepers.get(i, reg)
+        for i, reg in enumerate(items)
+        if i not in dropped_indices
+    ]
+    return items_out, detected_out
+
+
 def expand_composed_boxes_if_tight(
     regions: list[TextRegionItem], img_w: int, img_h: int
 ) -> list[TextRegionItem]:
@@ -417,7 +601,7 @@ def expand_composed_boxes_if_tight(
 
         adjusted.append(copy)
 
-    separated = resolve_box_overlaps(adjusted, img_w, img_h, gap=max(10, int(min_dim * 0.012)))
+    separated = resolve_box_overlaps(adjusted, img_w, img_h, gap=max(14, int(min_dim * 0.016)))
     # Harmonize outlier font sizes across all regions on the page without shrinking oversized fits
     for copy in separated:
         if copy.font_size is not None:
@@ -1261,7 +1445,6 @@ def run_translate_pipeline(
             items: list[TextRegionItem],
         ) -> tuple[np.ndarray, list[TextRegionItem]]:
             """Build erasure mask and run LaMa inpainting only on non-SFX regions so artwork SFX stays intact."""
-            by_id_det = {reg_idx: det for reg_idx, det in enumerate(detected, start=1)}
             normalized_items: list[TextRegionItem] = []
             for r in items:
                 if skip_sfx and r.kind == "floating" and (
@@ -1272,7 +1455,10 @@ def run_translate_pipeline(
                     normalized_items.append(r.model_copy(update={"is_sfx": True, "translated_text": ""}))
                 else:
                     normalized_items.append(r)
-            items = normalized_items
+            items, dedup_det = deduplicate_duplicate_regions(normalized_items, detected)
+            if dedup_det is not None:
+                detected = dedup_det
+            by_id_det = {reg_idx: det for reg_idx, det in enumerate(detected, start=1)}
             active_pairs = [
                 (by_id_det[r.id], r)
                 for r in items
@@ -1813,6 +1999,11 @@ def run_translate_pipeline(
                 elif (item_r.translated_text or "").strip():
                     item_r.is_sfx = False
 
+            translated_items, dedup_detected = deduplicate_duplicate_regions(
+                translated_items, task.detected
+            )
+            eff_detected = dedup_detected if dedup_detected is not None else task.detected
+
             with state_lock:
                 _remember_translations(translated_items)
                 if summary:
@@ -1830,7 +2021,7 @@ def run_translate_pipeline(
                     h=task.h,
                     rgb=task.rgb,
                     seg_mask=task.seg_mask,
-                    detected=task.detected,
+                    detected=eff_detected,
                     translated_items=translated_items,
                     summary=summary,
                 ),
@@ -1934,6 +2125,12 @@ def run_translate_pipeline(
                         item_r.translated_text = ""
                     elif (item_r.translated_text or "").strip():
                         item_r.is_sfx = False
+
+                translated_items, dedup_det_list = deduplicate_duplicate_regions(
+                    translated_items, det_list
+                )
+                eff_det_list = dedup_det_list if dedup_det_list is not None else det_list
+
                 with state_lock:
                     _remember_translations(translated_items)
                     if summary:
@@ -1959,7 +2156,7 @@ def run_translate_pipeline(
                         h=h,
                         rgb=rgb_page,
                         seg_mask=seg_arr,
-                        detected=det_list,
+                        detected=eff_det_list,
                         translated_items=translated_items,
                         summary=summary,
                     ),
