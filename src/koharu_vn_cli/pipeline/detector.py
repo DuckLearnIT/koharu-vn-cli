@@ -348,6 +348,8 @@ def _flood_fill_bubble_contour(
     largest = max(contours, key=cv2.contourArea)
     peri = cv2.arcLength(largest, True)
     c_area = cv2.contourArea(largest)
+    hull_area = max(1.0, float(cv2.contourArea(cv2.convexHull(largest))))
+    solidity = c_area / hull_area
     circularity = (4.0 * np.pi * c_area) / max(1e-5, peri * peri)
     if known_bubble_box is None and circularity < 0.25:
         return None, None, is_dark
@@ -357,19 +359,28 @@ def _flood_fill_bubble_contour(
     x, y, cw, ch = cv2.boundingRect(largest)
     filled_box = (roi_x1 + x, roi_y1 + y, roi_x1 + x + cw, roi_y1 + y + ch)
 
+    # Measure true pixel coverage of seed_box inside the filled mask (catches C-shaped / half-eaten
+    # flood-fills caused by high-contrast artwork crossing behind a translucent dark speech bubble!)
+    seed_in_filled = int(np.count_nonzero(filled[ly1:ly2, lx1:lx2]))
+    seed_cov = seed_in_filled / max(1, (lx2 - lx1) * (ly2 - ly1))
+
     if known_bubble_box is not None:
-        # Never let a partial translucent flood-fill shrink RT-DETR's bubble box or chop off text
         kb = known_bubble_box
+        poly_fill_vs_kb = c_area / max(1.0, float(box_area(kb)))
+        min_solidity = 0.84 if is_dark else 0.78
         if (
-            containment_ratio(seed_box, filled_box) >= 0.96
+            solidity >= min_solidity
+            and seed_cov >= 0.90
+            and poly_fill_vs_kb >= 0.56
+            and containment_ratio(seed_box, filled_box) >= 0.96
             and box_area(filled_box) >= box_area(kb) * 0.72
             and containment_ratio(filled_box, (kb[0] - 8, kb[1] - 8, kb[2] + 8, kb[3] + 8)) >= 0.45
         ):
             return filled_box, pts if len(pts) >= 4 else None, is_dark
         return known_bubble_box, None, is_dark
 
-    # Accept flood-filled contour only if it surrounds the text cleanly and isn't overly jagged
-    if containment_ratio(seed_box, filled_box) >= 0.70 and area <= text_area * 9.0:
+    # Accept flood-filled contour only if it surrounds the text cleanly and isn't overly concave/jagged
+    if solidity >= 0.76 and seed_cov >= 0.82 and containment_ratio(seed_box, filled_box) >= 0.70 and area <= text_area * 9.0:
         return filled_box, pts if len(pts) >= 4 else None, is_dark
 
     return None, None, is_dark

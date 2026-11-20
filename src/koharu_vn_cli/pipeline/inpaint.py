@@ -41,14 +41,30 @@ def _safe_bubble_interior_roi(
         return None
 
     interior = np.zeros((bh, bw), dtype=np.uint8)
+    use_contour = False
     if reg.bubble_contour and len(reg.bubble_contour) >= 4:
         pts = np.array(
             [[int(round(px - bx1)), int(round(py - by1))] for px, py in reg.bubble_contour],
             dtype=np.int32,
         )
-        cv2.fillPoly(interior, [pts], 255)
-    else:
-        # Fallback: superellipse interior matching oval balloons without touching rectangular corners
+        c_area = float(cv2.contourArea(pts))
+        h_area = max(1.0, float(cv2.contourArea(cv2.convexHull(pts))))
+        solidity = c_area / h_area
+        if solidity >= 0.78 and c_area >= (bw * bh) * 0.52:
+            cv2.fillPoly(interior, [pts], 255)
+            # Verify contour actually covers the detected text_bbox (guards against half-eaten translucent contours)
+            tx1 = max(0, int(reg.text_bbox[0]) - bx1)
+            ty1 = max(0, int(reg.text_bbox[1]) - by1)
+            tx2 = min(bw, int(reg.text_bbox[2]) - bx1)
+            ty2 = min(bh, int(reg.text_bbox[3]) - by1)
+            t_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+            if tx2 > tx1 and ty2 > ty1 and (np.count_nonzero(interior[ty1:ty2, tx1:tx2]) / t_area) >= 0.85:
+                use_contour = True
+            else:
+                interior.fill(0)
+
+    if not use_contour:
+        # Smooth superellipse interior matching oval/rounded speech balloons without clipping halves
         yy, xx = np.ogrid[:bh, :bw]
         cx, cy = (bw - 1) * 0.5, (bh - 1) * 0.5
         rx = max(2.0, bw * 0.5 - 2.0)
@@ -230,27 +246,30 @@ def build_erasure_mask(
             local_mask = cv2.bitwise_or(local_mask, extra)
 
             # On TRANSLUCENT bubbles (dark smoke bubbles with white Japanese text OR wavy white clouds
-            # over artwork), a tight text_bbox often misses top/edge glyphs (e.g. な/ん/い/温/え/ろ).
-            # Run local-background contrast across the full safe_roi (inset from bubble outline) so
-            # stray edge glyphs are cleanly erased without erasing underlying translucent artwork!
+            # over artwork), use morphological Top-Hat / Black-Hat background estimation across the
+            # FULL safe_roi so dense multi-column edge glyphs (`「えろや!`, `い温`, `なん`) are erased
+            # cleanly even when strong artwork boundaries cross behind the translucent bubble!
             if reg.is_bubble and safe_roi is not None and not is_flat_bubble:
-                k_blur = min(31, max(15, (min(roi_h, roi_w) // 5) | 1))
-                local_bg = cv2.medianBlur(roi_gray, k_blur).astype(np.float32)
+                k_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
                 g_f = roi_gray.astype(np.float32)
                 if bg_med < 120.0:
-                    # Dark translucent bubble: original text is bright white ink
+                    # Top-hat on dark translucent bubble: MORPH_OPEN estimates the exact dark background
+                    # underneath dense white strokes without getting dragged bright like medianBlur!
+                    local_dark_bg = cv2.morphologyEx(roi_gray, cv2.MORPH_OPEN, k_morph).astype(np.float32)
                     stray_ink = (
                         (safe_roi > 0)
-                        & ((g_f - local_bg) > 38.0)
-                        & (g_f > max(132.0, bg_med + 42.0))
+                        & ((g_f - local_dark_bg) > 40.0)
+                        & (g_f > 118.0)
                     )
                 else:
-                    # Bright translucent cloud bubble: original text is dark black or vivid colored ink
-                    local_rgb_bg = cv2.medianBlur(roi_rgb, k_blur).astype(np.float32)
+                    # Black-hat on bright translucent cloud bubble: MORPH_CLOSE estimates the bright cloud
+                    # underneath dense black/colored strokes!
+                    local_bright_bg = cv2.morphologyEx(roi_gray, cv2.MORPH_CLOSE, k_morph).astype(np.float32)
+                    local_rgb_bg = cv2.morphologyEx(roi_rgb, cv2.MORPH_CLOSE, k_morph).astype(np.float32)
                     local_cdiff = np.max(np.abs(roi_rgb.astype(np.float32) - local_rgb_bg), axis=-1)
                     stray_ink = (safe_roi > 0) & (
-                        ((local_bg - g_f) > 34.0)
-                        | ((local_cdiff > 58.0) & (g_f < bg_med - 16.0))
+                        ((local_bright_bg - g_f) > 34.0)
+                        | ((local_cdiff > 56.0) & (g_f < local_bright_bg - 16.0))
                     )
                 local_mask = cv2.bitwise_or(local_mask, stray_ink.astype(np.uint8) * 255)
         else:
@@ -287,8 +306,19 @@ def build_erasure_mask(
         if reg.bubble_bbox is not None and reg.is_bubble:
             bx1, by1, bx2, by2 = reg.bubble_bbox
             if safe_roi is not None and (x1 >= bx1 - 2 and y1 >= by1 - 2 and x2 <= bx2 + 2 and y2 <= by2 + 2):
-                # Allow 1px beyond safe_roi only when strictly needed, never touching the black outline
+                # Allow 1px beyond safe_roi AND never chop CTD-confirmed text pixels inside text_bbox
                 safe_clip = cv2.dilate(safe_roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+                ctd_confirmed = cv2.dilate(
+                    ((roi_seg > 28) & (tbox_roi > 0)).astype(np.uint8) * 255,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                )
+                # Still keep 2px inside bubble_bbox outer edge so the balloon border stays intact
+                inner_bbox = np.zeros_like(local_mask)
+                ibx1, iby1 = max(0, bx1 + 2 - px1), max(0, by1 + 2 - py1)
+                ibx2, iby2 = min(roi_w, bx2 - 2 - px1), min(roi_h, by2 - 2 - py1)
+                if ibx2 > ibx1 and iby2 > iby1:
+                    inner_bbox[iby1:iby2, ibx1:ibx2] = 255
+                safe_clip = cv2.bitwise_or(safe_clip, cv2.bitwise_and(ctd_confirmed, inner_bbox))
                 local_mask = cv2.bitwise_and(local_mask, safe_clip)
             else:
                 safe_x1 = max(px1, bx1 + 2) if bx1 - 2 <= x1 <= bx1 + 3 else px1
