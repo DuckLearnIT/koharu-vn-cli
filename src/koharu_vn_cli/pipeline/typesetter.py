@@ -17,6 +17,10 @@ SYMBOL_FALLBACK_FONTS = [
     r"C:\Windows\Fonts\seguisym.ttf",
     r"C:\Windows\Fonts\segoeui.ttf",
     r"C:\Windows\Fonts\arial.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
 ]
 
 

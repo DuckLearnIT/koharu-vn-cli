@@ -1,5 +1,7 @@
 # Koharu-VN CLI
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DuckLearnIT/koharu-vn-cli/blob/main/koharu_colab.ipynb)
+
 Công cụ dịch truyện tranh / doujinshi / sáng tác Artist CG tiếng Việt bằng **ONNX thuần + Gemini Vision**:
 - **Detector**: `ogkalu/comic-text-and-bubble-detector` (RT-DETRv2) + `mayocream/comic-text-detector` (YOLOv5 `blk` + UNet `seg` + DBNet `det`)
 - **Inpainting**: `mayocream/lama-manga-onnx` (`anime-manga-big-lama`) + solid-fill thông minh
