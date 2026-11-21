@@ -607,8 +607,8 @@ def rerender(
     output_dir: Path = typer.Argument(..., help="Thư mục output chứa .koharu_cache/*.koharu.json."),
     font: Optional[str] = typer.Option(None, "--font", help="Đổi font cho toàn bộ các trang."),
     font_scale: float = typer.Option(1.0, "--font-scale", help="Tỉ lệ phóng/thu cỡ chữ (vd: 1.15)."),
-    output_format: str = typer.Option("original", "--format", help="Định dạng ảnh xuất: original | webp | png | jpg."),
-    seq_names: bool = typer.Option(False, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (001, 002...)."),
+    output_format: Optional[str] = typer.Option(None, "--format", help="Định dạng ảnh xuất: original | webp | png | jpg (mặc định giữ đúng file cũ)."),
+    seq_names: Optional[bool] = typer.Option(None, "--seq-names/--no-seq-names", help="Đổi tên ảnh xuất theo số thứ tự đọc (mặc định giữ đúng tên file cũ)."),
 ) -> None:
     """Render lại nhanh toàn bộ ảnh từ file .koharu.json mà không tốn API hay chạy lại ML."""
     try:

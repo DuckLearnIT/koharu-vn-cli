@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -168,17 +169,148 @@ def _detect_image_ext(path: Path) -> str | None:
     return None
 
 
-def _is_supported_image(path: Path) -> bool:
+_IGNORED_DIR_NAMES = {
+    "__MACOSX",
+    ".koharu_cache",
+    ".git",
+    ".svn",
+    ".ipynb_checkpoints",
+    ".Trashes",
+    "$RECYCLE.BIN",
+}
+_DUP_COPY_SUFFIX_RE = re.compile(
+    r"(?:\s*\(\d+\)|\s*[-_]\s*copy(?:\s*\d+)?|\s+copy(?:\s*\d+)?)$",
+    re.IGNORECASE,
+)
+_EXT_PRIORITY = {".png": 0, ".webp": 1, ".jpg": 2, ".jpeg": 3, ".bmp": 4}
+
+
+def _is_ignored_rel_parts(parts: tuple[str, ...]) -> bool:
+    """Return True if any relative path component belongs to cache, hidden, or macOS metadata files."""
+    if not parts:
+        return False
+    for part in parts[:-1]:
+        if part in _IGNORED_DIR_NAMES or part.startswith(".") or part.startswith(".koharu_pack_"):
+            return True
+    name = parts[-1]
+    low = name.lower()
+    if name.startswith(".") or low.endswith(".clean.png"):
+        return True
+    return False
+
+
+def _is_supported_image(path: Path, *, root: Path | None = None) -> bool:
     if not path.is_file():
         return False
     if path.name.startswith("._") or "__MACOSX" in path.parts:
         return False
+    if root is not None:
+        try:
+            rel_parts = path.relative_to(root).parts
+        except ValueError:
+            rel_parts = (path.name,)
+        if _is_ignored_rel_parts(rel_parts):
+            return False
+    else:
+        if path.name.startswith(".") or path.name.lower().endswith(".clean.png"):
+            return False
+        if ".koharu_cache" in path.parts or any(p.startswith(".koharu_pack_") for p in path.parts):
+            return False
     try:
         if path.stat().st_size == 0:
             return False
     except OSError:
         return False
     return _detect_image_ext(path) is not None
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _images_visually_identical(path_a: Path, path_b: Path) -> bool:
+    """Check if two same-folder same-stem images in different formats (e.g. 001.jpg & 001.webp) are re-encodes of the exact same page."""
+    try:
+        with Image.open(path_a) as im_a, Image.open(path_b) as im_b:
+            if im_a.size != im_b.size:
+                return False
+            arr_a = np.asarray(im_a.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
+            arr_b = np.asarray(im_b.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
+        return float(np.mean(np.abs(arr_a - arr_b))) < 6.0
+    except Exception:
+        return False
+
+
+def _deduplicate_input_images(images: list[Path]) -> list[Path]:
+    """
+    Drop accidental duplicate image copies (e.g. `001.jpg` + `001 (1).jpg` with identical bytes,
+    nested backup copy with identical bytes & base stem, or same-folder `001.jpg` + `001.webp` re-encode)
+    while keeping genuinely distinct pages (even across multi-chapter subfolders with the same filename).
+    """
+    if len(images) < 2:
+        return images
+
+    def _norm_base_stem(p: Path) -> str:
+        return _DUP_COPY_SUFFIX_RE.sub("", p.stem).strip().lower()
+
+    stem_groups: dict[str, list[Path]] = {}
+    for p in images:
+        stem_groups.setdefault(_norm_base_stem(p), []).append(p)
+
+    drop: set[Path] = set()
+    for _norm, grp in stem_groups.items():
+        if len(grp) < 2:
+            continue
+
+        # 1. Exact byte-identical duplicates sharing the same normalized base stem
+        by_sha: dict[str, list[Path]] = {}
+        for p in grp:
+            try:
+                sha = _file_sha256(p)
+            except OSError:
+                continue
+            by_sha.setdefault(sha, []).append(p)
+        for dups in by_sha.values():
+            if len(dups) < 2:
+                continue
+            keeper = min(
+                dups,
+                key=lambda p: (
+                    1 if _DUP_COPY_SUFFIX_RE.search(p.stem) else 0,
+                    len(p.parts),
+                    _EXT_PRIORITY.get(p.suffix.lower(), 9),
+                    str(p).lower(),
+                ),
+            )
+            for p in dups:
+                if p != keeper:
+                    drop.add(p)
+
+        # 2. Same-folder, same case-insensitive stem in different formats (e.g. 001.jpg + 001.webp)
+        by_dir_stem: dict[tuple[Path, str], list[Path]] = {}
+        for p in grp:
+            if p in drop:
+                continue
+            by_dir_stem.setdefault((p.parent, p.stem.lower()), []).append(p)
+        for same_slot in by_dir_stem.values():
+            if len(same_slot) < 2:
+                continue
+            ordered = sorted(
+                same_slot,
+                key=lambda p: (_EXT_PRIORITY.get(p.suffix.lower(), 9), p.name.lower()),
+            )
+            kept_slot: list[Path] = []
+            for cand in ordered:
+                if any(_images_visually_identical(cand, k) for k in kept_slot):
+                    drop.add(cand)
+                else:
+                    kept_slot.append(cand)
+
+    return [p for p in images if p not in drop]
 
 
 def _resolve_output_ext(path: Path, output_format: str = "original") -> str:
@@ -233,11 +365,16 @@ def _archive_natural_key(
 
 
 def _cache_stem_for_page(img_path: Path, idx: int, seq_pad: int, stem_counts: Counter[str]) -> str:
-    return f"{idx:0{seq_pad}d}_{img_path.stem}" if stem_counts[img_path.stem] > 1 else img_path.stem
+    return f"{idx:0{seq_pad}d}_{img_path.stem}" if stem_counts[img_path.stem.lower()] > 1 else img_path.stem
 
 
-def collect_inputs(input_path: Path, extract_dir: Path | None) -> tuple[list[Path], str]:
-    """Collect naturally sorted image paths from a single image, folder, or .zip/.cbz archive."""
+def collect_inputs(
+    input_path: Path,
+    extract_dir: Path | None,
+    *,
+    exclude_dir: Path | None = None,
+) -> tuple[list[Path], str]:
+    """Collect naturally sorted, deduplicated image paths from a single image, folder, or .zip/.cbz archive."""
     if not input_path.exists():
         raise FileNotFoundError(f"Không tìm thấy đường dẫn: {input_path}")
 
@@ -246,37 +383,66 @@ def collect_inputs(input_path: Path, extract_dir: Path | None) -> tuple[list[Pat
             if extract_dir is None:
                 raise ValueError("extract_dir is required for archive input")
             root_resolved = extract_dir.resolve()
+            seen_members: set[str] = set()
             try:
                 with zipfile.ZipFile(input_path, "r") as zf:
                     for member in zf.infolist():
-                        m_path = Path(member.filename)
-                        if "__MACOSX" in m_path.parts or m_path.name.startswith("._"):
+                        if member.is_dir():
                             continue
-                        target = (root_resolved / member.filename).resolve()
+                        norm_member = member.filename.replace("\\", "/").lstrip("/")
+                        while norm_member.startswith("./"):
+                            norm_member = norm_member[2:]
+                        m_path = Path(norm_member)
+                        if not m_path.parts or _is_ignored_rel_parts(m_path.parts):
+                            continue
+                        member_key = norm_member.lower()
+                        if member_key in seen_members:
+                            continue
+                        seen_members.add(member_key)
+                        target = (root_resolved / m_path).resolve()
                         if not target.is_relative_to(root_resolved):
                             continue
-                        zf.extract(member, extract_dir)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member, "r") as src_fh, target.open("wb") as dst_fh:
+                            shutil.copyfileobj(src_fh, dst_fh)
             except zipfile.BadZipFile as exc:
                 raise ValueError(f"File nén không hợp lệ hoặc bị hỏng: {input_path.name}") from exc
             imgs = sorted(
-                (p for p in extract_dir.rglob("*") if _is_supported_image(p)),
+                (p for p in extract_dir.rglob("*") if _is_supported_image(p, root=extract_dir)),
                 key=lambda p: _archive_natural_key(extract_dir, p),
             )
-            return imgs, input_path.stem
+            return _deduplicate_input_images(imgs), input_path.stem
         if _is_supported_image(input_path):
             return [input_path], input_path.stem
         raise ValueError(f"Định dạng file không hỗ trợ: {input_path.suffix or '(không có đuôi file)'}")
 
+    excl_resolved: Path | None = None
+    if exclude_dir is not None:
+        try:
+            cand_excl = exclude_dir.resolve()
+            if cand_excl != input_path.resolve():
+                excl_resolved = cand_excl
+        except OSError:
+            excl_resolved = None
+
+    def _not_excluded(p: Path) -> bool:
+        if excl_resolved is None:
+            return True
+        try:
+            return not p.resolve().is_relative_to(excl_resolved)
+        except OSError:
+            return True
+
     imgs = sorted(
-        (p for p in input_path.iterdir() if _is_supported_image(p)),
+        (p for p in input_path.iterdir() if _is_supported_image(p, root=input_path) and _not_excluded(p)),
         key=natural_key,
     )
     if not imgs:
         imgs = sorted(
-            (p for p in input_path.rglob("*") if _is_supported_image(p)),
+            (p for p in input_path.rglob("*") if _is_supported_image(p, root=input_path) and _not_excluded(p)),
             key=lambda p: _archive_natural_key(input_path, p),
         )
-    return imgs, input_path.name
+    return _deduplicate_input_images(imgs), input_path.name
 
 
 def load_rgb(path: Path) -> np.ndarray:
@@ -294,6 +460,69 @@ def save_image(pil_img: Image.Image, out_path: Path) -> None:
         pil_img.convert("RGB").save(out_path, format="WEBP", quality=100, method=6)
     else:
         pil_img.convert("RGB").save(out_path, format="PNG")
+
+
+def _cleanup_stale_page_outputs(
+    out_path: Path,
+    *,
+    source_img_path: Path | None = None,
+    prev_output_path: Path | None = None,
+) -> None:
+    """
+    Remove stale sibling output files for the exact same page (e.g. old `001.jpg` when saving `001.webp`,
+    or old filename recorded in `PageDocument.output_image_path`) so re-runs/resumes never double pages.
+    """
+    try:
+        out_res = out_path.resolve()
+        out_dir_res = out_path.parent.resolve()
+    except OSError:
+        return
+    src_res: Path | None = None
+    if source_img_path is not None:
+        try:
+            src_res = source_img_path.resolve()
+        except OSError:
+            src_res = None
+
+    candidates: list[Path] = []
+    # 1. Previous output file recorded in cached PageDocument for this page
+    if prev_output_path is not None:
+        candidates.append(prev_output_path)
+    # 2. Same-stem sibling with a different image extension in the output directory
+    for ext in IMAGE_EXTS:
+        if ext != out_path.suffix.lower():
+            candidates.append(out_path.with_suffix(ext))
+
+    for cand in candidates:
+        try:
+            if not cand.is_file():
+                continue
+            cand_res = cand.resolve()
+            if cand_res == out_res:
+                continue
+            if src_res is not None and cand_res == src_res:
+                continue
+            if cand_res.parent != out_dir_res:
+                continue
+            cand.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _save_page_output(
+    pil_img: Image.Image,
+    out_path: Path,
+    *,
+    source_img_path: Path | None = None,
+    prev_output_path: Path | None = None,
+) -> None:
+    """Save page output image and remove any stale duplicate output for the same page."""
+    save_image(pil_img, out_path)
+    _cleanup_stale_page_outputs(
+        out_path,
+        source_img_path=source_img_path,
+        prev_output_path=prev_output_path,
+    )
 
 
 def render_document(base_rgb: np.ndarray, doc: PageDocument) -> Image.Image:
@@ -627,13 +856,14 @@ class _PreparedVisionPage:
     seg_mask: np.ndarray
     detected: list[DetectedRegion]
     region_items: list[TextRegionItem]
+    prev_out_path: Path | None = None
 
 
 @dataclass
 class _PreparedOcrBatch:
     scene_id: int
     pages: list[
-        tuple[int, Path, Path, Path, Path, int, int, bytes, list[DetectedRegion], list[TextRegionItem], dict[int, str]]
+        tuple[int, Path, Path, Path, Path, int, int, bytes, list[DetectedRegion], list[TextRegionItem], dict[int, str], Path | None]
     ]
 
 
@@ -651,6 +881,7 @@ class _TranslatedRenderTask:
     detected: list[DetectedRegion]
     translated_items: list[TextRegionItem]
     summary: str
+    prev_out_path: Path | None = None
 
 
 def _q_put(
@@ -1183,12 +1414,21 @@ def run_translate_pipeline(
     source_zip_fp = _capture_source_zip_fingerprint(input_path) if delete_source_zip else None
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        images, base_name = collect_inputs(input_path, Path(tmp_dir), exclude_dir=output)
         if not images:
             raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
 
         default_suffix = "_fixed" if retranslate_untranslated else "_vn"
         out_dir = output or input_path.parent / f"{base_name}{default_suffix}"
+        if input_path.is_dir():
+            try:
+                out_res = out_dir.resolve()
+                if out_res != input_path.resolve():
+                    images = [p for p in images if not p.resolve().is_relative_to(out_res)]
+            except OSError:
+                pass
+            if not images:
+                raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
         cache_dir = out_dir / ".koharu_cache"
         out_dir.mkdir(parents=True, exist_ok=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1328,7 +1568,7 @@ def run_translate_pipeline(
         out_paths_by_idx: dict[int, Path] = {}
         rendered_verified_by_idx: dict[int, bool] = {}
         seq_pad = max(3, len(str(total)))
-        stem_counts = Counter(p.stem for p in images)
+        stem_counts = Counter(p.stem.lower() for p in images)
         translation_memory: dict[str, str] = {}
         scene_summaries_by_page: dict[int, dict[int, str]] = {sc.scene_id: {} for sc in scenes}
 
@@ -1528,6 +1768,7 @@ def run_translate_pipeline(
                             list[DetectedRegion],
                             list[TextRegionItem],
                             dict[int, str],
+                            Path | None,
                         ]
                     ] = []
 
@@ -1541,41 +1782,78 @@ def run_translate_pipeline(
                         out_img_path = out_dir / _output_image_name(
                             img_path,
                             output_format=output_format,
-                            seq_index=idx if (sequential_names or stem_counts[img_path.stem] > 1) else None,
+                            seq_index=idx if (sequential_names or stem_counts[img_path.stem.lower()] > 1) else None,
                             seq_pad=seq_pad,
                         )
                         json_path = cache_dir / f"{cache_stem}.koharu.json"
 
-                        if resume and out_img_path.is_file() and json_path.is_file():
-                            prev_doc = PageDocument.model_validate_json(
-                                json_path.read_text(encoding="utf-8")
-                            )
-                            if not any(region_needs_translation(r) for r in prev_doc.regions):
-                                resumed_verified = False
-                                if source_zip_fp is not None:
-                                    try:
-                                        with Image.open(out_img_path) as resumed_im:
-                                            resumed_verified = _image_has_rendered_text_diff(
-                                                resumed_im, load_rgb(img_path)
-                                            )
-                                    except Exception:
-                                        resumed_verified = False
-                                with state_lock:
-                                    _remember_translations(prev_doc.regions)
-                                    if prev_doc.page_summary:
-                                        scene_summaries_by_page[sc.scene_id][idx] = prev_doc.page_summary
-                                    docs_by_idx[idx] = prev_doc
-                                    out_paths_by_idx[idx] = out_img_path
-                                    rendered_verified_by_idx[idx] = resumed_verified
-                                _emit_step(idx, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
-                                _emit_page_done(idx, img_path.name, prev_doc, out_img_path)
-                                continue
-                            _emit_step(
-                                idx,
-                                img_path.name,
-                                "retry",
-                                "Phát hiện vùng chưa dịch ở cache cũ -> dịch lại trang này...",
-                            )
+                        prev_doc_cached: PageDocument | None = None
+                        prev_out_path: Path | None = None
+                        if json_path.is_file():
+                            try:
+                                prev_doc_cached = PageDocument.model_validate_json(
+                                    json_path.read_text(encoding="utf-8")
+                                )
+                                if prev_doc_cached.output_image_path:
+                                    prev_out_path = Path(prev_doc_cached.output_image_path)
+                            except Exception:
+                                prev_doc_cached = None
+
+                        if resume and prev_doc_cached is not None:
+                            if not any(region_needs_translation(r) for r in prev_doc_cached.regions):
+                                existing_out: Path | None = None
+                                if out_img_path.is_file():
+                                    existing_out = out_img_path
+                                    _cleanup_stale_page_outputs(
+                                        out_img_path,
+                                        source_img_path=img_path,
+                                        prev_output_path=prev_out_path,
+                                    )
+                                elif (
+                                    prev_out_path is not None
+                                    and prev_out_path.is_file()
+                                    and prev_out_path.parent.resolve() == out_dir.resolve()
+                                ):
+                                    with Image.open(prev_out_path) as old_im:
+                                        _save_page_output(
+                                            old_im,
+                                            out_img_path,
+                                            source_img_path=img_path,
+                                            prev_output_path=prev_out_path,
+                                        )
+                                    prev_doc_cached = prev_doc_cached.model_copy(
+                                        update={"output_image_path": str(out_img_path.resolve())}
+                                    )
+                                    json_path.write_text(prev_doc_cached.model_dump_json(indent=2), encoding="utf-8")
+                                    existing_out = out_img_path
+
+                                if existing_out is not None:
+                                    resumed_verified = False
+                                    if source_zip_fp is not None:
+                                        try:
+                                            with Image.open(existing_out) as resumed_im:
+                                                resumed_verified = _image_has_rendered_text_diff(
+                                                    resumed_im, load_rgb(img_path)
+                                                )
+                                        except Exception:
+                                            resumed_verified = False
+                                    with state_lock:
+                                        _remember_translations(prev_doc_cached.regions)
+                                        if prev_doc_cached.page_summary:
+                                            scene_summaries_by_page[sc.scene_id][idx] = prev_doc_cached.page_summary
+                                        docs_by_idx[idx] = prev_doc_cached
+                                        out_paths_by_idx[idx] = existing_out
+                                        rendered_verified_by_idx[idx] = resumed_verified
+                                    _emit_step(idx, img_path.name, "skip", "Bỏ qua trang đã dịch (--resume)")
+                                    _emit_page_done(idx, img_path.name, prev_doc_cached, existing_out)
+                                    continue
+                            if out_img_path.is_file() or (prev_out_path is not None and prev_out_path.is_file()):
+                                _emit_step(
+                                    idx,
+                                    img_path.name,
+                                    "retry",
+                                    "Phát hiện vùng chưa dịch ở cache cũ -> dịch lại trang này...",
+                                )
 
                         rgb = load_rgb(img_path)
                         h, w = rgb.shape[:2]
@@ -1584,10 +1862,16 @@ def run_translate_pipeline(
                         with gpu_lock:
                             detected, seg_mask = detector.detect(rgb, conf_thresh=conf)
                         if not detected:
-                            save_image(Image.fromarray(rgb), out_img_path)
+                            _save_page_output(
+                                Image.fromarray(rgb),
+                                out_img_path,
+                                source_img_path=img_path,
+                                prev_output_path=prev_out_path,
+                            )
                             doc = PageDocument(
                                 image_path=str(img_path.resolve()),
                                 cleaned_image_path=str(out_img_path.resolve()),
+                                output_image_path=str(out_img_path.resolve()),
                                 width=w,
                                 height=h,
                                 mode="translate",
@@ -1640,10 +1924,16 @@ def run_translate_pipeline(
                                     region_items, rt_ocr_texts, skip_sfx=skip_sfx
                                 )
                                 if not untranslated_ids:
-                                    save_image(Image.fromarray(rgb), out_img_path)
+                                    _save_page_output(
+                                        Image.fromarray(rgb),
+                                        out_img_path,
+                                        source_img_path=img_path,
+                                        prev_output_path=prev_out_path,
+                                    )
                                     doc = PageDocument(
                                         image_path=str(img_path.resolve()),
                                         cleaned_image_path=str(out_img_path.resolve()),
+                                        output_image_path=str(out_img_path.resolve()),
                                         width=w,
                                         height=h,
                                         mode="translate",
@@ -1691,6 +1981,7 @@ def run_translate_pipeline(
                                             detected,
                                             region_items,
                                             filtered_ocr,
+                                            prev_out_path,
                                         )
                                     )
                                     if len(pending_ocr_pages) >= 4:
@@ -1730,6 +2021,7 @@ def run_translate_pipeline(
                                     detected,
                                     region_items,
                                     ocr_texts,
+                                    prev_out_path,
                                 )
                             )
                             if len(pending_ocr_pages) >= 4:
@@ -1752,6 +2044,7 @@ def run_translate_pipeline(
                             seg_mask=seg_mask,
                             detected=detected,
                             region_items=region_items,
+                            prev_out_path=prev_out_path,
                         )
                         if not _q_put(translate_queue, task, abort_event, hooks):
                             return
@@ -1933,7 +2226,12 @@ def run_translate_pipeline(
                 if not fallback_done:
                     if not skip_blocked:
                         raise
-                    save_image(Image.fromarray(task.rgb), task.out_img_path)
+                    _save_page_output(
+                        Image.fromarray(task.rgb),
+                        task.out_img_path,
+                        source_img_path=task.img_path,
+                        prev_output_path=task.prev_out_path,
+                    )
                     _emit_step(
                         idx,
                         task.img_path.name,
@@ -2024,6 +2322,7 @@ def run_translate_pipeline(
                     detected=eff_detected,
                     translated_items=translated_items,
                     summary=summary,
+                    prev_out_path=task.prev_out_path,
                 ),
                 abort_event,
                 hooks,
@@ -2079,9 +2378,15 @@ def run_translate_pipeline(
                     if not batch_res:
                         if not skip_blocked:
                             raise exc
-                        for idx, img_path, out_img_path, *_ in chunk:
+                        for idx, img_path, out_img_path, *_rest in chunk:
+                            prev_out_p = _rest[-1] if _rest else None
                             rgb_orig = load_rgb(img_path)
-                            save_image(Image.fromarray(rgb_orig), out_img_path)
+                            _save_page_output(
+                                Image.fromarray(rgb_orig),
+                                out_img_path,
+                                source_img_path=img_path,
+                                prev_output_path=prev_out_p if isinstance(prev_out_p, Path) else None,
+                            )
                             _emit_step(
                                 idx,
                                 img_path.name,
@@ -2090,7 +2395,7 @@ def run_translate_pipeline(
                             )
                         return
 
-            for idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, det_list, reg_items, _ocrs in chunk:
+            for idx, img_path, out_img_path, json_path, clean_path, w, h, seg_bytes, det_list, reg_items, _ocrs, prev_out_p in chunk:
                 sub_items, summary = batch_res.get(idx, (reg_items, ""))
                 sub_map = {r.id: r for r in sub_items}
                 translated_items = [sub_map.get(r.id, r) for r in reg_items]
@@ -2159,6 +2464,7 @@ def run_translate_pipeline(
                         detected=eff_det_list,
                         translated_items=translated_items,
                         summary=summary,
+                        prev_out_path=prev_out_p,
                     ),
                     abort_event,
                     hooks,
@@ -2221,6 +2527,7 @@ def run_translate_pipeline(
                     doc = PageDocument(
                         image_path=str(rtask.img_path.resolve()),
                         cleaned_image_path=str(rtask.clean_path.resolve()),
+                        output_image_path=str(rtask.out_img_path.resolve()),
                         width=rtask.w,
                         height=rtask.h,
                         mode="translate",
@@ -2232,7 +2539,12 @@ def run_translate_pipeline(
 
                     final_img = render_document(clean_rgb, doc)
                     rendered_ok = _image_has_rendered_text_diff(final_img, rtask.rgb, clean_rgb)
-                    save_image(final_img, rtask.out_img_path)
+                    _save_page_output(
+                        final_img,
+                        rtask.out_img_path,
+                        source_img_path=rtask.img_path,
+                        prev_output_path=rtask.prev_out_path,
+                    )
                     with state_lock:
                         docs_by_idx[rtask.idx] = doc
                         out_paths_by_idx[rtask.idx] = rtask.out_img_path
@@ -2401,9 +2713,20 @@ def run_compose_pipeline(
     source_zip_fp = _capture_source_zip_fingerprint(input_path) if delete_source_zip else None
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        all_images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        all_images, base_name = collect_inputs(input_path, Path(tmp_dir), exclude_dir=output)
         if not all_images:
             raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
+
+        out_dir = output or input_path.parent / f"{base_name}_composed"
+        if input_path.is_dir():
+            try:
+                out_res = out_dir.resolve()
+                if out_res != input_path.resolve():
+                    all_images = [p for p in all_images if not p.resolve().is_relative_to(out_res)]
+            except OSError:
+                pass
+            if not all_images:
+                raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
 
         orig_total = len(all_images)
         indexed_images: list[tuple[int, Path]] = list(enumerate(all_images, start=1))
@@ -2413,7 +2736,6 @@ def run_compose_pipeline(
             indexed_images = [(orig_idx, p) for orig_idx, p in indexed_images if orig_idx in chosen_nums]
         images = [p for _, p in indexed_images]
 
-        out_dir = output or input_path.parent / f"{base_name}_composed"
         cache_dir = out_dir / ".koharu_cache"
         out_dir.mkdir(parents=True, exist_ok=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2546,36 +2868,72 @@ def run_compose_pipeline(
                 sheet_results = {}
 
         seq_pad = max(3, len(str(orig_total)))
-        stem_counts = Counter(p.stem for p in all_images)
+        stem_counts = Counter(p.stem.lower() for p in all_images)
         for idx, (orig_idx, img_path) in enumerate(indexed_images, start=1):
             hooks.check_cancelled()
             cache_stem = _cache_stem_for_page(img_path, orig_idx, seq_pad, stem_counts)
             out_img_path = out_dir / _output_image_name(
                 img_path,
                 output_format=output_format,
-                seq_index=orig_idx if (sequential_names or stem_counts[img_path.stem] > 1) else None,
+                seq_index=orig_idx if (sequential_names or stem_counts[img_path.stem.lower()] > 1) else None,
                 seq_pad=seq_pad,
             )
             json_path = cache_dir / f"{cache_stem}.koharu.json"
 
-            if resume and out_img_path.is_file() and json_path.is_file():
-                prev_doc = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
-                if prev_doc.page_summary:
-                    previous_summaries.append(prev_doc.page_summary)
-                docs.append(prev_doc)
-                docs_by_idx[idx] = prev_doc
-                out_paths_by_idx[idx] = out_img_path
-                if source_zip_fp is not None:
-                    try:
-                        with Image.open(out_img_path) as resumed_im:
-                            rendered_verified_by_idx[idx] = _image_has_rendered_text_diff(
-                                resumed_im, load_rgb(img_path)
-                            )
-                    except Exception:
-                        rendered_verified_by_idx[idx] = False
-                hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua ảnh đã sáng tác (--resume)")
-                hooks.emit_page_done(idx, total, img_path.name, prev_doc, out_img_path)
-                continue
+            prev_doc_cached: PageDocument | None = None
+            prev_out_path: Path | None = None
+            if json_path.is_file():
+                try:
+                    prev_doc_cached = PageDocument.model_validate_json(json_path.read_text(encoding="utf-8"))
+                    if prev_doc_cached.output_image_path:
+                        prev_out_path = Path(prev_doc_cached.output_image_path)
+                except Exception:
+                    prev_doc_cached = None
+
+            if resume and prev_doc_cached is not None:
+                existing_out: Path | None = None
+                if out_img_path.is_file():
+                    existing_out = out_img_path
+                    _cleanup_stale_page_outputs(
+                        out_img_path,
+                        source_img_path=img_path,
+                        prev_output_path=prev_out_path,
+                    )
+                elif (
+                    prev_out_path is not None
+                    and prev_out_path.is_file()
+                    and prev_out_path.parent.resolve() == out_dir.resolve()
+                ):
+                    with Image.open(prev_out_path) as old_im:
+                        _save_page_output(
+                            old_im,
+                            out_img_path,
+                            source_img_path=img_path,
+                            prev_output_path=prev_out_path,
+                        )
+                    prev_doc_cached = prev_doc_cached.model_copy(
+                        update={"output_image_path": str(out_img_path.resolve())}
+                    )
+                    json_path.write_text(prev_doc_cached.model_dump_json(indent=2), encoding="utf-8")
+                    existing_out = out_img_path
+
+                if existing_out is not None:
+                    if prev_doc_cached.page_summary:
+                        previous_summaries.append(prev_doc_cached.page_summary)
+                    docs.append(prev_doc_cached)
+                    docs_by_idx[idx] = prev_doc_cached
+                    out_paths_by_idx[idx] = existing_out
+                    if source_zip_fp is not None:
+                        try:
+                            with Image.open(existing_out) as resumed_im:
+                                rendered_verified_by_idx[idx] = _image_has_rendered_text_diff(
+                                    resumed_im, load_rgb(img_path)
+                                )
+                        except Exception:
+                            rendered_verified_by_idx[idx] = False
+                    hooks.emit_step(idx, total, img_path.name, "skip", "Bỏ qua ảnh đã sáng tác (--resume)")
+                    hooks.emit_page_done(idx, total, img_path.name, prev_doc_cached, existing_out)
+                    continue
 
             rgb = load_rgb(img_path)
             h, w = rgb.shape[:2]
@@ -2604,7 +2962,12 @@ def run_compose_pipeline(
                         tags=tags,
                     )
                 except ContentBlockedError as exc:
-                    save_image(Image.fromarray(rgb), out_img_path)
+                    _save_page_output(
+                        Image.fromarray(rgb),
+                        out_img_path,
+                        source_img_path=img_path,
+                        prev_output_path=prev_out_path,
+                    )
                     hooks.emit_step(
                         idx,
                         total,
@@ -2627,6 +2990,7 @@ def run_compose_pipeline(
             doc = PageDocument(
                 image_path=str(img_path.resolve()),
                 cleaned_image_path=str(img_path.resolve()),
+                output_image_path=str(out_img_path.resolve()),
                 width=w,
                 height=h,
                 mode="compose",
@@ -2638,7 +3002,12 @@ def run_compose_pipeline(
 
             final_img = render_document(rgb, doc)
             rendered_ok = _image_has_rendered_text_diff(final_img, rgb)
-            save_image(final_img, out_img_path)
+            _save_page_output(
+                final_img,
+                out_img_path,
+                source_img_path=img_path,
+                prev_output_path=prev_out_path,
+            )
             docs.append(doc)
             docs_by_idx[idx] = doc
             out_paths_by_idx[idx] = out_img_path
@@ -2679,8 +3048,8 @@ def run_rerender_pipeline(
     *,
     font: str | None = None,
     font_scale: float = 1.0,
-    output_format: str = "original",
-    sequential_names: bool = False,
+    output_format: str | None = None,
+    sequential_names: bool | None = None,
     hooks: PipelineHooks | None = None,
 ) -> list[PageDocument]:
     """Re-render cached `.koharu.json` pages locally without calling any API or ML detector."""
@@ -2692,6 +3061,7 @@ def run_rerender_pipeline(
 
     total = len(json_files)
     seq_pad = max(3, len(str(total)))
+    out_dir_res = output_dir.resolve()
     docs: list[PageDocument] = []
     for idx, jp in enumerate(json_files, start=1):
         hooks.check_cancelled()
@@ -2710,16 +3080,29 @@ def run_rerender_pipeline(
                     reg.font_size = max(10.0, solved.font_size * font_scale)
 
         orig_path = Path(doc.image_path)
-        out_name = _output_image_name(
-            orig_path,
-            output_format=output_format,
-            seq_index=idx if sequential_names else None,
-            seq_pad=seq_pad,
+        prev_out = Path(doc.output_image_path) if doc.output_image_path else None
+        reuse_prev = (
+            output_format is None
+            and sequential_names is None
+            and prev_out is not None
+            and prev_out.parent.resolve() == out_dir_res
         )
+        if reuse_prev and prev_out is not None:
+            out_name = prev_out.name
+        else:
+            out_name = _output_image_name(
+                orig_path,
+                output_format=output_format or "original",
+                seq_index=idx if bool(sequential_names) else None,
+                seq_pad=seq_pad,
+            )
         out_path = output_dir / out_name
         hooks.emit_step(idx, total, out_name, "render", "Render lại ảnh từ .koharu.json...")
         out_img = render_document(base_rgb, doc)
-        save_image(out_img, out_path)
+        _save_page_output(out_img, out_path, prev_output_path=prev_out)
+        if doc.output_image_path != str(out_path.resolve()):
+            doc = doc.model_copy(update={"output_image_path": str(out_path.resolve())})
+            jp.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
         docs.append(doc)
         hooks.emit_page_done(idx, total, out_name, doc, out_path)
 
@@ -2740,7 +3123,7 @@ def pack_images_to_webp(
     """
     hooks = hooks or PipelineHooks()
     with tempfile.TemporaryDirectory() as tmp_dir:
-        images, base_name = collect_inputs(input_path, Path(tmp_dir))
+        images, base_name = collect_inputs(input_path, Path(tmp_dir), exclude_dir=output)
         if not images:
             raise ValueError("Không tìm thấy ảnh hợp lệ nào trong đường dẫn đã chọn.")
 
@@ -2796,6 +3179,6 @@ def pack_images_to_webp(
             hooks.emit_step(idx, total, img_path.name, "pack", f"Chuyển {img_path.name} -> {out_name} (WebP 100%)")
             dest = out_dir / out_name
             with Image.open(img_path) as im:
-                save_image(im, dest)
+                _save_page_output(im, dest, source_img_path=img_path)
             written.append(dest)
         return out_dir, written

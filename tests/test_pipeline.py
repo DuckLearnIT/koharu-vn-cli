@@ -3920,3 +3920,108 @@ def test_conjoined_bubbles_and_rendered_lines_never_collide():
     canvas = Image.new("RGBA", (img_w, img_h), (255, 255, 255, 255))
     rendered = render_text_regions(canvas, adapted)
     assert rendered.size == (img_w, img_h)
+
+
+def test_no_duplicate_pages_from_cache_zip_resume_or_rerender(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure CLI never doubles pages from .koharu_cache, duplicate zip copies, format switches, or rerender."""
+    import io
+    import zipfile
+    from koharu_vn_cli.pipeline.detector import DetectedRegion
+    from koharu_vn_cli.pipeline.runner import (
+        IMAGE_EXTS,
+        collect_inputs,
+        run_rerender_pipeline,
+        run_translate_pipeline,
+    )
+
+    # 1. ZIP containing .koharu_cache/*.clean.png + case-variant + copy duplicate -> yields ONLY 2 unique pages
+    zpath = tmp_path / "dirty_archive.zip"
+    buf1 = io.BytesIO()
+    Image.new("RGB", (120, 160), (220, 40, 40)).save(buf1, format="PNG")
+    buf2 = io.BytesIO()
+    Image.new("RGB", (120, 160), (40, 180, 90)).save(buf2, format="PNG")
+    buf2_jpg = io.BytesIO()
+    Image.new("RGB", (120, 160), (40, 180, 90)).save(buf2_jpg, format="JPEG", quality=96)
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("001.png", buf1.getvalue())
+        zf.writestr("001 (1).png", buf1.getvalue())  # accidental duplicate copy
+        zf.writestr("001.PNG", buf1.getvalue())  # case-variant duplicate on Linux
+        zf.writestr(".koharu_cache/001.clean.png", buf1.getvalue())  # cache image
+        zf.writestr("002.png", buf2.getvalue())
+        zf.writestr("002.jpg", buf2_jpg.getvalue())  # same-folder re-encode duplicate
+        zf.writestr(".koharu_cache/002.clean.png", buf2.getvalue())
+
+    collected, _ = collect_inputs(zpath, tmp_path / "ext_dirty")
+    assert len(collected) == 2
+    assert [p.stem for p in collected] == ["001", "002"]
+
+    # 2. Translating with PNG then resuming with WebP + seq_names AND running rerender never doubles pages!
+    in_dir = tmp_path / "comic_src"
+    in_dir.mkdir()
+    Image.new("RGB", (200, 260), (245, 245, 245)).save(in_dir / "page_a.png")
+    Image.new("RGB", (200, 260), (235, 235, 245)).save(in_dir / "page_b.png")
+
+    class FakeDet:
+        def detect(self, rgb, conf_thresh: float = 0.34):
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            return [DetectedRegion((30, 30, 150, 100), (20, 20, 160, 110), None, True, False, 0.9)], mask
+
+    class FakeInp:
+        def inpaint(self, rgb, mask):
+            return rgb.copy()
+
+    class FakeCache:
+        def get_detector(self, accurate=True, use_gpu=True):
+            return FakeDet()
+
+        def get_inpainter(self, use_gpu=True):
+            return FakeInp()
+
+    llm_calls = {"n": 0}
+
+    def fake_translate_page(self, rgb, regions, **kwargs):
+        llm_calls["n"] += 1
+        return [r.model_copy(update={"source_text": "こんにちは", "translated_text": "Xin chào!"}) for r in regions], ""
+
+    monkeypatch.setattr("koharu_vn_cli.pipeline.gemini_client.VisionLLMClient.translate_page", fake_translate_page)
+
+    out_dir = tmp_path / "comic_out"
+    # Run 1: original PNG without seq_names (keep_cache=True so resume/rerender can use it)
+    _, docs1 = run_translate_pipeline(
+        in_dir,
+        output=out_dir,
+        api_key="dummy",
+        story_pass=False,
+        output_format="png",
+        sequential_names=False,
+        clean_cache=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs1) == 2
+    assert llm_calls["n"] == 2
+    imgs_after_r1 = [p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    assert sorted(p.name for p in imgs_after_r1) == ["page_a.png", "page_b.png"]
+
+    # Run 2: --resume switching to WebP + sequential_names -> migrates files cleanly with 0 API calls & 0 duplicates!
+    _, docs2 = run_translate_pipeline(
+        in_dir,
+        output=out_dir,
+        api_key="dummy",
+        story_pass=False,
+        output_format="webp",
+        sequential_names=True,
+        resume=True,
+        clean_cache=False,
+        model_cache=FakeCache(),  # type: ignore[arg-type]
+    )
+    assert len(docs2) == 2
+    assert llm_calls["n"] == 2  # skipped via resume migration!
+    imgs_after_r2 = [p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    assert sorted(p.name for p in imgs_after_r2) == ["001.webp", "002.webp"]
+
+    # Run 3: rerender with default None format/seq_names keeps exact 001.webp / 002.webp (never adds page_a.png!)
+    run_rerender_pipeline(out_dir)
+    imgs_after_rr = [p for p in out_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    assert sorted(p.name for p in imgs_after_rr) == ["001.webp", "002.webp"]

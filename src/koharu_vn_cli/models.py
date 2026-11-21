@@ -141,6 +141,7 @@ class PageDocument(BaseModel):
     version: int = 1
     image_path: str
     cleaned_image_path: str | None = None
+    output_image_path: str | None = None
     width: int
     height: int
     mode: Literal["translate", "compose"]

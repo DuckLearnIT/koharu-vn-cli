@@ -2807,8 +2807,8 @@ class KoharuTUI(App[None]):
             docs = run_rerender_pipeline(
                 output_dir,
                 font=self.cfg.font,
-                output_format="original",
-                sequential_names=False,
+                output_format=None,
+                sequential_names=None,
                 hooks=self._build_hooks(),
             )
             self.call_from_thread(self._set_job_ui, False, f"[green]Rerender {len(docs)} trang![/green]", 100.0)
