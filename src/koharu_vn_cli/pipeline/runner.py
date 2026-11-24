@@ -39,8 +39,12 @@ from koharu_vn_cli.pipeline.gemini_client import (
     _PLACEHOLDER_TEXTS,
     DEEPSEEK_BASE_URL,
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_GROQ_TEXT_MODEL,
+    GROQ_BASE_URL,
     ContentBlockedError,
     VisionLLMClient,
+    is_deepseek_model,
+    is_groq_model,
     is_text_only_model,
     looks_like_floating_sfx,
     normalize_source_key,
@@ -2093,7 +2097,7 @@ def run_translate_pipeline(
                             api_key=api_key,
                             api_keys=api_keys,
                             model=fb_m,
-                            base_url=None if fb_m.lower().startswith("deepseek-") else base_url,
+                            base_url=None if (is_deepseek_model(fb_m) or is_groq_model(fb_m)) else base_url,
                             on_status=w_llm.on_status,
                         )
                         seen_models.add(fb_m)
@@ -2123,6 +2127,25 @@ def run_translate_pipeline(
                         )
                         seen_models.add("deepseek-chat")
                         chain.append(ds_client)
+                except Exception:
+                    pass
+            if DEFAULT_GROQ_TEXT_MODEL not in seen_models:
+                try:
+                    from koharu_vn_cli.config import load_config
+
+                    groq_keys = load_config().effective_api_keys(
+                        model=DEFAULT_GROQ_TEXT_MODEL, base_url=GROQ_BASE_URL
+                    )
+                    if groq_keys:
+                        groq_client = VisionLLMClient(
+                            api_key=groq_keys[0],
+                            api_keys=groq_keys,
+                            model=DEFAULT_GROQ_TEXT_MODEL,
+                            base_url=GROQ_BASE_URL,
+                            on_status=w_llm.on_status,
+                        )
+                        seen_models.add(DEFAULT_GROQ_TEXT_MODEL)
+                        chain.append(groq_client)
                 except Exception:
                     pass
             return chain

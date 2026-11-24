@@ -36,10 +36,13 @@ from koharu_vn_cli.pipeline.detector import active_ort_provider_label
 from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import (
     DEEPSEEK_BASE_URL,
+    GROQ_BASE_URL,
     VisionLLMClient,
     get_key_health_tracker,
     is_deepseek_endpoint,
     is_deepseek_model,
+    is_groq_endpoint,
+    is_groq_model,
 )
 from koharu_vn_cli.pipeline.runner import (
     IMAGE_EXTS,
@@ -98,7 +101,7 @@ SLASH_COMMANDS: tuple[SlashSpec, ...] = (
     SlashSpec("/fallback", "[tên_model|off]", "Chọn Model fallback cho PHỤ khi hết quota (tự đổi sang model này)"),
     SlashSpec("/story-model", "[tên_model|off]", "Chọn Model CHÍNH (mạnh) cho Pass 1 cốt truyện & nhân vật"),
     SlashSpec("/story-fallback", "[tên_model|off]", "Chọn Model fallback cho CHÍNH khi bị prohibit (thử 1 lượt rồi bỏ qua)"),
-    SlashSpec("/key", "", "Cài đặt GEMINI_API_KEY & --base-url tùy chọn"),
+    SlashSpec("/key", "", "Cài đặt API Key (Gemini / DeepSeek / Groq) & --base-url tùy chọn"),
     SlashSpec("/prompt", "[nội_dung]", "Đặt gợi ý xưng hô / văn phong mặc định"),
     SlashSpec("/tags", "[vanilla, NTR, ...]", "Đặt tag thể loại cho sáng tác CG & dịch (vd: vanilla, NTR)"),
     SlashSpec("/story", "[chữ_hoặc_file.txt]", "Nạp cốt truyện / tên nhân vật / lore trước khi dịch"),
@@ -141,6 +144,10 @@ MODEL_CHOICES: list[tuple[str, str]] = [
     ("gemini-4-carbon", "Gemini 4 Carbon (Frontier flagship)"),
     ("deepseek-chat", "DeepSeek V3 Chat (api.deepseek.com — OCR cục bộ + dịch text)"),
     ("deepseek-reasoner", "DeepSeek R1 Reasoner (api.deepseek.com — suy luận sâu, OCR cục bộ)"),
+    ("meta-llama/llama-4-scout-17b-16e-instruct", "Groq Llama 4 Scout (Vision + siêu nhanh, api.groq.com)"),
+    ("meta-llama/llama-4-maverick-17b-128e-instruct", "Groq Llama 4 Maverick (Vision mạnh, api.groq.com)"),
+    ("llama-3.3-70b-versatile", "Groq Llama 3.3 70B (Siêu nhanh, OCR cục bộ + dịch text)"),
+    ("qwen/qwen3-32b", "Groq Qwen3 32B (Mạnh Nhật/Trung/Hàn → Việt, OCR cục bộ)"),
 ]
 
 THEME_CHOICES: list[tuple[str, str]] = [
@@ -460,8 +467,8 @@ class PickerModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class KeySetupModal(ModalScreen[tuple[str, str, str] | None]):
-    """Input dialog supporting independent Gemini/Proxy keys, DeepSeek keys, and optional base URL."""
+class KeySetupModal(ModalScreen[tuple[str, str, str, str] | None]):
+    """Input dialog supporting independent Gemini/Proxy keys, DeepSeek keys, Groq keys, and optional base URL."""
 
     BINDINGS = [Binding("escape", "cancel", "Hủy")]
 
@@ -469,18 +476,20 @@ class KeySetupModal(ModalScreen[tuple[str, str, str] | None]):
         self,
         current_key: str,
         current_deepseek_key: str,
-        current_base_url: str | None,
+        current_groq_key: str = "",
+        current_base_url: str | None = None,
     ) -> None:
         super().__init__()
         self.current_key = current_key
         self.current_deepseek_key = current_deepseek_key
+        self.current_groq_key = current_groq_key
         self.current_base_url = current_base_url or ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-card"):
-            yield Label("Cấu hình API Key độc lập (Gemini / DeepSeek / Proxy)", id="modal-title")
+            yield Label("Cấu hình API Key độc lập (Gemini / DeepSeek / Groq / Proxy)", id="modal-title")
             yield Label(
-                "2 ô nhập key hoàn toàn tách biệt — thêm DeepSeek không làm mất key & setup Gemini cũ. Hỗ trợ nhiều key cách nhau bởi dấu phẩy (,).",
+                "3 ô nhập key hoàn toàn tách biệt — thêm Groq/DeepSeek không làm mất key & setup cũ. Hỗ trợ nhiều key cách nhau bởi dấu phẩy (,).",
                 id="modal-subtitle",
             )
             yield Label("1. GEMINI_API_KEY / Proxy Key (giữ nguyên setup cũ):")
@@ -497,7 +506,14 @@ class KeySetupModal(ModalScreen[tuple[str, str, str] | None]):
                 placeholder="sk-...",
                 id="deepseek-key-input",
             )
-            yield Label("Base URL tùy chọn (chỉ áp dụng cho Proxy / OpenAI-compatible, không ảnh hưởng DeepSeek):")
+            yield Label("3. GROQ_API_KEY (độc lập, dùng cho Llama 4 Vision / Llama 3.3 / Qwen3 trên api.groq.com):")
+            yield Input(
+                value=self.current_groq_key,
+                password=False,
+                placeholder="gsk_...",
+                id="groq-key-input",
+            )
+            yield Label("Base URL tùy chọn (chỉ áp dụng cho Proxy / OpenAI-compatible, không ảnh hưởng DeepSeek / Groq):")
             yield Input(
                 value=self.current_base_url,
                 placeholder="https://openrouter.ai/api/v1 | https://api.x.ai/v1 | http://127.0.0.1:11434/v1",
@@ -514,8 +530,9 @@ class KeySetupModal(ModalScreen[tuple[str, str, str] | None]):
     def _save(self) -> None:
         k = self.query_one("#key-input", Input).value.strip()
         ds_k = self.query_one("#deepseek-key-input", Input).value.strip()
+        groq_k = self.query_one("#groq-key-input", Input).value.strip()
         u = self.query_one("#url-input", Input).value.strip()
-        self.dismiss((k, ds_k, u))
+        self.dismiss((k, ds_k, groq_k, u))
 
     @on(Button.Pressed, "#cancel-btn")
     def _cancel(self) -> None:
@@ -1155,7 +1172,9 @@ class KoharuTUI(App[None]):
             else f"{self.cfg.workers} luồng"
         )
         eff_endpoint_label = (
-            "DeepSeek Official"
+            "Groq Official"
+            if is_groq_endpoint(self.cfg.base_url) or (not self.cfg.base_url and is_groq_model(self.cfg.model))
+            else "DeepSeek Official"
             if is_deepseek_endpoint(self.cfg.base_url) or (not self.cfg.base_url and is_deepseek_model(self.cfg.model))
             else (self.cfg.base_url or "Gemini Official")
         )
@@ -1167,6 +1186,8 @@ class KoharuTUI(App[None]):
         )
         ds_key_ok = bool(self.cfg.effective_api_keys(model="deepseek-chat"))
         ds_badge = f"[green]● {escape_markup(self.cfg.masked_deepseek_key())}[/green]" if ds_key_ok else "[dim]chưa đặt[/dim]"
+        groq_key_ok = bool(self.cfg.effective_api_keys(model="llama-3.3-70b-versatile", base_url=GROQ_BASE_URL))
+        groq_badge = f"[green]● {escape_markup(self.cfg.masked_groq_key())}[/green]" if groq_key_ok else "[dim]chưa đặt[/dim]"
         tags_raw = (self.cfg.tags[:30] + "...") if len(self.cfg.tags) > 30 else (self.cfg.tags or "chưa đặt")
         prompt_raw = (
             (self.cfg.custom_prompt[:46] + "...")
@@ -1183,6 +1204,7 @@ class KoharuTUI(App[None]):
             f"Endpoint: [dim]{escape_markup(eff_endpoint_label)}[/dim]\n"
             f"Key Gemini: {gem_badge}\n"
             f"Key DeepSeek: {ds_badge}\n"
+            f"Key Groq: {groq_badge}\n"
             f"Ngôn ngữ: [cyan]{escape_markup(self.cfg.lang)}[/cyan]\n"
             f"CG Style: [magenta]{escape_markup(self.cfg.compose_style.value)}[/magenta]\n"
             f"Mật độ CG: [cyan]{escape_markup(self.cfg.density)}[/cyan]\n"
@@ -1671,14 +1693,23 @@ class KoharuTUI(App[None]):
         elif cmd == "/key":
             if rest:
                 keys = parse_api_keys(rest)
-                if keys and all(k.startswith("sk-") for k in keys):
+                if keys and all(k.startswith("gsk_") for k in keys):
+                    self.cfg.groq_api_keys = keys
+                    self.cfg.groq_api_key = keys[0]
+                    save_config(self.cfg)
+                    get_key_health_tracker().reset_keys()
+                    self._refresh_chrome()
+                    self._log_ai(
+                        f"Đã lưu {len(keys)} Groq API key ({self.cfg.masked_groq_key()}) — key Gemini/DeepSeek cũ vẫn giữ nguyên."
+                    )
+                elif keys and all(k.startswith("sk-") for k in keys):
                     self.cfg.deepseek_api_keys = keys
                     self.cfg.deepseek_api_key = keys[0]
                     save_config(self.cfg)
                     get_key_health_tracker().reset_keys()
                     self._refresh_chrome()
                     self._log_ai(
-                        f"Đã lưu {len(keys)} DeepSeek API key ({self.cfg.masked_deepseek_key()}) — key Gemini cũ vẫn giữ nguyên."
+                        f"Đã lưu {len(keys)} DeepSeek API key ({self.cfg.masked_deepseek_key()}) — key Gemini/Groq cũ vẫn giữ nguyên."
                     )
                 else:
                     self.cfg.api_keys = keys
@@ -1690,8 +1721,9 @@ class KoharuTUI(App[None]):
             else:
                 saved_raw = ", ".join(self.cfg.api_keys) if self.cfg.api_keys else self.cfg.api_key
                 saved_ds = ", ".join(self.cfg.deepseek_api_keys) if self.cfg.deepseek_api_keys else self.cfg.deepseek_api_key
+                saved_groq = ", ".join(self.cfg.groq_api_keys) if self.cfg.groq_api_keys else self.cfg.groq_api_key
                 self.push_screen(
-                    KeySetupModal(saved_raw, saved_ds, self.cfg.base_url),
+                    KeySetupModal(saved_raw, saved_ds, saved_groq, self.cfg.base_url),
                     self._on_key_saved,
                 )
         elif cmd == "/prompt":
@@ -2010,16 +2042,17 @@ class KoharuTUI(App[None]):
     def _has_any_api_for_models(self) -> bool:
         gem_keys = self.cfg.effective_api_keys(model="gemini-3.8-flash", base_url=self.cfg.base_url or "")
         ds_keys = self.cfg.effective_api_keys(model="deepseek-chat", base_url=DEEPSEEK_BASE_URL)
-        return bool(gem_keys or ds_keys or self.cfg.base_url)
+        groq_keys = self.cfg.effective_api_keys(model="llama-3.3-70b-versatile", base_url=GROQ_BASE_URL)
+        return bool(gem_keys or ds_keys or groq_keys or self.cfg.base_url)
 
     def action_choose_model(self) -> None:
         if self._has_any_api_for_models():
-            self._log_ai("Đang truy vấn API lấy danh sách model mới nhất (Gemini / DeepSeek)...", "dim")
+            self._log_ai("Đang truy vấn API lấy danh sách model mới nhất (Gemini / DeepSeek / Groq)...", "dim")
             self._fetch_remote_models_and_pick("model")
             return
         self._open_picker(
             "Chọn Model PHỤ (dịch & sáng tác thoại nhanh)",
-            "Gõ /key để kết nối API và tự động cập nhật model mới từ Google / DeepSeek",
+            "Gõ /key để kết nối API và tự động cập nhật model mới từ Google / DeepSeek / Groq",
             MODEL_CHOICES,
             self.cfg.model,
             self._set_model,
@@ -2105,6 +2138,22 @@ class KoharuTUI(App[None]):
                     sources_ok.append(f"{len(ds_remote)} DeepSeek")
             except Exception as exc:
                 errors.append(f"DeepSeek: {str(exc)[:45]}")
+
+        groq_keys = self.cfg.effective_api_keys(model="llama-3.3-70b-versatile", base_url=GROQ_BASE_URL)
+        if groq_keys:
+            try:
+                groq_client = VisionLLMClient(
+                    api_key=groq_keys[0],
+                    api_keys=groq_keys,
+                    model="llama-3.3-70b-versatile",
+                    base_url=GROQ_BASE_URL,
+                )
+                groq_remote = groq_client.list_available_models(limit=25)
+                if groq_remote:
+                    remote_all.extend(groq_remote)
+                    sources_ok.append(f"{len(groq_remote)} Groq")
+            except Exception as exc:
+                errors.append(f"Groq: {str(exc)[:45]}")
 
         if remote_all:
             deduped: list[tuple[str, str]] = []
@@ -2248,16 +2297,19 @@ class KoharuTUI(App[None]):
         except Exception as exc:
             self._log_ai(f"Không áp dụng được theme '{escape_markup(value)}': {escape_markup(str(exc))}", style="red")
 
-    def _on_key_saved(self, result: tuple[str, str, str] | None) -> None:
+    def _on_key_saved(self, result: tuple[str, str, str, str] | None) -> None:
         if result is None:
             return
-        raw_keys, raw_ds_keys, url = result
+        raw_keys, raw_ds_keys, raw_groq_keys, url = result
         keys = parse_api_keys(raw_keys)
         ds_keys = parse_api_keys(raw_ds_keys)
+        groq_keys = parse_api_keys(raw_groq_keys)
         self.cfg.api_keys = keys
         self.cfg.api_key = keys[0] if keys else ""
         self.cfg.deepseek_api_keys = ds_keys
         self.cfg.deepseek_api_key = ds_keys[0] if ds_keys else ""
+        self.cfg.groq_api_keys = groq_keys
+        self.cfg.groq_api_key = groq_keys[0] if groq_keys else ""
         self.cfg.base_url = url or None
         save_config(self.cfg)
         get_key_health_tracker().reset_keys()
@@ -2265,7 +2317,8 @@ class KoharuTUI(App[None]):
         self._log_ai(
             f"Đã lưu cấu hình vào [dim]{CONFIG_FILE}[/dim] "
             f"(Gemini/Proxy: {self.cfg.masked_api_key(model='gemini-3.8-flash', base_url=self.cfg.base_url or '')} | "
-            f"DeepSeek: {self.cfg.masked_deepseek_key()})."
+            f"DeepSeek: {self.cfg.masked_deepseek_key()} | "
+            f"Groq: {self.cfg.masked_groq_key()})."
         )
 
     def _open_last_output(self) -> None:
@@ -2301,12 +2354,13 @@ class KoharuTUI(App[None]):
     def _ensure_llm_ready(self, needs_llm: bool = True) -> bool:
         if needs_llm and not self.cfg.effective_api_key() and not self.cfg.base_url:
             self._log_ai(
-                "Chưa có `GEMINI_API_KEY`! Mở hộp thoại `/key` để dán API key (hoặc base URL proxy) trước nhé.",
+                "Chưa có API Key cho model hiện tại! Mở hộp thoại `/key` để dán API key (Gemini / DeepSeek / Groq / Proxy) trước nhé.",
                 style="yellow",
             )
             saved_raw = ", ".join(self.cfg.api_keys) if self.cfg.api_keys else self.cfg.api_key
             saved_ds = ", ".join(self.cfg.deepseek_api_keys) if self.cfg.deepseek_api_keys else self.cfg.deepseek_api_key
-            self.push_screen(KeySetupModal(saved_raw, saved_ds, self.cfg.base_url), self._on_key_saved)
+            saved_groq = ", ".join(self.cfg.groq_api_keys) if self.cfg.groq_api_keys else self.cfg.groq_api_key
+            self.push_screen(KeySetupModal(saved_raw, saved_ds, saved_groq, self.cfg.base_url), self._on_key_saved)
             return False
         return True
 

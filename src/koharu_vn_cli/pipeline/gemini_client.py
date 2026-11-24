@@ -35,6 +35,35 @@ from koharu_vn_cli.pipeline.scene_cluster import SceneGroup
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODELS = ("deepseek-chat", "deepseek-reasoner")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
+GROQ_VISION_MODELS = (
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+)
+GROQ_MODELS = (
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3-32b",
+    "moonshotai/kimi-k2-instruct",
+    "openai/gpt-oss-120b",
+    "llama-3.1-8b-instant",
+)
+_GROQ_MODEL_PREFIXES = (
+    "meta-llama/llama-4-",
+    "llama-3.3-",
+    "llama-3.1-",
+    "llama3-",
+    "qwen/qwen3-",
+    "qwen-qwq-",
+    "moonshotai/kimi-k2",
+    "openai/gpt-oss-",
+    "compound-beta",
+    "groq/",
+    "gemma2-9b-it",
+    "mixtral-8x7b-",
+)
 
 
 def is_deepseek_model(model: str | None) -> bool:
@@ -47,11 +76,45 @@ def is_deepseek_endpoint(base_url: str | None) -> bool:
     return "api.deepseek.com" in (base_url or "").lower()
 
 
+def is_groq_endpoint(base_url: str | None) -> bool:
+    """Return True when base_url points to Groq's OpenAI-compatible API."""
+    return "api.groq.com" in (base_url or "").lower()
+
+
+def is_groq_vision_model(model: str | None) -> bool:
+    """Return True when a Groq model supports multimodal `image_url` vision inputs."""
+    low = (model or "").strip().lower()
+    return any(
+        tok in low
+        for tok in (
+            "llama-4-scout",
+            "llama-4-maverick",
+            "llama-3.2-11b-vision",
+            "llama-3.2-90b-vision",
+            "-vision",
+        )
+    )
+
+
+def is_groq_model(model: str | None) -> bool:
+    """Return True when the model ID targets Groq's API."""
+    low = (model or "").strip().lower()
+    if not low:
+        return False
+    if low in {m.lower() for m in GROQ_MODELS}:
+        return True
+    return low.startswith(_GROQ_MODEL_PREFIXES)
+
+
 def is_text_only_model(model: str | None, base_url: str | None = None) -> bool:
     """Return True when the target model/endpoint cannot accept image_url vision inputs."""
     if is_deepseek_endpoint(base_url):
         return True
-    return is_deepseek_model(model) and not base_url
+    if is_deepseek_model(model) and not base_url:
+        return True
+    if is_groq_endpoint(base_url) or (is_groq_model(model) and not base_url):
+        return not is_groq_vision_model(model)
+    return False
 
 
 class ContentBlockedError(RuntimeError):
@@ -142,6 +205,8 @@ def _endpoint_scope(base_url: str | None, model: str) -> str:
         return base_url.strip().rstrip("/").lower()
     if is_deepseek_model(model):
         return DEEPSEEK_BASE_URL.lower()
+    if is_groq_model(model):
+        return GROQ_BASE_URL.lower()
     return "gemini-official"
 
 
@@ -1057,6 +1122,9 @@ class VisionLLMClient:
         eff_base_url = base_url.rstrip("/") if base_url else None
         if not eff_base_url and is_deepseek_model(model):
             eff_base_url = DEEPSEEK_BASE_URL
+        elif not eff_base_url and is_groq_model(model):
+            eff_base_url = GROQ_BASE_URL
+        use_groq_keys = is_groq_model(model) or is_groq_endpoint(eff_base_url)
         use_deepseek_keys = is_deepseek_model(model) or is_deepseek_endpoint(eff_base_url)
 
         raw_sources: list[str] = []
@@ -1064,6 +1132,13 @@ class VisionLLMClient:
             raw_sources.extend(api_keys)
         env_sources = (
             (
+                api_key,
+                os.environ.get("GROQ_API_KEYS"),
+                os.environ.get("GROQ_API_KEY"),
+                os.environ.get("OPENAI_API_KEY"),
+            )
+            if use_groq_keys
+            else (
                 api_key,
                 os.environ.get("DEEPSEEK_API_KEYS"),
                 os.environ.get("DEEPSEEK_API_KEY"),
@@ -1087,9 +1162,11 @@ class VisionLLMClient:
             k = k.strip()
             if not k or k in seen:
                 continue
-            if use_deepseek_keys and k.startswith("AIza"):
+            if use_groq_keys and (k.startswith("AIza") or k.startswith("sk-")):
                 continue
-            if not eff_base_url and k.startswith("sk-"):
+            if use_deepseek_keys and (k.startswith("AIza") or k.startswith("gsk_")):
+                continue
+            if not eff_base_url and (k.startswith("sk-") or k.startswith("gsk_")):
                 continue
             seen.add(k)
             self.api_keys.append(k)
@@ -1139,11 +1216,15 @@ class VisionLLMClient:
         self.on_status = on_status
         if not self.api_key and not self.base_url:
             raise ValueError(
-                "Missing API key. Set GEMINI_API_KEY or DEEPSEEK_API_KEY env var, or pass --api-key (or --base-url for a local proxy)."
+                "Missing API key. Set GEMINI_API_KEY, DEEPSEEK_API_KEY, or GROQ_API_KEY env var, or pass --api-key (or --base-url for a local proxy)."
             )
         if is_deepseek_endpoint(self.base_url) and not self.api_key:
             raise ValueError(
                 "Missing DeepSeek API key. Set DEEPSEEK_API_KEY env var or pass --api-key."
+            )
+        if is_groq_endpoint(self.base_url) and not self.api_key:
+            raise ValueError(
+                "Missing Groq API key. Set GROQ_API_KEY env var or pass --api-key."
             )
 
     def _has_fallback_model(self) -> bool:
@@ -1167,7 +1248,19 @@ class VisionLLMClient:
                     self.api_keys = ds_keys
             except Exception:
                 pass
-        elif not is_deepseek_model(new_model) and is_deepseek_endpoint(self.base_url):
+        elif is_groq_model(new_model) and not is_groq_endpoint(self.base_url):
+            self.base_url = GROQ_BASE_URL
+            try:
+                from koharu_vn_cli.config import load_config
+
+                groq_keys = load_config().effective_api_keys(model=new_model, base_url=GROQ_BASE_URL)
+                if groq_keys:
+                    self.api_keys = groq_keys
+            except Exception:
+                pass
+        elif not is_deepseek_model(new_model) and not is_groq_model(new_model) and (
+            is_deepseek_endpoint(self.base_url) or is_groq_endpoint(self.base_url)
+        ):
             self.base_url = None
             try:
                 from koharu_vn_cli.config import load_config
@@ -1487,6 +1580,11 @@ class VisionLLMClient:
                 "DeepSeek API chính thức chỉ hỗ trợ text (không nhận ảnh trực tiếp). "
                 "Hãy bật OCR cục bộ (--no-vision) khi dịch, hoặc dùng Gemini / OpenAI-Vision proxy."
             )
+        if images and is_groq_endpoint(self.base_url) and not is_groq_vision_model(self.model):
+            raise ValueError(
+                f"Model Groq '{self.model}' chỉ hỗ trợ text (không nhận ảnh trực tiếp). "
+                "Hãy dùng model Vision (như meta-llama/llama-4-scout-17b-16e-instruct) hoặc bật OCR cục bộ (--no-vision)."
+            )
         if images:
             user_content: str | list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
             for label, b64 in images:
@@ -1507,9 +1605,17 @@ class VisionLLMClient:
                 {"role": "user", "content": user_content},
             ],
         }
-        if self.model.strip().lower() != "deepseek-reasoner":
+        low_model = self.model.strip().lower()
+        if low_model != "deepseek-reasoner":
             payload["temperature"] = temperature
-        if json_mode:
+        omit_json_format = (
+            low_model == "deepseek-reasoner"
+            or (
+                is_groq_endpoint(self.base_url)
+                and (bool(images) or "qwen3" in low_model or "gpt-oss" in low_model)
+            )
+        )
+        if json_mode and not omit_json_format:
             payload["response_format"] = {"type": "json_object"}
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(endpoint, headers=headers, json=payload)
@@ -1564,12 +1670,30 @@ class VisionLLMClient:
                 "deepseek-chat": "DeepSeek V3 Chat (text/JSON, OCR cục bộ)",
                 "deepseek-reasoner": "DeepSeek R1 Reasoner (suy luận sâu, OCR cục bộ)",
             }
+            groq_excluded = (
+                "whisper",
+                "tts",
+                "orpheus",
+                "prompt-guard",
+                "llama-guard",
+                "safeguard",
+                "embed",
+                "allam",
+            )
+            is_groq = is_groq_endpoint(self.base_url)
             for m in raw_items:
                 mid = str(m.get("id", "")).strip()
                 if not mid:
                     continue
+                low_mid = mid.lower()
+                if is_groq and any(tok in low_mid for tok in groq_excluded):
+                    continue
                 owner = str(m.get("owned_by", "")).strip()
-                label = ds_desc.get(mid) or (f"Proxy model ({owner})" if owner else "Proxy model")
+                if is_groq:
+                    kind_note = "Groq Vision (hỗ trợ ảnh)" if is_groq_vision_model(mid) else "Groq siêu nhanh (OCR cục bộ)"
+                    label = f"{kind_note} · {owner}" if owner else kind_note
+                else:
+                    label = ds_desc.get(mid) or (f"Proxy model ({owner})" if owner else "Proxy model")
                 models.append((mid, label))
             models.sort(key=lambda x: _model_sort_key(x[0]), reverse=True)
             return models[:limit]
@@ -1645,7 +1769,13 @@ class VisionLLMClient:
 
     def _localization_rules(self) -> str:
         base = self._VI_LOCALIZATION_RULES + self._HUMAN_CRAFT_RULES
-        if is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url) or self.base_url:
+        if (
+            is_deepseek_model(self.model)
+            or is_deepseek_endpoint(self.base_url)
+            or is_groq_model(self.model)
+            or is_groq_endpoint(self.base_url)
+            or self.base_url
+        ):
             return base + self._DEEPSEEK_R18_LOCALIZATION_ADDON
         return base
 
@@ -2053,7 +2183,16 @@ class VisionLLMClient:
             "  ]\n"
             "}"
         )
-        ocr_temp = 0.45 if (is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url)) else 0.25
+        ocr_temp = (
+            0.45
+            if (
+                is_deepseek_model(self.model)
+                or is_deepseek_endpoint(self.base_url)
+                or is_groq_model(self.model)
+                or is_groq_endpoint(self.base_url)
+            )
+            else 0.25
+        )
         data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
         raw_items = _extract_items_list(data)
         merged_sub = self._merge_translated_regions(to_translate, raw_items, ocr_texts=ocr_texts, skip_sfx=skip_sfx)
@@ -2183,7 +2322,16 @@ class VisionLLMClient:
             "  ]\n"
             "}"
         )
-        ocr_temp = 0.45 if (is_deepseek_model(self.model) or is_deepseek_endpoint(self.base_url)) else 0.25
+        ocr_temp = (
+            0.45
+            if (
+                is_deepseek_model(self.model)
+                or is_deepseek_endpoint(self.base_url)
+                or is_groq_model(self.model)
+                or is_groq_endpoint(self.base_url)
+            )
+            else 0.25
+        )
         try:
             data = self._call_json(system_prompt, user_prompt, images=[], temperature=ocr_temp)
         except ContentBlockedError:

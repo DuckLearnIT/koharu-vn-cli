@@ -135,11 +135,24 @@ def test_tui_slash_popup_style_picker_and_rerender(tmp_path: Path, monkeypatch) 
             await pilot.pause()
             assert app.cfg.story_model == ""
 
-            # 3d. `/key` supports multiple rotating API keys
+            # 3d. `/key` supports multiple rotating API keys & independent Groq keys
             app.dispatch_command("/key AIzaKeyOne111, AIzaKeyTwo222")
             await pilot.pause()
             assert app.cfg.effective_api_keys()[:2] == ["AIzaKeyOne111", "AIzaKeyTwo222"]
             assert "2 keys" in app.cfg.masked_api_key()
+
+            app.dispatch_command("/key gsk_test111, gsk_test222")
+            await pilot.pause()
+            assert app.cfg.groq_api_keys == ["gsk_test111", "gsk_test222"]
+            assert app.cfg.effective_api_keys(model="llama-3.3-70b-versatile")[:2] == [
+                "gsk_test111",
+                "gsk_test222",
+            ]
+            # Gemini keys untouched
+            assert app.cfg.effective_api_keys(model="gemini-3.8-flash")[:2] == [
+                "AIzaKeyOne111",
+                "AIzaKeyTwo222",
+            ]
 
             # 3e. `/cache` toggles auto-cleaning `.koharu_cache`
             assert app.cfg.clean_cache is True

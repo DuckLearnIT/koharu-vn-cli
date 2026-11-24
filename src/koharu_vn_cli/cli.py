@@ -22,8 +22,10 @@ from koharu_vn_cli.pipeline.fonts import available_fonts
 from koharu_vn_cli.pipeline.gemini_client import (
     DEFAULT_GEMINI_MODEL,
     DEEPSEEK_BASE_URL,
+    GROQ_BASE_URL,
     VisionLLMClient,
     is_deepseek_model,
+    is_groq_model,
 )
 from koharu_vn_cli.pipeline.runner import (
     ModelCache,
@@ -66,6 +68,8 @@ def _resolve_auth(api_key: str | None, base_url: str | None, model: str | None) 
     eff_url = base_url or cfg.base_url
     if not eff_url and is_deepseek_model(eff_model):
         eff_url = DEEPSEEK_BASE_URL
+    elif not eff_url and is_groq_model(eff_model):
+        eff_url = GROQ_BASE_URL
     cli_keys = [k.strip() for k in (api_key or "").replace(";", ",").split(",") if k.strip()] if api_key else []
     eff_keys = cli_keys or cfg.effective_api_keys(model=eff_model, base_url=eff_url)
     eff_key = eff_keys[0] if eff_keys else None
@@ -413,9 +417,9 @@ def retranslate(
     input_path: Path = typer.Argument(..., help="Thư mục/ảnh/file .zip đã xuất tải từ Drive về (bỏ qua ảnh đã dịch, chỉ dịch lại ảnh chưa dịch)."),
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Thư mục lưu bộ ảnh đã sửa (mặc định: <tên>_fixed)."),
     lang: str = typer.Option("auto", "--lang", help="Ngôn ngữ gốc: auto | ja | ko | zh | en."),
-    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="API key Gemini / DeepSeek."),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="API key Gemini / DeepSeek / Groq."),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="Endpoint OpenAI-compatible tùy chọn."),
-    model: Optional[str] = typer.Option(None, "--model", help="Model dịch lại (vd: gemini-3.8-flash hoặc deepseek-chat)."),
+    model: Optional[str] = typer.Option(None, "--model", help="Model dịch lại (vd: gemini-3.8-flash, deepseek-chat, llama-3.3-70b-versatile)."),
     fallback_model: Optional[str] = typer.Option(None, "--fallback-model", help="Model fallback khi hết quota."),
     story_model: Optional[str] = typer.Option(None, "--story-model", help="Model phụ/chính fallback."),
     story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback khi bị prohibit."),
@@ -674,6 +678,7 @@ def models(
     cfg = load_config()
     gem_keys = ([api_key] if api_key else []) or cfg.effective_api_keys(model="gemini-3.8-flash", base_url=base_url or cfg.base_url or "")
     ds_keys = cfg.effective_api_keys(model="deepseek-chat", base_url=DEEPSEEK_BASE_URL)
+    groq_keys = cfg.effective_api_keys(model="llama-3.3-70b-versatile", base_url=GROQ_BASE_URL)
     eff_key = gem_keys[0] if gem_keys else None
     eff_url = base_url or cfg.base_url
 
@@ -696,11 +701,17 @@ def models(
         if ds_keys
         else "Chưa đặt (chạy `koharu-vn` -> `/key` hoặc đặt env DEEPSEEK_API_KEY)",
     )
+    table.add_row(
+        "GROQ_API_KEY",
+        f"Đã thiết lập ({cfg.masked_groq_key()})"
+        if groq_keys
+        else "Chưa đặt (chạy `koharu-vn` -> `/key` hoặc đặt env GROQ_API_KEY)",
+    )
     console.print(table)
 
     if remote:
-        if not eff_key and not ds_keys and not eff_url:
-            console.print("[yellow]Cần có GEMINI_API_KEY, DEEPSEEK_API_KEY hoặc --base-url để lấy danh sách model từ API.[/yellow]")
+        if not eff_key and not ds_keys and not groq_keys and not eff_url:
+            console.print("[yellow]Cần có GEMINI_API_KEY, DEEPSEEK_API_KEY, GROQ_API_KEY hoặc --base-url để lấy danh sách model từ API.[/yellow]")
             return
         remote_models: list[tuple[str, str]] = []
         if eff_key or eff_url:
@@ -715,8 +726,14 @@ def models(
                 remote_models.extend(ds_client.list_available_models(limit=20))
             except Exception as exc:
                 console.print(f"[yellow]Không lấy được model DeepSeek: {exc}[/yellow]")
+        if groq_keys:
+            try:
+                groq_client = VisionLLMClient(api_key=groq_keys[0], model="llama-3.3-70b-versatile", base_url=GROQ_BASE_URL)
+                remote_models.extend(groq_client.list_available_models(limit=25))
+            except Exception as exc:
+                console.print(f"[yellow]Không lấy được model Groq: {exc}[/yellow]")
         if remote_models:
-            mt = Table(title="Model Gemini / DeepSeek mới nhất từ API")
+            mt = Table(title="Model Gemini / DeepSeek / Groq mới nhất từ API")
             mt.add_column("Model ID", style="bold cyan")
             mt.add_column("Mô tả", style="white")
             for mid, desc in remote_models:

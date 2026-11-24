@@ -2385,6 +2385,122 @@ def test_deepseek_api_routing_payload_and_ocr_auto_mode(monkeypatch, tmp_path: P
         run_compose_pipeline(img_dir, model="deepseek-chat", api_key="sk-fake-deepseek-1")
 
 
+def test_groq_api_routing_vision_text_isolation_and_model_listing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Verify Groq auto-routing (text vs Llama-4 Vision), gsk_ key isolation, migration, and /models filtering."""
+    import httpx
+    import pytest
+
+    from koharu_vn_cli.config import AppConfig, load_config
+    from koharu_vn_cli.pipeline import gemini_client as gc
+    from koharu_vn_cli.pipeline.runner import run_compose_pipeline
+
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-gemini")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-fake-deepseek")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_fake_env_groq")
+
+    cfg = AppConfig(
+        api_key="AIza-saved-gemini",
+        deepseek_api_key="sk-saved-deepseek",
+        groq_api_key="gsk_saved_groq_1",
+        base_url="https://my-proxy.example/v1",
+        model="llama-3.3-70b-versatile",
+    )
+    assert cfg.effective_api_keys() == ["gsk_saved_groq_1", "gsk_fake_env_groq"]
+    assert cfg.effective_api_keys(model="deepseek-chat") == ["sk-saved-deepseek", "sk-fake-deepseek"]
+    assert cfg.effective_api_keys(model="gemini-3.8-flash") == ["AIza-saved-gemini", "AIza-fake-gemini"]
+    assert cfg.masked_groq_key().startswith("gsk_")
+
+    # Verify gsk_ key stored inside legacy `api_key` auto-migrates to `groq_api_key`
+    legacy_cfg_path = tmp_path / "legacy_cfg.json"
+    legacy_cfg_path.write_text('{"api_key": "gsk_migrated_key"}', encoding="utf-8")
+    migrated = load_config(legacy_cfg_path)
+    assert migrated.groq_api_keys == ["gsk_migrated_key"]
+    assert migrated.api_keys == []
+
+    # 1. Text-only Groq model
+    text_client = VisionLLMClient(model="llama-3.3-70b-versatile")
+    assert text_client.base_url == gc.GROQ_BASE_URL
+    assert text_client.api_keys == ["gsk_fake_env_groq"]
+    assert gc.is_text_only_model("llama-3.3-70b-versatile", text_client.base_url) is True
+
+    captured: list[dict] = []
+
+    class FakeResp:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+            self.status_code = 200
+            self.text = "{}"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            captured.append({"url": url, "headers": headers, "json": json})
+            return FakeResp({"choices": [{"message": {"content": '{"ok": true}'}}]})
+
+        def get(self, url, headers=None):
+            return FakeResp(
+                {
+                    "data": [
+                        {"id": "llama-3.3-70b-versatile", "owned_by": "Meta"},
+                        {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "owned_by": "Meta"},
+                        {"id": "qwen/qwen3-32b", "owned_by": "Alibaba Cloud"},
+                        {"id": "whisper-large-v3", "owned_by": "OpenAI"},
+                        {"id": "playai-tts", "owned_by": "PlayAI"},
+                        {"id": "llama-guard-3-8b", "owned_by": "Meta"},
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeHttpClient)
+
+    out = text_client._call_openai_compatible("sys", "dịch dòng này", [], temperature=0.3)
+    assert out == '{"ok": true}'
+    assert captured[0]["url"] == "https://api.groq.com/openai/v1/chat/completions"
+    assert captured[0]["json"]["response_format"] == {"type": "json_object"}
+
+    with pytest.raises(ValueError, match="Groq"):
+        text_client._call_openai_compatible("sys", "xem ảnh", [("p1", "AAA")], temperature=0.3)
+
+    img_dir = tmp_path / "cg_groq"
+    img_dir.mkdir()
+    Image.new("RGB", (64, 64), (255, 255, 255)).save(img_dir / "01.png")
+    with pytest.raises(ValueError, match="Vision"):
+        run_compose_pipeline(img_dir, model="llama-3.3-70b-versatile", api_key="gsk_fake_env_groq")
+
+    # 2. Groq Vision model (Llama 4 Scout)
+    vision_client = VisionLLMClient(model="meta-llama/llama-4-scout-17b-16e-instruct")
+    assert vision_client.base_url == gc.GROQ_BASE_URL
+    assert gc.is_text_only_model("meta-llama/llama-4-scout-17b-16e-instruct", vision_client.base_url) is False
+    vision_client._call_openai_compatible("sys", "xem ảnh", [("p1", "AAA")], temperature=0.3)
+    assert any(p.get("type") == "image_url" for p in captured[1]["json"]["messages"][1]["content"])
+    assert "response_format" not in captured[1]["json"]
+
+    # 3. list_available_models filters out whisper / tts / guard models cleanly
+    listed = text_client.list_available_models(limit=20)
+    listed_ids = [mid for mid, _ in listed]
+    assert "llama-3.3-70b-versatile" in listed_ids
+    assert "meta-llama/llama-4-scout-17b-16e-instruct" in listed_ids
+    assert "whisper-large-v3" not in listed_ids
+    assert "playai-tts" not in listed_ids
+    assert "llama-guard-3-8b" not in listed_ids
+
+
 def test_vision_prohibit_ocr_fallback_chain_and_untranslated_page_recovery(
     tmp_path: Path, monkeypatch
 ) -> None:
