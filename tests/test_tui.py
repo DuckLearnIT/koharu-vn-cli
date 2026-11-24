@@ -25,12 +25,13 @@ def test_config_roundtrip_and_masking(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    cfg = AppConfig(api_key="AIzaTest1234SecretKey", compose_style=ComposePreset.MANGA_TAIL, lang="ja")
+    cfg = AppConfig(api_key="AIzaTest1234SecretKey", compose_style=ComposePreset.MANGA_TAIL, lang="ja", story_pass=False)
     save_config(cfg, cfg_path)
     loaded = load_config(cfg_path)
 
     assert loaded.compose_style == ComposePreset.MANGA_TAIL
     assert loaded.lang == "ja"
+    assert loaded.story_pass is False
     assert loaded.masked_api_key() == "AIza...tKey"
 
 
@@ -166,6 +167,21 @@ def test_tui_slash_popup_style_picker_and_rerender(tmp_path: Path, monkeypatch) 
             await pilot.pause()
             assert app.cfg.notify is True
 
+            # 3h. `/pass1` & `/story-pass` toggle Pass 1 Story Bible setting
+            assert app.cfg.story_pass is True
+            app.dispatch_command("/pass1 off")
+            await pilot.pause()
+            assert app.cfg.story_pass is False
+            app.dispatch_command("/pass1 on")
+            await pilot.pause()
+            assert app.cfg.story_pass is True
+            app.dispatch_command("/story-pass skip")
+            await pilot.pause()
+            assert app.cfg.story_pass is False
+            app.dispatch_command("/pass1")
+            await pilot.pause()
+            assert app.cfg.story_pass is True
+
             # 4. Run `/rerender` in background worker inside TUI
             app.dispatch_command(f'/rerender "{out_dir}"')
             deadline = time.monotonic() + 8.0
@@ -257,6 +273,86 @@ def test_tui_zip_drop_intent_and_review_timeout_and_notify(tmp_path: Path, monke
     app_ok._start_translate.__wrapped__(app_ok, zip_file)
     assert len(notifs) == 1
     assert notifs[0][2] is True and "API broken" in notifs[0][1]
+
+
+def test_skip_pass1_cli_tui_and_natural_intent(tmp_path: Path, monkeypatch) -> None:
+    """Verify `--skip-pass1`, `/pass1 off`, and natural-language skip Pass 1 across CLI & TUI."""
+    from typer.testing import CliRunner
+
+    from koharu_vn_cli.cli import app as cli_app
+
+    cfg_file = tmp_path / "cfg.json"
+    monkeypatch.setattr("koharu_vn_cli.tui.load_config", lambda: load_config(cfg_file))
+    monkeypatch.setattr("koharu_vn_cli.tui.save_config", lambda c: save_config(c, cfg_file))
+    monkeypatch.setattr("koharu_vn_cli.cli.load_config", lambda: load_config(cfg_file))
+
+    sample_dir = tmp_path / "Doujin Sample"
+    sample_dir.mkdir()
+    zip_file = tmp_path / "CG Pack.zip"
+    zip_file.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+    # 1. Natural intent extracts Vietnamese/English skip Pass 1 instructions
+    act, parsed_p, opts = parse_natural_intent(f'dịch "{sample_dir}" bỏ qua pass 1 xưng hô anh em')
+    assert act == "translate"
+    assert parsed_p == str(sample_dir)
+    assert opts["story_pass"] is False
+    assert "anh em" in opts["prompt"]
+
+    act_c, _, opts_c = parse_natural_intent(f'sáng tác "{sample_dir}" skip pass 1 ngọt ngào')
+    assert act_c == "compose"
+    assert opts_c["story_pass"] is False
+
+    # 2. TUI `/translate --skip-pass1`, `cfg.story_pass=False`, and `_start_compose` propagate `story_pass=False`
+    seen_translate: list[bool] = []
+    seen_compose: list[bool] = []
+    monkeypatch.setattr(
+        "koharu_vn_cli.tui.run_translate_pipeline",
+        lambda p, **kw: (seen_translate.append(bool(kw.get("story_pass"))), (tmp_path / "out_t", []))[1],
+    )
+    monkeypatch.setattr(
+        "koharu_vn_cli.tui.run_compose_pipeline",
+        lambda p, **kw: (seen_compose.append(bool(kw.get("story_pass"))), (tmp_path / "out_c", []))[1],
+    )
+    tui_app = KoharuTUI()
+    tui_app.cfg.api_key = "test-key"
+    tui_app.call_from_thread = lambda fn, *a, **kw: None  # type: ignore[method-assign]
+    tui_app._start_translate.__wrapped__(tui_app, zip_file, story_pass=False)
+    assert seen_translate == [False]
+
+    seen_translate.clear()
+    tui_app.cfg.story_pass = False
+    tui_app._start_translate.__wrapped__(tui_app, zip_file)
+    tui_app._start_compose.__wrapped__(tui_app, sample_dir)
+    assert seen_translate == [False]
+    assert seen_compose == [False]
+
+    # 3. Headless CLI `--skip-pass1` & saved config `story_pass=False`
+    cli_seen_t: list[bool] = []
+    cli_seen_c: list[bool] = []
+    monkeypatch.setattr(
+        "koharu_vn_cli.cli.run_translate_pipeline",
+        lambda p, **kw: (cli_seen_t.append(bool(kw.get("story_pass"))), (tmp_path / "out_cli_t", []))[1],
+    )
+    monkeypatch.setattr(
+        "koharu_vn_cli.cli.run_compose_pipeline",
+        lambda p, **kw: (cli_seen_c.append(bool(kw.get("story_pass"))), (tmp_path / "out_cli_c", []))[1],
+    )
+    runner = CliRunner()
+    res1 = runner.invoke(cli_app, ["translate", str(zip_file), "--skip-pass1", "--api-key", "test-key"])
+    assert res1.exit_code == 0, res1.output
+    res2 = runner.invoke(cli_app, ["compose", str(sample_dir), "--skip-pass1", "--api-key", "test-key"])
+    assert res2.exit_code == 0, res2.output
+    assert cli_seen_t == [False]
+    assert cli_seen_c == [False]
+
+    # Even without --skip-pass1 flag, saved config story_pass=False applies by default, and --pass1 overrides it
+    save_config(AppConfig(api_key="test-key", story_pass=False), cfg_file)
+    cli_seen_t.clear()
+    res3 = runner.invoke(cli_app, ["translate", str(zip_file)])
+    assert res3.exit_code == 0, res3.output
+    res4 = runner.invoke(cli_app, ["translate", str(zip_file), "--pass1"])
+    assert res4.exit_code == 0, res4.output
+    assert cli_seen_t == [False, True]
 
 
 def test_tui_queue_and_chrome_handle_square_brackets_in_filenames(tmp_path: Path, monkeypatch) -> None:

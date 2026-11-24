@@ -69,17 +69,19 @@ class QueuedJob:
     resume: bool = False
     in_place: bool = False
     page_range: str = ""
+    story_pass: bool | None = None
 
 
 SLASH_COMMANDS: tuple[SlashSpec, ...] = (
-    SlashSpec("/translate", "<đường_dẫn|.zip> [--resume]", "Dịch truyện tranh / file .zip / .cbz (tự xếp queue nếu đang chạy)"),
+    SlashSpec("/translate", "<đường_dẫn|.zip> [--resume] [--skip-pass1]", "Dịch truyện tranh / file .zip / .cbz (tự xếp queue nếu đang chạy)"),
     SlashSpec("/retranslate", "<đường_dẫn|.zip>", "Tái dịch ảnh/zip tải từ Drive (bỏ qua ảnh đã dịch, chỉ dịch lại ảnh chưa dịch)"),
     SlashSpec("/queue", "<đường_dẫn... | list | clear | start | remove N>", "Hàng đợi dịch liên tục nhiều tác phẩm kế tiếp nhau"),
-    SlashSpec("/compose", "<đường_dẫn> [--pages 1-20] [--resume]", "Tự sáng tác thoại cho Artist CG không lời (hỗ trợ chọn trang)"),
+    SlashSpec("/compose", "<đường_dẫn> [--pages 1-20] [--resume] [--skip-pass1]", "Tự sáng tác thoại cho Artist CG không lời (hỗ trợ chọn trang)"),
     SlashSpec("/resume", "[đường_dẫn]", "Chạy tiếp tác vụ bị dừng/lỗi từ trang chưa xong (bỏ qua trang đã dịch)"),
     SlashSpec("/rerender", "<thư_mục_output>", "Render lại ảnh từ .koharu.json (0 giây API)"),
     SlashSpec("/rename", "<thư_mục> [--in-place]", "Đổi tên theo thứ tự đọc (001.webp...) & nén WebP max quality (100)"),
     SlashSpec("/format", "", "Chọn định dạng xuất (webp 100% / original) & đánh số 001.webp"),
+    SlashSpec("/pass1", "[on|off|skip]", "Bật/tắt Pass 1 Story Bible (tắt = bỏ qua Pass 1, dịch/sáng tác thẳng từng trang)"),
     SlashSpec("/chars", "[on|off]", "Bật/tắt bước kiểm tra & sửa tên nhân vật sau Pass 1 (tự xác nhận sau 10s)"),
     SlashSpec("/vision", "[on|off]", "Bật/tắt gửi ảnh cho model con (tắt = OCR cục bộ + dịch theo Story Bible)"),
     SlashSpec("/sfx", "[skip|translate]", "Bỏ qua không dịch & không tẩy SFX vẽ trên tranh (mặc định: bỏ qua)"),
@@ -280,13 +282,40 @@ def extract_page_range_arg(text: str, *, allow_bare: bool = True) -> tuple[str |
     return None, s
 
 
+def _extract_pass1_flag(text: str) -> tuple[bool | None, str]:
+    """Extract `--skip-pass1` / `--no-pass1` / `--no-story-pass` or `--pass1` / `--story-pass` from text."""
+    s = (text or "").strip()
+    if not s:
+        return None, ""
+    override: bool | None = None
+    off_re = re.compile(r"(?:^|\s)(--skip-pass1|--no-pass1|--no-story-pass)(?=\s|$)", flags=re.IGNORECASE)
+    on_re = re.compile(r"(?:^|\s)(--pass1|--story-pass)(?=\s|$)", flags=re.IGNORECASE)
+    if off_re.search(s):
+        override = False
+        s = off_re.sub(" ", s)
+    elif on_re.search(s):
+        override = True
+        s = on_re.sub(" ", s)
+    return override, re.sub(r"\s+", " ", s).strip()
+
+
 def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
     """
     Interpret natural Vietnamese prompt into `(action, path, extra_opts)`.
     `action` is one of: 'translate', 'compose', 'rerender', 'pick_action', 'chat'.
     """
-    path_str, rem = extract_path_and_remainder(text)
-    low = rem.lower() if path_str else text.lower()
+    pass1_override, text_no_flag = _extract_pass1_flag(text)
+    skip_phrases = re.compile(
+        r"(?:bỏ qua|bo qua|skip|không chạy|khong chay|không cần|khong can|tắt|tat|no)\s*pass\s*1\b",
+        flags=re.IGNORECASE,
+    )
+    if pass1_override is None and skip_phrases.search(text_no_flag):
+        pass1_override = False
+        text_no_flag = skip_phrases.sub(" ", text_no_flag)
+        text_no_flag = re.sub(r"\s+", " ", text_no_flag).strip()
+
+    path_str, rem = extract_path_and_remainder(text_no_flag)
+    low = rem.lower() if path_str else text_no_flag.lower()
 
     if any(k in low for k in ("tái dịch", "tai dich", "retranslate", "dịch lại", "chưa dịch")):
         hint = re.sub(
@@ -335,14 +364,28 @@ def parse_natural_intent(text: str) -> tuple[str, str | None, dict[str, Any]]:
         hint = re.sub(r"\s+", " ", hint).strip(" ,.-:")
 
         if is_compose and not is_translate:
-            return "compose", path_str, {"prompt": hint, "style": style_override, "pages": extracted_pages or ""}
+            return "compose", path_str, {
+                "prompt": hint,
+                "style": style_override,
+                "pages": extracted_pages or "",
+                "story_pass": pass1_override,
+            }
         if is_translate and not is_compose:
-            return "translate", path_str, {"prompt": hint}
+            return "translate", path_str, {"prompt": hint, "story_pass": pass1_override}
         if style_override is not None:
-            return "compose", path_str, {"prompt": hint, "style": style_override, "pages": extracted_pages or ""}
+            return "compose", path_str, {
+                "prompt": hint,
+                "style": style_override,
+                "pages": extracted_pages or "",
+                "story_pass": pass1_override,
+            }
         if Path(path_str).suffix.lower() in {".zip", ".cbz"}:
-            return "translate", path_str, {"prompt": hint}
-        return "pick_action", path_str, {"prompt": hint, "pages": extracted_pages or ""}
+            return "translate", path_str, {"prompt": hint, "story_pass": pass1_override}
+        return "pick_action", path_str, {
+            "prompt": hint,
+            "pages": extracted_pages or "",
+            "story_pass": pass1_override,
+        }
 
     return "chat", None, {"text": text}
 
@@ -1091,11 +1134,12 @@ class KoharuTUI(App[None]):
         )
         story_model_esc = escape_markup(self.cfg.story_model) if self.cfg.story_model else ""
         model_esc = escape_markup(self.cfg.model)
-        model_badge = (
-            f"Chính: [bold magenta]{story_model_esc}[/bold magenta] → Phụ: [bold]{model_esc}[/bold]"
-            if self.cfg.story_model and self.cfg.story_model != self.cfg.model
-            else f"Model: [bold]{model_esc}[/bold]"
-        )
+        if not self.cfg.story_pass:
+            model_badge = f"Model: [bold]{model_esc}[/bold] · Pass 1: [yellow]Tắt[/yellow]"
+        elif self.cfg.story_model and self.cfg.story_model != self.cfg.model:
+            model_badge = f"Chính: [bold magenta]{story_model_esc}[/bold magenta] → Phụ: [bold]{model_esc}[/bold]"
+        else:
+            model_badge = f"Model: [bold]{model_esc}[/bold]"
         self._safe_update_static(
             topbar,
             f"[bold cyan]◈ KOHARU-VN CLI[/bold cyan] [dim]v{__version__}[/dim]  │  "
@@ -1144,6 +1188,7 @@ class KoharuTUI(App[None]):
             f"Mật độ CG: [cyan]{escape_markup(self.cfg.density)}[/cyan]\n"
             f"Tags: [magenta]{escape_markup(tags_raw)}[/magenta]\n"
             f"Font: [white]{escape_markup(self.cfg.font or 'auto (animeace3/pangolin)')}[/white]\n"
+            f"Pass 1: {'[cyan]Bật (Story Bible)[/cyan]' if self.cfg.story_pass else '[yellow]Bỏ qua (/pass1)[/yellow]'}\n"
             f"SFX: [cyan]{'Bỏ qua (giữ tranh gốc)' if self.cfg.skip_sfx else 'Dịch & tẩy'}[/cyan]\n"
             f"Cache: [cyan]{'Tự xóa khi xong 100%' if self.cfg.clean_cache else 'Giữ .koharu_cache'}[/cyan]\n"
             f"Xóa ZIP gốc: [cyan]{'Tự xóa (xác minh 100%)' if self.cfg.delete_source_zip else 'Giữ lại'}[/cyan]\n"
@@ -1511,7 +1556,7 @@ class KoharuTUI(App[None]):
 
         action, path_str, extra = parse_natural_intent(raw)
         if action == "translate" and path_str:
-            self._launch_translate(Path(path_str), extra.get("prompt") or "")
+            self._launch_translate(Path(path_str), extra.get("prompt") or "", story_pass=extra.get("story_pass"))
         elif action == "retranslate" and path_str:
             self._launch_retranslate(Path(path_str), extra.get("prompt") or "")
         elif action == "compose" and path_str:
@@ -1523,22 +1568,23 @@ class KoharuTUI(App[None]):
                 Path(path_str),
                 extra.get("prompt") or "",
                 page_range=extra.get("pages") or "",
+                story_pass=extra.get("story_pass"),
             )
         elif action == "rerender" and path_str:
             self._launch_rerender(Path(path_str))
         elif action == "pick_action" and path_str:
-            self._ask_path_action(Path(path_str), extra.get("prompt") or "")
+            self._ask_path_action(Path(path_str), extra.get("prompt") or "", story_pass=extra.get("story_pass"))
         else:
             self._run_chat_assistant(raw)
 
-    def _ask_path_action(self, target: Path, hint: str) -> None:
+    def _ask_path_action(self, target: Path, hint: str, *, story_pass: bool | None = None) -> None:
         def _after(choice: str | None) -> None:
             if choice == "translate":
-                self._launch_translate(target, hint)
+                self._launch_translate(target, hint, story_pass=story_pass)
             elif choice == "retranslate":
                 self._launch_retranslate(target, hint)
             elif choice == "compose":
-                self._launch_compose(target, hint)
+                self._launch_compose(target, hint, story_pass=story_pass)
             elif choice == "rerender":
                 self._launch_rerender(target)
 
@@ -1681,14 +1727,15 @@ class KoharuTUI(App[None]):
             self._open_last_output()
         elif cmd == "/translate":
             resume_flag = "--resume" in rest
-            cleaned_rest = rest.replace("--resume", "").strip()
+            cleaned_rest = rest.replace("--resume", " ").strip()
+            pass1_override, cleaned_rest = _extract_pass1_flag(cleaned_rest)
             p_str, hint = split_cmd_and_hint(cleaned_rest)
             if p_str:
-                self._launch_translate(Path(p_str), hint, resume=resume_flag)
+                self._launch_translate(Path(p_str), hint, resume=resume_flag, story_pass=pass1_override)
             else:
                 self.push_screen(
                     RunJobModal("translate", "", self.cfg.custom_prompt, initial_tags=self.cfg.tags),
-                    lambda res: self._launch_translate(Path(res[0]), res[1], res[2], resume=resume_flag) if res else None,
+                    lambda res: self._launch_translate(Path(res[0]), res[1], res[2], resume=resume_flag, story_pass=pass1_override) if res else None,
                 )
         elif cmd == "/retranslate":
             p_str, hint = split_cmd_and_hint(rest)
@@ -1703,11 +1750,12 @@ class KoharuTUI(App[None]):
             self._handle_queue_command(rest)
         elif cmd == "/compose":
             resume_flag = "--resume" in rest
-            cleaned_rest = rest.replace("--resume", "").strip()
+            cleaned_rest = rest.replace("--resume", " ").strip()
+            pass1_override, cleaned_rest = _extract_pass1_flag(cleaned_rest)
             p_str, hint = split_cmd_and_hint(cleaned_rest)
             page_range, hint = extract_page_range_arg(hint, allow_bare=True)
             if p_str:
-                self._launch_compose(Path(p_str), hint, resume=resume_flag, page_range=page_range or "")
+                self._launch_compose(Path(p_str), hint, resume=resume_flag, page_range=page_range or "", story_pass=pass1_override)
             else:
                 self.push_screen(
                     RunJobModal(
@@ -1725,6 +1773,7 @@ class KoharuTUI(App[None]):
                             res[2],
                             resume=resume_flag,
                             page_range=res[3],
+                            story_pass=pass1_override,
                         )
                         if res
                         else None
@@ -1783,6 +1832,24 @@ class KoharuTUI(App[None]):
                     ],
                     f"{self.cfg.output_format}_{'seq' if self.cfg.sequential_names else 'orig'}",
                     self._set_format_combo,
+                )
+        elif cmd in {"/pass1", "/story-pass"}:
+            val = rest.strip().lower()
+            if val in {"on", "1", "true"}:
+                self.cfg.story_pass = True
+            elif val in {"off", "0", "false", "skip", "no"}:
+                self.cfg.story_pass = False
+            else:
+                self.cfg.story_pass = not self.cfg.story_pass
+            save_config(self.cfg)
+            self._refresh_chrome()
+            if self.cfg.story_pass:
+                self._log_ai(
+                    "Pass 1: [bold cyan]BẬT[/bold cyan] — AI sẽ quét trước toàn bộ tập để dựng Story Bible, nhân vật & xưng hô."
+                )
+            else:
+                self._log_ai(
+                    "Pass 1: [bold yellow]BỎ QUA[/bold yellow] — bỏ qua bước quét Story Bible, chạy thẳng dịch / sáng tác từng trang (nhanh hơn, không tốn lượt gọi Model chính)."
                 )
         elif cmd == "/chars":
             val = rest.strip().lower()
@@ -2267,7 +2334,7 @@ class KoharuTUI(App[None]):
 
     def _dispatch_job_spec(self, job: QueuedJob) -> None:
         if job.mode == "translate":
-            self._launch_translate(job.input_path, job.prompt, job.tags, resume=job.resume)
+            self._launch_translate(job.input_path, job.prompt, job.tags, resume=job.resume, story_pass=job.story_pass)
         elif job.mode == "retranslate":
             self._launch_retranslate(job.input_path, job.prompt, job.tags)
         elif job.mode == "compose":
@@ -2277,6 +2344,7 @@ class KoharuTUI(App[None]):
                 job.tags,
                 resume=job.resume,
                 page_range=job.page_range,
+                story_pass=job.story_pass,
             )
         elif job.mode == "rerender":
             self._launch_rerender(job.input_path)
@@ -2350,7 +2418,7 @@ class KoharuTUI(App[None]):
             return
 
         mode = "translate"
-        cleaned = arg
+        pass1_override, cleaned = _extract_pass1_flag(arg)
         for flag, mname in (
             ("--retranslate", "retranslate"),
             ("--compose", "compose"),
@@ -2375,7 +2443,7 @@ class KoharuTUI(App[None]):
             if not p_obj.exists():
                 self._log_ai(f"Bỏ qua đường dẫn không tồn tại: [red]{escape_markup(str(p_obj))}[/red]", style="yellow")
                 continue
-            job = QueuedJob(mode=mode, input_path=p_obj, tags=self.cfg.tags)
+            job = QueuedJob(mode=mode, input_path=p_obj, tags=self.cfg.tags, story_pass=pass1_override)
             if not self.is_running_job and added == 0 and not self.job_queue:
                 self._dispatch_job_spec(job)
             else:
@@ -2522,6 +2590,7 @@ class KoharuTUI(App[None]):
         *,
         resume: bool = False,
         retranslate_untranslated: bool = False,
+        story_pass: bool | None = None,
     ) -> None:
         if not self._ensure_llm_ready(needs_llm=True):
             return
@@ -2536,18 +2605,23 @@ class KoharuTUI(App[None]):
                     prompt=extra_prompt,
                     tags=extra_tags,
                     resume=resume,
+                    story_pass=story_pass,
                 )
             )
             return
         self.cfg.last_input_path = str(input_path)
         self.cfg.last_job_mode = "retranslate" if retranslate_untranslated else "translate"
         save_config(self.cfg)
+        extra_kw: dict[str, Any] = {}
+        if story_pass is not None:
+            extra_kw["story_pass"] = story_pass
         self._start_translate(
             input_path,
             extra_prompt,
             extra_tags,
             resume=resume,
             retranslate_untranslated=retranslate_untranslated,
+            **extra_kw,
         )
 
     def _launch_retranslate(
@@ -2569,6 +2643,7 @@ class KoharuTUI(App[None]):
         *,
         resume: bool = False,
         page_range: str = "",
+        story_pass: bool | None = None,
     ) -> None:
         if not self._ensure_llm_ready(needs_llm=True):
             return
@@ -2584,13 +2659,24 @@ class KoharuTUI(App[None]):
                     tags=extra_tags,
                     resume=resume,
                     page_range=page_range,
+                    story_pass=story_pass,
                 )
             )
             return
         self.cfg.last_input_path = str(input_path)
         self.cfg.last_job_mode = "compose"
         save_config(self.cfg)
-        self._start_compose(input_path, extra_prompt, extra_tags, resume=resume, page_range=page_range)
+        extra_kw: dict[str, Any] = {}
+        if story_pass is not None:
+            extra_kw["story_pass"] = story_pass
+        self._start_compose(
+            input_path,
+            extra_prompt,
+            extra_tags,
+            resume=resume,
+            page_range=page_range,
+            **extra_kw,
+        )
 
     def _launch_rerender(self, output_dir: Path) -> None:
         if self.is_running_job:
@@ -2607,6 +2693,7 @@ class KoharuTUI(App[None]):
         *,
         resume: bool = False,
         retranslate_untranslated: bool = False,
+        story_pass: bool | None = None,
     ) -> None:
         self.cancel_event.clear()
         mode_lbl = (
@@ -2617,6 +2704,11 @@ class KoharuTUI(App[None]):
         self.call_from_thread(self._set_job_ui, True, f"{mode_lbl}: {escape_markup(input_path.name)}", 2.0)
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
+        eff_story_pass = (
+            (False if retranslate_untranslated else self.cfg.story_pass)
+            if story_pass is None
+            else story_pass
+        )
 
         was_cancelled = False
         try:
@@ -2633,7 +2725,7 @@ class KoharuTUI(App[None]):
                 prompt=merged_prompt,
                 story=self.cfg.story_context or None,
                 tags=eff_tags,
-                story_pass=not retranslate_untranslated,
+                story_pass=eff_story_pass,
                 font=self.cfg.font,
                 conf=self.cfg.conf_thresh,
                 accurate_detector=self.cfg.accurate_detector,
@@ -2688,6 +2780,7 @@ class KoharuTUI(App[None]):
         *,
         resume: bool = False,
         page_range: str = "",
+        story_pass: bool | None = None,
     ) -> None:
         self.cancel_event.clear()
         range_tag = f" [{page_range}]" if page_range else ""
@@ -2701,6 +2794,7 @@ class KoharuTUI(App[None]):
         )
         merged_prompt = " | ".join(x for x in (self.cfg.custom_prompt, extra_prompt) if x) or None
         eff_tags = (extra_tags or self.cfg.tags).strip() or None
+        eff_story_pass = self.cfg.story_pass if story_pass is None else story_pass
 
         was_cancelled = False
         try:
@@ -2711,6 +2805,7 @@ class KoharuTUI(App[None]):
                 prompt=merged_prompt,
                 story=self.cfg.story_context or None,
                 tags=eff_tags,
+                story_pass=eff_story_pass,
                 api_key=self.cfg.effective_api_key() or None,
                 api_keys=self.cfg.effective_api_keys(),
                 base_url=self.cfg.base_url,

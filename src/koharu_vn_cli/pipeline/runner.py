@@ -1259,6 +1259,13 @@ def _load_or_build_story_bible(
             return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
 
     if not enable_story_pass:
+        hooks.emit_step(
+            0,
+            len(images),
+            base_name,
+            "skip",
+            "Bỏ qua Pass 1 (Story Bible) — chạy thẳng dịch/sáng tác từng trang.",
+        )
         return StoryBible(full_plot_summary=resolved_story) if resolved_story else None
 
     hooks.emit_step(
@@ -1466,11 +1473,16 @@ def run_translate_pipeline(
         mode_tag = "Vision" if vision_translate else "No-Vision OCR"
         fb_s_tag = f" [FB: {eff_story_fallback}]" if eff_story_fallback else ""
         fb_m_tag = f" [FB quota: {eff_fallback}]" if eff_fallback else ""
+        init_detail = (
+            f"Kiểm tra API & ONNX (Chính: {eff_story_model}{fb_s_tag} -> Phụ ({mode_tag}): {model}{fb_m_tag})..."
+            if eff_story_pass
+            else f"Kiểm tra API & ONNX (Pass 1: Bỏ qua -> Phụ ({mode_tag}): {model}{fb_m_tag})..."
+        )
         _emit_step(
             0,
             base_name,
             "init",
-            f"Kiểm tra API & ONNX (Chính: {eff_story_model}{fb_s_tag} -> Phụ ({mode_tag}): {model}{fb_m_tag})...",
+            init_detail,
         )
         STORY_MODEL_TIMEOUT = 180.0
         llm = VisionLLMClient(
@@ -1481,13 +1493,17 @@ def run_translate_pipeline(
             base_url=base_url,
             on_status=lambda msg: _emit_step(0, base_name, "api", msg),
         )
-        story_llm = VisionLLMClient(
-            api_key=api_key,
-            api_keys=api_keys,
-            model=eff_story_model,
-            base_url=base_url,
-            timeout=STORY_MODEL_TIMEOUT,
-            on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+        story_llm = (
+            VisionLLMClient(
+                api_key=api_key,
+                api_keys=api_keys,
+                model=eff_story_model,
+                base_url=base_url,
+                timeout=STORY_MODEL_TIMEOUT,
+                on_status=lambda msg: _emit_step(0, base_name, "api", msg),
+            )
+            if eff_story_pass
+            else llm
         )
         story_fallback_llm = (
             VisionLLMClient(
@@ -1498,7 +1514,7 @@ def run_translate_pipeline(
                 timeout=STORY_MODEL_TIMEOUT,
                 on_status=lambda msg: _emit_step(0, base_name, "api", msg),
             )
-            if eff_story_fallback and eff_story_fallback != eff_story_model
+            if eff_story_pass and eff_story_fallback and eff_story_fallback != eff_story_model
             else None
         )
         key_pool = list(llm.api_keys)
@@ -2757,14 +2773,29 @@ def run_compose_pipeline(
         eff_story_model = (story_model or "").strip() or model
         eff_fallback = (fallback_model or "").strip() or None
         eff_story_fallback = (story_fallback_model or "").strip() or None
+        eff_story_pass = story_pass
+        if eff_story_pass and is_text_only_model(eff_story_model, base_url):
+            eff_story_pass = False
+            hooks.emit_step(
+                0,
+                total,
+                base_name,
+                "api",
+                f"ℹ Model chính ({eff_story_model}) chỉ hỗ trợ text -> bỏ qua Pass 1 xem ảnh (vẫn dùng --story nếu có).",
+            )
         fb_s_tag = f" [FB: {eff_story_fallback}]" if eff_story_fallback else ""
         fb_m_tag = f" [FB quota: {eff_fallback}]" if eff_fallback else ""
+        init_detail = (
+            f"Khởi tạo sáng tác CG ({style.value} | Chính: {eff_story_model}{fb_s_tag} -> Phụ: {model}{fb_m_tag})..."
+            if eff_story_pass
+            else f"Khởi tạo sáng tác CG ({style.value} | Pass 1: Bỏ qua -> Phụ: {model}{fb_m_tag})..."
+        )
         hooks.emit_step(
             0,
             total,
             base_name,
             "init",
-            f"Khởi tạo sáng tác CG ({style.value} | Chính: {eff_story_model}{fb_s_tag} -> Phụ: {model}{fb_m_tag})...",
+            init_detail,
         )
         STORY_MODEL_TIMEOUT = 180.0
         llm = VisionLLMClient(
@@ -2775,13 +2806,17 @@ def run_compose_pipeline(
             base_url=base_url,
             on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
         )
-        story_llm = VisionLLMClient(
-            api_key=api_key,
-            api_keys=api_keys,
-            model=eff_story_model,
-            base_url=base_url,
-            timeout=STORY_MODEL_TIMEOUT,
-            on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+        story_llm = (
+            VisionLLMClient(
+                api_key=api_key,
+                api_keys=api_keys,
+                model=eff_story_model,
+                base_url=base_url,
+                timeout=STORY_MODEL_TIMEOUT,
+                on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
+            )
+            if eff_story_pass
+            else llm
         )
         story_fallback_llm = (
             VisionLLMClient(
@@ -2792,7 +2827,7 @@ def run_compose_pipeline(
                 timeout=STORY_MODEL_TIMEOUT,
                 on_status=lambda msg: hooks.emit_step(0, total, base_name, "api", msg),
             )
-            if eff_story_fallback and eff_story_fallback != eff_story_model
+            if eff_story_pass and eff_story_fallback and eff_story_fallback != eff_story_model
             else None
         )
 
@@ -2815,7 +2850,7 @@ def run_compose_pipeline(
             user_story=story,
             prompt=prompt,
             tags=tags,
-            enable_story_pass=story_pass,
+            enable_story_pass=eff_story_pass,
             resume=resume,
             scenes=scenes,
             story_fallback_llm=story_fallback_llm,

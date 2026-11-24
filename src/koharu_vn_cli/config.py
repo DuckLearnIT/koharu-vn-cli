@@ -72,6 +72,7 @@ class AppConfig(BaseModel):
     save_cbz: bool = False
     output_format: str = "webp"
     sequential_names: bool = True
+    story_pass: bool = True
     review_characters: bool = True
     vision_translate: bool = True
     skip_sfx: bool = True

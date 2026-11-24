@@ -194,7 +194,7 @@ def _execute_translate_cli(
     prompt: Optional[str],
     story: Optional[str],
     tags: Optional[str],
-    story_pass: bool,
+    story_pass: Optional[bool],
     font: Optional[str],
     conf: float,
     accurate_detector: bool,
@@ -223,6 +223,7 @@ def _execute_translate_cli(
     eff_delete_zip = cfg.delete_source_zip if delete_zip is None else delete_zip
     eff_notify = cfg.notify if notify is None else notify
     eff_workers = cfg.workers if workers is None else max(0, min(workers, 16))
+    eff_story_pass = (False if retranslate_untranslated else cfg.story_pass) if story_pass is None else story_pass
     job_title = "Đang tái dịch trang chưa dịch..." if retranslate_untranslated else "Đang dịch truyện..."
     err_notif_title = "Koharu-VN · Lỗi tái dịch" if retranslate_untranslated else "Koharu-VN · Lỗi dịch truyện"
     done_notif_title = "Koharu-VN · Tái dịch xong!" if retranslate_untranslated else "Koharu-VN · Dịch xong!"
@@ -274,7 +275,7 @@ def _execute_translate_cli(
                 prompt=prompt,
                 story=story,
                 tags=tags if tags is not None else (cfg.tags or None),
-                story_pass=story_pass,
+                story_pass=eff_story_pass,
                 font=font,
                 conf=conf,
                 accurate_detector=accurate_detector,
@@ -351,7 +352,12 @@ def translate(
     prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô thêm cho người dịch."),
     story: Optional[str] = typer.Option(None, "--story", help="Cốt truyện/nhân vật/lore (nhập chữ hoặc đường dẫn file .txt/.md)."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại (vd: 'vanilla, romance' hoặc 'NTR, angst')."),
-    story_pass: bool = typer.Option(True, "--story-pass/--no-story-pass", help="Quét trước toàn bộ chương (Pass 1) để khóa nhân vật, xưng hô & cốt truyện."),
+    story_pass: Optional[bool] = typer.Option(
+        None,
+        "--story-pass/--no-story-pass",
+        "--pass1/--skip-pass1",
+        help="Bật/tắt quét trước toàn bộ chương (Pass 1 Story Bible); dùng --skip-pass1 để bỏ qua Pass 1 (mặc định theo cấu hình /pass1).",
+    ),
     font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt (mali-bold, pangolin, patrick-hand, bangers, hoặc đường dẫn .ttf)."),
     conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại (0.2 - 0.8)."),
     accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Dùng model detector FP32 (168MB, chuẩn cao) hoặc --fast-detector INT8 (43MB)."),
@@ -416,7 +422,12 @@ def retranslate(
     prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô thêm."),
     story: Optional[str] = typer.Option(None, "--story", help="Cốt truyện/nhân vật/lore (chữ hoặc file .txt/.md)."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại (vd: 'vanilla, romance')."),
-    story_pass: bool = typer.Option(False, "--story-pass/--no-story-pass", help="Có chạy Pass 1 Story Bible trước khi tái dịch không (mặc định: tắt để quét nhanh)."),
+    story_pass: bool = typer.Option(
+        False,
+        "--story-pass/--no-story-pass",
+        "--pass1/--skip-pass1",
+        help="Có chạy Pass 1 Story Bible trước khi tái dịch không (mặc định: tắt để quét nhanh).",
+    ),
     font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt."),
     conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại."),
     accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Dùng detector FP32 chuẩn cao hoặc INT8."),
@@ -478,7 +489,12 @@ def compose(
     prompt: Optional[str] = typer.Option(None, "--prompt", help="Gợi ý cốt truyện, tên nhân vật, xưng hô, thể loại."),
     story: Optional[str] = typer.Option(None, "--story", help="Cốt truyện/nhân vật/lore (nhập chữ hoặc đường dẫn file .txt/.md)."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại sáng tác CG (vd: 'vanilla, sweet' hoặc 'NTR, tâm lý')."),
-    story_pass: bool = typer.Option(True, "--story-pass/--no-story-pass", help="Quét trước toàn bộ bộ ảnh CG (Pass 1) để dựng mạch truyện & nhân vật."),
+    story_pass: Optional[bool] = typer.Option(
+        None,
+        "--story-pass/--no-story-pass",
+        "--pass1/--skip-pass1",
+        help="Bật/tắt Pass 1 dựng mạch truyện & nhân vật CG; dùng --skip-pass1 để bỏ qua Pass 1 (mặc định theo cấu hình /pass1).",
+    ),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="GEMINI_API_KEY", help="Gemini API key (hoặc ~/.koharu-vn/config.json)."),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="Endpoint OpenAI-compatible tùy chọn."),
     model: Optional[str] = typer.Option(None, "--model", help="Model PHỤ (nhanh) để dịch từng trang hoặc sáng tác thoại."),
@@ -504,6 +520,7 @@ def compose(
     eff_clean_cache = cfg.clean_cache if clean_cache is None else clean_cache
     eff_delete_zip = cfg.delete_source_zip if delete_zip is None else delete_zip
     eff_notify = cfg.notify if notify is None else notify
+    eff_story_pass = cfg.story_pass if story_pass is None else story_pass
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -546,7 +563,7 @@ def compose(
                 prompt=prompt,
                 story=story,
                 tags=tags if tags is not None else (cfg.tags or None),
-                story_pass=story_pass,
+                story_pass=eff_story_pass,
                 api_key=eff_key,
                 api_keys=eff_keys,
                 base_url=eff_url,
@@ -720,7 +737,12 @@ def queue(
     story_fallback: Optional[str] = typer.Option(None, "--story-fallback", help="Model fallback cho CHÍNH khi bị prohibit."),
     prompt: Optional[str] = typer.Option(None, "--prompt", help="Hướng dẫn ngữ cảnh/xưng hô chung cho cả hàng chờ."),
     tags: Optional[str] = typer.Option(None, "--tags", help="Tag thể loại chung cho hàng chờ."),
-    story_pass: bool = typer.Option(True, "--story-pass/--no-story-pass", help="Quét cốt truyện Pass 1 trước khi dịch."),
+    story_pass: Optional[bool] = typer.Option(
+        None,
+        "--story-pass/--no-story-pass",
+        "--pass1/--skip-pass1",
+        help="Bật/tắt Pass 1 trước khi dịch hàng chờ; dùng --skip-pass1 để bỏ qua Pass 1 (mặc định theo cấu hình /pass1).",
+    ),
     font: Optional[str] = typer.Option(None, "--font", help="Font chữ Việt."),
     conf: float = typer.Option(0.34, "--conf", help="Ngưỡng confidence phát hiện khung thoại (0.2 - 0.8)."),
     accurate_detector: bool = typer.Option(True, "--accurate-detector/--fast-detector", help="Chọn model detector FP32 hoặc INT8."),
